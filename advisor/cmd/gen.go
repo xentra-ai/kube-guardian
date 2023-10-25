@@ -30,7 +30,7 @@ var networkPolicyCmd = &cobra.Command{
 		log.Info().Msgf("Using namespace: %s", config.Namespace)
 		podName := args[0]
 
-		stopChan, errChan, done := k8s.PortForward(config)
+		stopChan, errChan, done := k8s.PortForward(config, cfg)
 		<-done // Block until we receive a notification from the goroutine that port-forwarding has been set up
 		go func() {
 			for err := range errChan {
@@ -38,7 +38,7 @@ var networkPolicyCmd = &cobra.Command{
 			}
 		}()
 		log.Debug().Msg("Port forwarding set up successfully.")
-		k8s.GenerateNetworkPolicy(podName, config)
+		k8s.GenerateNetworkPolicy(podName, config, cfg)
 		close(stopChan)
 	},
 }

@@ -14,21 +14,21 @@ import (
 	"k8s.io/client-go/transport/spdy"
 )
 
-var (
-	serviceNamespace = "kube-guardian"
-	serviceName      = "broker"
-	ports            = []string{"9090:9090"}
-)
+type Broker struct {
+	ServiceNamespace string
+	ServiceName      string
+	Ports            []string
+}
 
 // PortForward sets up a port-forwarding from the local machine to the given pod.
 // It runs the port-forwarding operation in a Goroutine and returns a channel to stop the port-forwarding
-func PortForward(config *Config) (chan struct{}, chan error, chan bool) {
+func PortForward(config *Config, cfg *Broker) (chan struct{}, chan error, chan bool) {
 	stopChan := make(chan struct{}, 1)
 	errChan := make(chan error, 1)
 	done := make(chan bool)
 	log.Debug().Msg("Configuring port-forwarding")
 	go func() {
-		service, err := config.Clientset.CoreV1().Services(serviceNamespace).Get(context.TODO(), serviceName, metav1.GetOptions{})
+		service, err := config.Clientset.CoreV1().Services(cfg.ServiceNamespace).Get(context.TODO(), cfg.ServiceName, metav1.GetOptions{})
 		if err != nil {
 			errChan <- err
 			return
@@ -42,7 +42,7 @@ func PortForward(config *Config) (chan struct{}, chan error, chan bool) {
 		labelSelectorString := strings.Join(selectors, ",")
 
 		log.Debug().Msgf("Using port-forwarding pod with selector: %s", labelSelectorString)
-		pods, err := config.Clientset.CoreV1().Pods(serviceNamespace).List(context.TODO(), metav1.ListOptions{LabelSelector: labelSelectorString})
+		pods, err := config.Clientset.CoreV1().Pods(cfg.ServiceNamespace).List(context.TODO(), metav1.ListOptions{LabelSelector: labelSelectorString})
 		if err != nil {
 			errChan <- err
 			return
@@ -75,7 +75,7 @@ func PortForward(config *Config) (chan struct{}, chan error, chan bool) {
 
 		dialer := spdy.NewDialer(upgrader, &http.Client{Transport: transport}, "POST", url)
 
-		pf, err := portforward.New(dialer, ports, make(chan struct{}, 1), make(chan struct{}, 1), io.Discard, os.Stderr)
+		pf, err := portforward.New(dialer, cfg.Ports, make(chan struct{}, 1), make(chan struct{}, 1), io.Discard, os.Stderr)
 		if err != nil {
 			errChan <- err
 			return

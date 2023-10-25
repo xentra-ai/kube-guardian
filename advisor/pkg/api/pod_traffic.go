@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	log "github.com/rs/zerolog/log"
@@ -39,12 +40,11 @@ type SvcDetail struct {
 	Service      v1.Service `yaml:"service_spec" json:"service_spec"`
 }
 
-func GetPodTraffic(podName string) ([]PodTraffic, error) {
-
+func GetPodTraffic(podName string, port []string) ([]PodTraffic, error) {
+	p, _ := GetLocalPort(port)
 	time.Sleep(3 * time.Second)
 	// Specify the URL of the REST API endpoint you want to invoke.
-	apiURL := "http://127.0.0.1:9090/podtraffic/pod/" + podName
-
+	apiURL := fmt.Sprintf("http://127.0.0.1:%s/podtraffic/pod/%s", p, podName)
 	// Send an HTTP GET request to the API endpoint.
 	resp, err := http.Get(apiURL)
 	if err != nil {
@@ -79,10 +79,12 @@ func GetPodTraffic(podName string) ([]PodTraffic, error) {
 }
 
 // Should we just get the pod spec directly from the cluster and only use the DB for the SaaS version where it contains the pod spec? Would this help with reducing unnecessary chatter?And just let the client do it?
-func GetPodSpec(ip string) (*PodDetail, error) {
+func GetPodSpec(ip string, port []string) (*PodDetail, error) {
+	p, _ := GetLocalPort(port)
 
 	// Specify the URL of the REST API endpoint you want to invoke.
-	apiURL := "http://127.0.0.1:9090/netpol/pod/" + ip
+
+	apiURL := fmt.Sprintf("http://127.0.0.1:%s/netpol/pod/%s", p, ip)
 
 	// Send an HTTP GET request to the API endpoint.
 	resp, err := http.Get(apiURL)
@@ -109,10 +111,11 @@ func GetPodSpec(ip string) (*PodDetail, error) {
 	return &details, nil
 }
 
-func GetSvcSpec(svcIp string) (*SvcDetail, error) {
+func GetSvcSpec(svcIp string, port []string) (*SvcDetail, error) {
+	p, _ := GetLocalPort(port)
 
 	// Specify the URL of the RESTAPI endpoint you want to invoke.
-	apiURL := "http://127.0.0.1:9090/netpol/svc/" + svcIp
+	apiURL := fmt.Sprintf("http://127.0.0.1:%s/netpol/svc/%s", p, svcIp)
 
 	// Send an HTTP GET request to the API endpoint.
 	resp, err := http.Get(apiURL)
@@ -137,4 +140,15 @@ func GetSvcSpec(svcIp string) (*SvcDetail, error) {
 	}
 
 	return &details, nil
+}
+
+func GetLocalPort(ports []string) (string, error) {
+	for _, port := range ports {
+		parts := strings.Split(port, ":")
+		if len(parts) != 2 {
+			return "", fmt.Errorf("invalid format: %s", port)
+		}
+		return parts[1], nil
+	}
+	return "", fmt.Errorf("no local port found")
 }

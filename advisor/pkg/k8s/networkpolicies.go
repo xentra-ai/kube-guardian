@@ -29,8 +29,8 @@ type RuleSets struct {
 	Egress  []networkingv1.NetworkPolicyEgressRule
 }
 
-func GenerateNetworkPolicy(podName string, config *Config) {
-	podTraffic, err := api.GetPodTraffic(podName)
+func GenerateNetworkPolicy(podName string, config *Config, cfg *Broker) {
+	podTraffic, err := api.GetPodTraffic(podName, cfg.Ports)
 	if err != nil {
 		log.Fatal().Err(err).Msg("Error retrieving pod traffic")
 	}
@@ -39,7 +39,7 @@ func GenerateNetworkPolicy(podName string, config *Config) {
 		log.Fatal().Msgf("No pod traffic found for pod %s\n", podName)
 	}
 
-	podDetail, err := api.GetPodSpec(podTraffic[0].SrcIP)
+	podDetail, err := api.GetPodSpec(podTraffic[0].SrcIP, cfg.Ports)
 	if err != nil {
 		log.Fatal().Err(err).Msg("Error retrieving pod spec")
 	}
@@ -48,7 +48,7 @@ func GenerateNetworkPolicy(podName string, config *Config) {
 		log.Fatal().Msgf("No pod spec found for pod %s\n", podTraffic[0].SrcIP)
 	}
 
-	policy, err := transformToNetworkPolicy(podTraffic, podDetail, config)
+	policy, err := transformToNetworkPolicy(podTraffic, podDetail, config, cfg)
 	if err != nil {
 		log.Error().Err(err).Msg("Error transforming policy")
 	}
@@ -60,12 +60,12 @@ func GenerateNetworkPolicy(podName string, config *Config) {
 	log.Info().Msgf("Generated policy for pod %s:\n%s", podName, string(policyYAML))
 }
 
-func transformToNetworkPolicy(podTraffic []api.PodTraffic, podDetail *api.PodDetail, config *Config) (*networkingv1.NetworkPolicy, error) {
-	ingressRulesRaw, err := processIngressRules(podTraffic, config)
+func transformToNetworkPolicy(podTraffic []api.PodTraffic, podDetail *api.PodDetail, config *Config, cfg *Broker) (*networkingv1.NetworkPolicy, error) {
+	ingressRulesRaw, err := processIngressRules(podTraffic, config, cfg)
 	if err != nil {
 		return nil, err
 	}
-	egressRulesRaw, err := processEgressRules(podTraffic, config)
+	egressRulesRaw, err := processEgressRules(podTraffic, config, cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -107,13 +107,13 @@ func transformToNetworkPolicy(podTraffic []api.PodTraffic, podDetail *api.PodDet
 	return networkPolicy, nil
 }
 
-func processIngressRules(podTraffic []api.PodTraffic, config *Config) ([]networkingv1.NetworkPolicyIngressRule, error) {
+func processIngressRules(podTraffic []api.PodTraffic, config *Config, cfg *Broker) ([]networkingv1.NetworkPolicyIngressRule, error) {
 	var ingressRules []networkingv1.NetworkPolicyIngressRule
 	for _, traffic := range podTraffic {
 		if strings.ToUpper(traffic.TrafficType) != "INGRESS" {
 			continue
 		}
-		peer, err := determinePeerForTraffic(traffic, config)
+		peer, err := determinePeerForTraffic(traffic, config, cfg)
 		if err != nil {
 			return nil, err
 		}
@@ -133,13 +133,13 @@ func processIngressRules(podTraffic []api.PodTraffic, config *Config) ([]network
 	return ingressRules, nil
 }
 
-func processEgressRules(podTraffic []api.PodTraffic, config *Config) ([]networkingv1.NetworkPolicyEgressRule, error) {
+func processEgressRules(podTraffic []api.PodTraffic, config *Config, cfg *Broker) ([]networkingv1.NetworkPolicyEgressRule, error) {
 	var egressRules []networkingv1.NetworkPolicyEgressRule
 	for _, traffic := range podTraffic {
 		if strings.ToUpper(traffic.TrafficType) != "EGRESS" {
 			continue
 		}
-		peer, err := determinePeerForTraffic(traffic, config)
+		peer, err := determinePeerForTraffic(traffic, config, cfg)
 		if err != nil {
 			return nil, err
 		}
@@ -159,10 +159,10 @@ func processEgressRules(podTraffic []api.PodTraffic, config *Config) ([]networki
 	return egressRules, nil
 }
 
-func determinePeerForTraffic(traffic api.PodTraffic, config *Config) (*networkingv1.NetworkPolicyPeer, error) {
+func determinePeerForTraffic(traffic api.PodTraffic, config *Config, cfg *Broker) (*networkingv1.NetworkPolicyPeer, error) {
 	var origin interface{} = nil
 
-	podOrigin, err := api.GetPodSpec(traffic.DstIP)
+	podOrigin, err := api.GetPodSpec(traffic.DstIP, cfg.Ports)
 	if err != nil {
 		return nil, err
 	}
@@ -171,7 +171,7 @@ func determinePeerForTraffic(traffic api.PodTraffic, config *Config) (*networkin
 	}
 
 	if origin == nil {
-		svcOrigin, err := api.GetSvcSpec(traffic.DstIP)
+		svcOrigin, err := api.GetSvcSpec(traffic.DstIP, cfg.Ports)
 		if err != nil {
 			return nil, err
 		}
