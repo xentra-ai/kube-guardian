@@ -34,8 +34,8 @@ pub static NETWORK_EVENTS: PerfEventArray<TrafficLog> = PerfEventArray::new(0);
 pub static SYS_CALL_EVENTS: PerfEventArray<SysCallLog> = PerfEventArray::new(0);
 
 #[map(name = "IFINDEX_MAP")]
-static mut IFINDEX_MAP: HashMap<u32, u32> =
-    HashMap::<u32, u32>::with_max_entries(BPF_MAPS_CAPACITY, 0);
+static mut IFINDEX_MAP: HashMap<u64, u32> =
+    HashMap::<u64, u32>::with_max_entries(BPF_MAPS_CAPACITY, 0);
 
 #[tracepoint]
 pub fn kube_guardian_syscalls(ctx: TracePointContext) -> u32 {
@@ -78,9 +78,16 @@ unsafe fn try_kube_guardian(ctx: TracePointContext, traffic_type: i32) -> Result
     )
     .map_err(|_| 100u32)?;
 
+
+    let task: TaskStructPtr = bpf_get_current_task() as TaskStructPtr;
+    let inum = match get_ns_proxy(task) {
+        Ok(i) => i,
+        Err(_) => return Ok(1),
+    };
+
     let if_index = bpf_probe_read(&(*dev_ptr).ifindex as *const i32).map_err(|_| 100i32)?;
 
-    let if_index_map = unsafe { IFINDEX_MAP.get(&(if_index as u32)) }.ok_or(0)?;
+    let if_index_map = unsafe { IFINDEX_MAP.get(&(inum as u64)) }.ok_or(0)?;
 
     if if_index_map.eq(&1) {
         let eth_proto =
@@ -150,11 +157,6 @@ unsafe fn try_kube_guardian(ctx: TracePointContext, traffic_type: i32) -> Result
             _ => (),
         }
 
-        let task: TaskStructPtr = bpf_get_current_task() as TaskStructPtr;
-        let inum = match get_ns_proxy(task) {
-            Ok(i) => i,
-            Err(_) => return Ok(1),
-        };
 
         let log_entry = TrafficLog {
             saddr,

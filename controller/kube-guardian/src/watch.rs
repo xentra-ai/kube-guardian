@@ -45,7 +45,8 @@ pub struct PodDetail {
 
 pub async fn watch_pods(
     ebpf: EbpfPgm,
-    container_map: Arc<Mutex<BTreeMap<u32, PodInspect>>>,
+    container_map: Arc<Mutex<BTreeMap<u64, PodInspect>>>,
+    reverse_if_index_map: Arc<Mutex<BTreeMap<u32, u64>>>,
     node_name: String,
 ) -> Result<(), crate::Error> {
     let c = Client::try_default().await?;
@@ -63,9 +64,10 @@ pub async fn watch_pods(
         .default_backoff()
         .try_for_each(|p| {
             let container_map = Arc::clone(&container_map);
+            let reverse_if_index_map = Arc::clone(&reverse_if_index_map);
             let ebpf = Arc::clone(&ebpf);
             async move {
-                let p = process_pod(&p, container_map, ebpf).await;
+                let p = process_pod(&p, container_map, reverse_if_index_map,ebpf).await;
                 if let Err(e) = p{
                     //dont panic and the error is already printed, so no point of reporting again
                     // maybe find a better way of handling error
@@ -82,14 +84,15 @@ pub async fn watch_pods(
 
 async fn process_pod(
     pod: &Pod,
-    container_map: Arc<Mutex<BTreeMap<u32, PodInspect>>>,
+    container_map: Arc<Mutex<BTreeMap<u64, PodInspect>>>,
+    reverse_if_index_map: Arc<Mutex<BTreeMap<u32, u64>>>,
     ebpf: Arc<Mutex<EbpfPgm>>,
 ) -> Result<(), Error> {
     if let Some(con_ids) = pod_unready(pod) {
         let pod_ip = update_pods_details(pod).await;
         if should_process_pod(&pod.metadata.namespace) {
             if let Ok(Some(pod_ip)) = pod_ip {
-                process_container_ids(&con_ids, &pod, &pod_ip, container_map, ebpf).await?;
+                process_container_ids(&con_ids, &pod, &pod_ip, container_map,reverse_if_index_map, ebpf).await?;
             }
         }
     }
@@ -100,7 +103,8 @@ async fn process_container_ids(
     con_ids: &[String],
     pod: &Pod,
     pod_ip: &String,
-    container_map: Arc<Mutex<BTreeMap<u32, PodInspect>>>,
+    container_map: Arc<Mutex<BTreeMap<u64, PodInspect>>>,
+    reverse_if_index_map: Arc<Mutex<BTreeMap<u32, u64>>>,
     ebpf: Arc<Mutex<EbpfPgm>>,
 ) -> Result<(), Error> {
     for con_id in con_ids {
@@ -115,24 +119,26 @@ async fn process_container_ids(
             if pod_inspect.pid.is_some() {
                 // let inum = get_pid_for_children_namespace_id(pod_inspect.pid.unwrap() as i32);
                 let mut cm = container_map.lock().await;
-                if let Some(if_index) = pod_inspect.if_index {
+                let mut rever_map = reverse_if_index_map.lock().await;
+                if let Some(inode_num) = pod_inspect.inode_number {
                     info!(
                         "inode_num of pod {} is {}",
-                        pod_inspect.status.pod_name, if_index
+                        pod_inspect.status.pod_name, inode_num
                     );
-                    cm.insert(if_index, pod_inspect.clone());
+                    cm.insert(inode_num, pod_inspect.clone());
+                    rever_map.insert(pod_inspect.if_index.unwrap(), inode_num);
                     let mut ebpf_pgm = ebpf.lock().await;
                        
-                        let mut ifindex_map: HashMap<_, u32, u32> =
+                        let mut ifindex_map: HashMap<_, u64, u32> =
                         HashMap::try_from(ebpf_pgm.bpf.map_mut("IFINDEX_MAP").unwrap())?;
                       
-                        match ifindex_map.get(&if_index, 0)  {
+                        match ifindex_map.get(&inode_num, 0)  {
                             Ok(_) => {
-                                info!("{} ifindex already exists", if_index);
+                                info!("{} ifindex already exists", inode_num);
                             }
                             Err(MapError::KeyNotFound) => {
                                 info!(" Key not found, insert");
-                                ifindex_map.insert(if_index , 1, 0)?;
+                                ifindex_map.insert(inode_num , 1, 0)?;
                             }
                             Err(e) => {
                                return Err(Error::BpfMapError { source: e })

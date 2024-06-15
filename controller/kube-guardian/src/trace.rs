@@ -44,7 +44,8 @@ pub struct EbpfPgm {
 
 impl EbpfPgm {
     pub fn load_ebpf(
-        container_map: Arc<Mutex<BTreeMap<u32, PodInspect>>>,
+        container_map: Arc<Mutex<BTreeMap<u64, PodInspect>>>,
+        reverse_if_map: Arc<Mutex<BTreeMap<u32, u64>>>,
         traced_address: Arc<Mutex<HashSet<TracedAddrRecord>>>,
     ) -> Result<EbpfPgm, crate::Error> {
         #[cfg(debug_assertions)]
@@ -99,6 +100,7 @@ impl EbpfPgm {
         let mut syscall_events = AsyncPerfEventArray::try_from(bpf.take_map("SYS_CALL_EVENTS").unwrap())?;
         for cpu_id in online_cpus()? {
             let container_map = Arc::clone(&container_map);
+            let reverse_map = Arc::clone(&reverse_if_map);
             let traced_address_cache = Arc::clone(&traced_address);
 
             let mut network_buffer = network_events.open(cpu_id, None)?;
@@ -112,7 +114,7 @@ impl EbpfPgm {
                     loop {
                         let events = network_buffer.read_events(&mut buffers).await.unwrap();
                         for buf in buffers.iter_mut().take(events.read) {
-                            process_network_buffer(buf, &container_map, &traced_address_cache).await.unwrap();
+                            process_network_buffer(buf, &container_map,&reverse_map, &traced_address_cache).await.unwrap();
                         }
                     }
             });
@@ -124,7 +126,7 @@ impl EbpfPgm {
                     loop {
                         let events = sys_calls_buffer.read_events(&mut buffers).await.unwrap();
                         for buf in buffers.iter_mut().take(events.read) {
-                            process_syscall_buffer(buf).await.unwrap();
+                           // process_syscall_buffer(buf).await.unwrap();
                         }
                     }
             });
@@ -148,12 +150,13 @@ async fn process_syscall_buffer(buf: &mut BytesMut) -> Result<(), Box<dyn std::e
     Ok(())
 }
 
-async fn process_network_buffer(buf: &mut BytesMut, container_map: & Arc<Mutex<BTreeMap<u32, PodInspect>>>, traced_address_cache: &Arc<Mutex<HashSet<(String, String, u16, String, u16)>>>) -> Result<(), Box<dyn std::error::Error>> {
+async fn process_network_buffer(buf: &mut BytesMut, container_map: & Arc<Mutex<BTreeMap<u64, PodInspect>>>,reverse_if_map: & Arc<Mutex<BTreeMap<u32, u64>>>,  traced_address_cache: &Arc<Mutex<HashSet<(String, String, u16, String, u16)>>>) -> Result<(), Box<dyn std::error::Error>> {
     let ptr = TrafficObj(buf.as_ptr() as *const TrafficLog);
     let data = unsafe { ptr.as_ptr().read_unaligned() };
 
     let tracker = container_map.lock().await;
-    if let Some(valid_pod) = tracker.get(&(data.if_index as u32)) {
+    if let Some(valid_pod) = tracker.get(&(data.inum as u64)) {
+        let mut pod_details : &PodInfo = &valid_pod.status;
         let mut t = Traffic {
             src_addr: Ipv4Addr::from(data.saddr.to_be()).to_string(),
             dst_addr: Ipv4Addr::from(data.daddr.to_be()).to_string(),
@@ -162,30 +165,43 @@ async fn process_network_buffer(buf: &mut BytesMut, container_map: & Arc<Mutex<B
             ..Default::default()
         };
 
-        if t.src_addr == valid_pod.status.pod_ip {
+        info!(
+            "source {}:{}, port {}:{}, syn {}, ack {}, inum {} ifindex {} traffic_type {}",
+            Ipv4Addr::from(data.saddr.to_be()),
+            data.sport,
+            Ipv4Addr::from(data.daddr.to_be()),
+            data.dport,
+            data.syn,
+            data.ack,
+            data.inum,
+            data.if_index,
+            data.traffic_type,
+        );
 
-            info!(
-                "source {}:{}, port {}:{}, syn {}, ack {}, inum {} ifindex {} traffic_type {}",
-                Ipv4Addr::from(data.saddr.to_be()),
-                data.sport,
-                Ipv4Addr::from(data.daddr.to_be()),
-                data.dport,
-                data.syn,
-                data.ack,
-                data.inum,
-                data.if_index,
-                data.traffic_type,
-            );
-       
-            if data.syn == 1 && data.ack == 0 {
+            if data.syn == 1 && data.ack == 0 && t.src_addr.eq(&pod_details.pod_ip){
+            
                 // Egress when the traffic is iniated from
                 t.ip_protocol = String::from("TCP");
                 t.traffic_type = 0;
             } else if data.syn == 1 && data.ack == 1 {
                 // Ingress succeed at Destination
+                // here the src address is the destination and if_index is destination but the inode_num is client
                 // The inode num points to the client
-                t.ip_protocol = String::from("TCP");
-                t.traffic_type = 1;
+                if !data.if_index.eq(&(valid_pod.if_index.unwrap() as i32)){
+                    //loop thru the tracker and match the if_index to get the pod details
+                     let rc_mpp = reverse_if_map.lock().await;
+                     if let Some(inum) = rc_mpp.get(&(data.if_index as u32)) {
+                        if let Some(z) = tracker.get(&(inum)){
+                            pod_details = &z.status;
+                            t.ip_protocol = String::from("TCP");
+                            t.traffic_type = 1;
+                        }
+                     }else{
+                        return Ok(());
+                     }
+                   
+                }
+                
             } else if data.syn == 2 && data.ack == 2  {
                 // Egress
                 t.ip_protocol = String::from("UDP");
@@ -198,7 +214,7 @@ async fn process_network_buffer(buf: &mut BytesMut, container_map: & Arc<Mutex<B
             let mut cache = traced_address_cache.lock().await;
             let traced_traffic = t.define_traffic();
             if !cache.contains(&traced_traffic) {
-                match t.parse_message(&valid_pod.status).await {
+                match t.parse_message(pod_details).await {
                     Ok(_) => {
                         cache.insert(traced_traffic);
                     }
@@ -209,7 +225,7 @@ async fn process_network_buffer(buf: &mut BytesMut, container_map: & Arc<Mutex<B
             } else {
                 info!("Record exists");
             }
-        }
+
     }
 
     Ok(())

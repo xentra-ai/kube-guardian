@@ -23,16 +23,17 @@ async fn health(_: HttpRequest) -> impl Responder {
 async fn main() -> anyhow::Result<()> {
     telemetry::init_logger();
 
-    let c: Arc<Mutex<BTreeMap<u32, PodInspect>>> = Arc::new(Mutex::new(BTreeMap::new()));
+    let c: Arc<Mutex<BTreeMap<u64, PodInspect>>> = Arc::new(Mutex::new(BTreeMap::new()));
+    let rc_map: Arc<Mutex<BTreeMap<u32, u64>>> = Arc::new(Mutex::new(BTreeMap::new()));
 
     let traced_addresses_cache: Arc<Mutex<HashSet<TracedAddrRecord>>> =
         Arc::new(Mutex::new(HashSet::new()));
 
     // load ebpf
-    let bpf = EbpfPgm::load_ebpf(Arc::clone(&c), Arc::clone(&traced_addresses_cache))?;
+    let bpf = EbpfPgm::load_ebpf(Arc::clone(&c), Arc::clone(&rc_map),Arc::clone(&traced_addresses_cache))?;
 
     let node_name = env::var("CURRENT_NODE").expect("cannot find node name: CURRENT_NODE ");
-    let pods = watch_pods( bpf,c, node_name);
+    let pods = watch_pods( bpf,c,rc_map, node_name);
 
     // Start web server,
     // let server = HttpServer::new(move || {
