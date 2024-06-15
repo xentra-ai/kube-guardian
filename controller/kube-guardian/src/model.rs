@@ -9,6 +9,7 @@ pub struct PodInspect {
     pub namespace_pid: Option<u32>,
     pub pid: Option<u32>,
     pub cgroup_path: Option<String>,
+    pub inode_number : Option<u64>,
 }
 #[derive(Debug, Default, Deserialize, Clone)]
 pub struct Info {

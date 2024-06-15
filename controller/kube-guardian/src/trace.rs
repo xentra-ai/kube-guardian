@@ -10,7 +10,7 @@ use aya::{
 };
 use bytes::BytesMut;
 use chrono::{NaiveDateTime, Utc};
-use kube_guardian_common::TrafficLog;
+use kube_guardian_common::{SysCallLog, TrafficLog};
 use serde::Serialize;
 use serde_json::json;
 use std::sync::Arc;
@@ -75,18 +75,34 @@ impl EbpfPgm {
             return Err(Error::BpfProgramError { source: e })
         };
 
-        if let Err(e) = program_ingress.attach("net", "netif_receive_skb") { // INGRESS 1
+        if let Err(e) = program_ingress.attach("net", "netif_receive_skb") { 
             error!("Failed to attach netif_receive_skb {}", e);
             return Err(Error::BpfProgramError { source: e })
 
         };
 
-        let mut perf_array = AsyncPerfEventArray::try_from(bpf.take_map("EVENTS").unwrap())?;
+        let program_sys_calls: &mut TracePoint = bpf.program_mut("kube_guardian_syscalls").unwrap().try_into()?;
+             
+        if let Err(e) = program_sys_calls.load(){ 
+            error!("Failed to load  program_sys_calls {}", e);
+            return Err(Error::BpfProgramError { source: e })
+        };
+
+        if let Err(e) = program_sys_calls.attach("raw_syscalls", "sys_enter") {
+            error!("Failed to attach syscalls {}", e);
+            return Err(Error::BpfProgramError { source: e })
+
+        };
+
+
+        let mut network_events = AsyncPerfEventArray::try_from(bpf.take_map("NETWORK_EVENTS").unwrap())?;
+        let mut syscall_events = AsyncPerfEventArray::try_from(bpf.take_map("SYS_CALL_EVENTS").unwrap())?;
         for cpu_id in online_cpus()? {
             let container_map = Arc::clone(&container_map);
             let traced_address_cache = Arc::clone(&traced_address);
 
-            let mut perf_buffer = perf_array.open(cpu_id, None)?;
+            let mut network_buffer = network_events.open(cpu_id, None)?;
+            let mut sys_calls_buffer = syscall_events.open(cpu_id, None)?;
 
             task::spawn(async move {
                 let mut buffers = (0..10)
@@ -94,9 +110,21 @@ impl EbpfPgm {
                     .collect::<Vec<_>>();
 
                     loop {
-                        let events = perf_buffer.read_events(&mut buffers).await.unwrap();
+                        let events = network_buffer.read_events(&mut buffers).await.unwrap();
                         for buf in buffers.iter_mut().take(events.read) {
-                            process_buffer(buf, &container_map, &traced_address_cache).await.unwrap();
+                            process_network_buffer(buf, &container_map, &traced_address_cache).await.unwrap();
+                        }
+                    }
+            });
+            task::spawn(async move {
+                let mut buffers = (0..10)
+                    .map(|_| BytesMut::with_capacity(1024))
+                    .collect::<Vec<_>>();
+
+                    loop {
+                        let events = sys_calls_buffer.read_events(&mut buffers).await.unwrap();
+                        for buf in buffers.iter_mut().take(events.read) {
+                            process_syscall_buffer(buf).await.unwrap();
                         }
                     }
             });
@@ -106,8 +134,22 @@ impl EbpfPgm {
     }
 }
 
-async fn process_buffer(buf: &mut BytesMut, container_map: & Arc<Mutex<BTreeMap<u32, PodInspect>>>, traced_address_cache: &Arc<Mutex<HashSet<(String, String, u16, String, u16)>>>) -> Result<(), Box<dyn std::error::Error>> {
-    let ptr = UserObj(buf.as_ptr() as *const TrafficLog);
+async fn process_syscall_buffer(buf: &mut BytesMut) -> Result<(), Box<dyn std::error::Error>> {
+    let ptr = SyscallObj(buf.as_ptr() as *const SysCallLog);
+    let data = unsafe { ptr.as_ptr().read_unaligned() };
+
+    info!(
+        "Syscall tracing inum {} syscall number {}",
+        data.inum,
+        data.syscall_nbr
+
+    );
+
+    Ok(())
+}
+
+async fn process_network_buffer(buf: &mut BytesMut, container_map: & Arc<Mutex<BTreeMap<u32, PodInspect>>>, traced_address_cache: &Arc<Mutex<HashSet<(String, String, u16, String, u16)>>>) -> Result<(), Box<dyn std::error::Error>> {
+    let ptr = TrafficObj(buf.as_ptr() as *const TrafficLog);
     let data = unsafe { ptr.as_ptr().read_unaligned() };
 
     let tracker = container_map.lock().await;
@@ -173,11 +215,21 @@ async fn process_buffer(buf: &mut BytesMut, container_map: & Arc<Mutex<BTreeMap<
     Ok(())
 }
 
-struct UserObj(*const TrafficLog);
+struct SyscallObj(*const SysCallLog);
 // SAFETY: Any user data object must be safe to send between threads.
-unsafe impl Send for UserObj {}
+unsafe impl Send for SyscallObj {}
 
-impl UserObj {
+impl SyscallObj {
+    fn as_ptr(&self) -> *const SysCallLog {
+        self.0
+    }
+}
+
+struct TrafficObj(*const TrafficLog);
+// SAFETY: Any user data object must be safe to send between threads.
+unsafe impl Send for TrafficObj {}
+
+impl TrafficObj {
     fn as_ptr(&self) -> *const TrafficLog {
         self.0
     }

@@ -8,8 +8,9 @@ use containerd_client::{
     tonic::{transport::Channel, Request},
     with_namespace,
 };
+use procfs::process::Process;
 use regex::Regex;
-use std::process::Command;
+use std::{ffi::OsString, process::Command};
 use tracing::*;
 
 static REGEX_CONTAINERD: &str = "containerd://(?P<container_id>[0-9a-zA-Z]*)";
@@ -49,7 +50,8 @@ impl PodInspect {
                         .get_pid(channel)
                         .await
                         .extract_namespace_pid(container)
-                        .get_peer_ifindex(),
+                        .get_peer_ifindex()
+                        .get_inode_number()
                 );
             }
         }
@@ -142,6 +144,20 @@ impl PodInspect {
         } else {
             let container_resp = container_resp.unwrap().into_inner();
             self.pid = Some(container_resp.process.unwrap().pid);
+        }
+        self
+    }
+       // get the inode number
+       fn get_inode_number(mut self) -> Self {
+        let pid = &self.pid;
+        if let Some(pid) = pid {
+            if let Some(process) = Process::new(*pid as i32).ok() {
+                if let Ok(ns) = process.namespaces() {
+                    if let Some(pid_for_children) = ns.0.get(&OsString::from("pid_for_children")) {
+                        self.inode_number = Some(pid_for_children.identifier);
+                    }
+                }
+            }
         }
         self
     }

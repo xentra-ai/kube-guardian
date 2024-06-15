@@ -16,14 +16,23 @@ pub struct TrafficLog {
     pub if_index: i32,
     pub traffic_type : i32,
 }
+
+
+#[derive(Debug, Copy, Clone)]
+#[repr(C)]
+pub struct SysCallLog {
+    pub inum: u32, // i node numbner
+    pub syscall_nbr : u32
+}
 #[cfg(feature = "user")]
 pub mod user {
     use super::*;
 
     unsafe impl aya::Pod for TrafficLog {}
+    unsafe impl aya::Pod for SysCallLog {}
 }
 
 unsafe impl Send for TrafficLog {}
 
-
+unsafe impl Send for SysCallLog {}
 
