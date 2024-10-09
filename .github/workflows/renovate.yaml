@@ -61,7 +61,7 @@ jobs:
           private-key: "${{ secrets.ARX_GITHUB_APP_PRIVATE_KEY }}"
 
       - name: Renovate
-        uses: renovatebot/github-action@063e0c946b9c1af35ef3450efc44114925d6e8e6 # v40.1.11
+        uses: renovatebot/github-action@b9486682a19fe4ea2dd1263c11b4e0c1fe1838fe # v40.3.2
         with:
           configurationFile: .github/renovate.json5
           token: "x-access-token:${{ steps.app-token.outputs.token }}"
