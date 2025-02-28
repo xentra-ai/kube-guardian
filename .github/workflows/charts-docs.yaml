@@ -1,11 +1,10 @@
-name: "Charts: Update README"
+name: "Charts: Update Versions and Docs"
 
 on:
   pull_request:
     branches:
       - main
     paths:
-      - '.github/workflows/charts-readme-docs.yaml'
       - 'charts/**'
 
 env:
@@ -13,27 +12,54 @@ env:
 
 jobs:
   chart-readme:
-    name: Update README
+    name: Update README and Version
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4
+        uses: actions/checkout@actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4
         with:
           ref: ${{ github.event.pull_request.head.ref }}
 
-      - name: install helm-docs
+      - name: Install yq
+        run: |
+          wget https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -O /usr/local/bin/yq
+          chmod +x /usr/local/bin/yq
+
+      - name: Bump Chart Version
+        run: |
+          CHART_PATH="./charts/kube-guardian/Chart.yaml"
+
+          # Get current version
+          CURRENT_VERSION=$(yq e '.version' $CHART_PATH)
+
+          # Parse version components
+          IFS='.' read -r major minor patch <<< "$CURRENT_VERSION"
+
+          # Increment patch version
+          NEW_VERSION="$major.$minor.$((patch + 1))"
+
+          # Update chart version
+          yq e ".version = \"$NEW_VERSION\"" -i $CHART_PATH
+          echo "Bumped chart version from $CURRENT_VERSION to $NEW_VERSION"
+
+      - name: Install helm-docs
         run: |
           cd /tmp
           wget https://github.com/norwoodj/helm-docs/releases/download/v${{env.HELM_DOCS_VERSION}}/helm-docs_Linux_x86_64.tar.gz
           tar -xvf helm-docs_Linux_x86_64.tar.gz
           sudo mv helm-docs /usr/local/sbin
 
-      - name: run helm-docs
+      - name: Run helm-docs
         run: |
           helm-docs -t README.md.gotmpl -o README.md
 
       - name: Commit changes
         uses: stefanzweifel/git-auto-commit-action@8621497c8c39c72f3e2a999a26b4ca1b5058a842 # v5
-        id: auto-commit
         with:
           branch: ${{ github.event.pull_request.head.ref }}
+          commit_message: |
+            chore(chart): bump version and update documentation
+
+            - Bump chart version
+            - Update documentation
+          file_pattern: 'charts/**/*'
