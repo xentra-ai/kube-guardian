@@ -3,6 +3,32 @@ entries:
   kube-guardian:
   - apiVersion: v2
     appVersion: 1.16.0
+    created: "2025-02-28T00:00:25.919194809Z"
+    description: A Helm chart for Kubernetes
+    digest: 8d14e41060dd2da5581b39287843d08b3c8c6804b3ac9bbe97a7b71357492b67
+    home: https://xentra.ai/
+    keywords:
+    - BPF
+    - eBPF
+    - Kubernetes
+    - Networking
+    - Security
+    - Observability
+    - Troubleshooting
+    kubeVersion: '>= 1.18.0-0'
+    maintainers:
+    - email: mahesh.rayas@xentra-ai.com
+      name: maheshrayas
+    - email: michael.fornaro@xentra-ai.com
+      name: xunholy
+    name: kube-guardian
+    sources:
+    - https://github.com/xentra-ai/kube-guardian
+    urls:
+    - https://github.com/xentra-ai/kube-guardian/releases/download/kube-guardian-0.0.22/kube-guardian-0.0.22.tgz
+    version: 0.0.22
+  - apiVersion: v2
+    appVersion: 1.16.0
     created: "2025-02-19T06:03:41.40431749Z"
     description: A Helm chart for Kubernetes
     digest: 6c65c083c178701740b647f4eecd75566bd25edc7e4e7209a32060e372ba3320
@@ -183,4 +209,4 @@ entries:
     urls:
     - https://github.com/xentra-ai/kube-guardian/releases/download/kube-guardian-0.0.15/kube-guardian-0.0.15.tgz
     version: 0.0.15
-generated: "2025-02-19T06:03:41.404349239Z"
+generated: "2025-02-28T00:00:25.919225637Z"
