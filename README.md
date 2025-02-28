@@ -46,8 +46,7 @@ Or manually download the release and place it in your PATH:
 Example:
 
 ```bash
-# Download the release and set it as executable
-wget -O advisor https://github.com/xentra-ai/kube-guardian/releases/download/v0.0.4/advisor-linux-amd64
+wget -O advisor https://github.com/xentra-ai/kube-guardian/releases/download/v0.0.7/advisor-linux-amd64
 chmod +x advisor
 sudo mv advisor /usr/local/bin/kubectl-advisor
 ```

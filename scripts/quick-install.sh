@@ -31,11 +31,13 @@ echo "Detected OS: $OS, Arch: $ARCH"
 
 # Get the latest release tag
 echo "Fetching the latest release tag..."
-LATEST_RELEASE_TAG=$(curl -s "https://api.github.com/repos/$GITHUB_OWNER/$GITHUB_REPO/releases/latest" | grep tag_name | cut -d '"' -f 4)
+LATEST_TAG_RESPONSE=$(curl -s "https://api.github.com/repos/$GITHUB_OWNER/$GITHUB_REPO/releases/latest")
+LATEST_RELEASE_TAG=$(echo $LATEST_TAG_RESPONSE | grep tag_name | cut -d '"' -f 4)
 
 # Check if the latest release was found
 if [ -z "$LATEST_RELEASE_TAG" ]; then
     echo "Error: Failed to fetch the latest release."
+    echo "Error: $LATEST_TAG_RESPONSE"
     exit 1
 fi
 
