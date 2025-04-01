@@ -2,7 +2,7 @@ module github.com/xentra-ai/advisor
 
 go 1.22.0
 
-toolchain go1.22.3
+toolchain go1.24.2
 
 require (
 	github.com/cilium/cilium v1.14.5
