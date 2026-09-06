@@ -125,6 +125,27 @@ spec:
             - name: DB_STATEMENT_TIMEOUT_MS
               value: {{ .Values.broker.statementTimeoutMs | quote }}
             {{- end }}
+            {{- if hasKey .Values.broker "readMemoryBudgetMb" }}
+            - name: BROKER_READ_MEMORY_BUDGET_MB
+              value: {{ .Values.broker.readMemoryBudgetMb | quote }}
+            {{- end }}
+            {{- if hasKey .Values.broker "readAcquireWaitMs" }}
+            - name: BROKER_READ_ACQUIRE_WAIT_MS
+              value: {{ .Values.broker.readAcquireWaitMs | quote }}
+            {{- end }}
+            {{- if .Values.broker.resources.limits.memory }}
+            # Downward API, not a templated value: reports the container's
+            # real memory limit in MiB whatever unit values.yaml spells it
+            # in. The broker clamps its read budget to 30% of this and warns
+            # if an operator raised the budget without raising the limit —
+            # the misconfiguration that OOMKilled it.
+            - name: BROKER_MEMORY_LIMIT_MB
+              valueFrom:
+                resourceFieldRef:
+                  containerName: broker
+                  resource: limits.memory
+                  divisor: 1Mi
+            {{- end }}
             {{- if hasKey .Values.broker "dbMigrationMaxRetries" }}
             - name: DB_MIGRATION_MAX_RETRIES
               value: {{ .Values.broker.dbMigrationMaxRetries | quote }}

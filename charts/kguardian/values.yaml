@@ -182,14 +182,17 @@ controller:
 # `SYSCALL_CAPTURE_LEVEL` / `SYSCALL_CUSTOM_LIST` on the controller DaemonSet.
 syscalls:
   # Tiers, most to least complete:
-  #   full    — every syscall. The only tier that can publish a seccomp
-  #             profile; anything less is a partial set and a deny-by-default
-  #             profile built from it will break the workload.
+  #   full    — every syscall. The only tier that can export an enforcing
+  #             seccomp profile; anything less is a partial set and a
+  #             deny-by-default profile built from it will break the
+  #             workload, so the broker refuses that combination unless the
+  #             request passes `acknowledgePartial=true`. Audit-only
+  #             (`SCMP_ACT_LOG`) exports are allowed from any tier.
   #   high    — everything except hot-path noise (read/write/futex/epoll/
   #             mmap/clock_gettime and similar).
   #   medium  — `low` plus the network, file-permission/link and process-
   #             lifecycle families.
-  #   low     — the 56 security-relevant syscalls kguardian traced before
+  #   low     — the 57 security-relevant syscalls kguardian traced before
   #             this setting existed (exec, socket, mount, ptrace, bpf, ...).
   #   custom  — exactly the names in `syscalls.customList`.
   #
@@ -203,11 +206,15 @@ syscalls:
   # `kguardian.dev/syscall-capture: full`.
   #
   # -- Cluster-wide capture level: `full` (default, every syscall — the only
-  # tier that can publish a seccomp profile), `high`, `medium`, `low` or
-  # `custom`. Full capture is de-duplicated in BPF so it costs about the same
-  # CPU as `low`; pick a lower tier only if you never intend to publish
-  # seccomp profiles and want a smaller syscall table in the broker. The
-  # block above lists what each tier traces.
+  # tier an enforcing seccomp profile can be exported from), `high`,
+  # `medium`, `low` or `custom`. Full capture is de-duplicated in BPF so it
+  # costs about the same CPU as `low`; pick a lower tier only if you never
+  # intend to enforce seccomp profiles and want a smaller syscall table in
+  # the broker. Below `full`, the broker still exports audit-only
+  # (`SCMP_ACT_LOG`) profiles and stamps every manifest with
+  # `kguardian.dev/capture-level` and `kguardian.dev/capture-complete`, but
+  # refuses to render a denying `defaultAction` unless the request passes
+  # `acknowledgePartial=true`. The block above lists what each tier traces.
   captureLevel: full
   # -- Syscall names for `captureLevel: custom` (ignored on any other level),
   # rendered comma-joined into `SYSCALL_CUSTOM_LIST`, e.g.
@@ -450,6 +457,26 @@ broker:
   # are exempt. Healthy request queries are sub-second, so 30s is a safe ceiling
   # that only ever fires on pathological queries. Tune down for tighter SLOs.
   statementTimeoutMs: 30000
+
+  # -- Total in-flight memory (MiB) the broker will commit to whole-result-set
+  # reads (/pod/traffic, /pod/info, /svc/info, /audit/verdicts, ...). This is
+  # what bounds concurrent heavy reads; dbPoolMaxSize does NOT — it was chosen
+  # for DB contention and never referenced memory, which let 32 concurrent
+  # 50 MiB reads be admitted into a 1Gi container and OOMKill it.
+  # One /pod/traffic?limit=20000 peaks at ~50 MiB (measured byte-exact:
+  # 1982 B/row of Rust heap + ~600 B/row of libpq PGresult). 256 MiB buys 5
+  # concurrent hard-cap reads, or 20 concurrent default 5000-row reads.
+  # Reads that don't fit are REFUSED with 503 + Retry-After, never truncated —
+  # a short read would produce a policy with missing rules.
+  # Raise this and resources.limits.memory together: the broker clamps the
+  # budget to 30% of the limit and warns if you don't.
+  # Watch broker_read_shed_total and broker_read_budget_kib_available.
+  readMemoryBudgetMb: 256
+
+  # -- How long a read queues for budget before being shed with 503 (ms).
+  # 0 fails fast with no queueing. 5s rides out a burst (a hard-cap read
+  # holds its budget ~1-3s) while failing inside a typical client timeout.
+  readAcquireWaitMs: 5000
 
   # -- Number of attempts the broker makes to run embedded migrations
   # on startup, at 2s spacing. The chart's wait-for-db init container
