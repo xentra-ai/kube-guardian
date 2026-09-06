@@ -39,7 +39,12 @@ tracing-subscriber = { version = "0.3.22", features = ["json", "env-filter"] }
 # outbound HTTPS version check-in (version_check.rs); in-cluster calls
 # (evaluator) remain plain http.
 reqwest = { version = "0.13", default-features = false, features = ["json", "query", "rustls"] }
-tokio = { version = "1", features = ["rt", "macros"] }
+# "sync" (Semaphore) and "time" (timeout) back the read-memory budget in
+# read_budget.rs. Both were previously reaching us only via actix-rt's own
+# feature selection — relying on another crate's features for a memory-safety
+# bound is a build that breaks on someone else's dependency bump, so they are
+# declared here explicitly.
+tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
 
 [dev-dependencies]
 # Used in unit tests to exercise the same query-string parsing path
