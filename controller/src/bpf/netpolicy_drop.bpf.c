@@ -17,17 +17,33 @@ char LICENSE[] SEC("license") = "GPL";
 // in helper.h). Field order is chosen so the struct has no implicit
 // padding: this is a hash-map key, compared byte-wise, and only *named*
 // members are guaranteed zeroed by a designated initialiser.
+//
+// `generation` carries the same duty it does in the network probe's
+// conn_key, and for the same reason (KG_GEN_SHIFT in helper.h):
+// connection_tracking is a node-wide LRU hash that nothing prunes when
+// a pod dies, so without it a pod landing on a recycled netns inode
+// inherited its predecessor's per-flow state. The consequence here is
+// the mirror image of the network probe's: a stale entry already marked
+// `established`, or already past the syn_count threshold, means a
+// genuinely blocked connection from the NEW pod is never reported as a
+// drop — the policy-gap signal the operator is relying on just does not
+// arrive.
+//
+// This is NOT a wire struct: nothing in userspace mirrors it (only
+// policy_drop_event below is pointer-cast in bpf.rs), so the field order
+// is free to be whatever keeps the padding explicit.
 struct conn_attempt {
     __u64 inum;                  // 0  Network namespace inode
     __u8 saddr[IPV6_ADDR_LEN];   // 8  Source IP (v4-mapped when IPv4)
     __u8 daddr[IPV6_ADDR_LEN];   // 24 Dest IP (v4-mapped when IPv4)
-    __u16 sport;                 // 40 Source port
-    __u16 dport;                 // 42 Dest port
-    __u8 protocol;               // 44 TCP/UDP
-    __u8 _pad[3];                // 45 Explicit padding for alignment
+    __u32 generation;            // 40 Registration generation for `inum`
+    __u16 sport;                 // 44 Source port
+    __u16 dport;                 // 46 Dest port
+    __u8 protocol;               // 48 TCP/UDP
+    __u8 _pad[7];                // 49 Explicit padding for alignment
 };
 
-_Static_assert(sizeof(struct conn_attempt) == 48,
+_Static_assert(sizeof(struct conn_attempt) == 56,
                "conn_attempt must have no implicit padding");
 
 // Connection state tracking
@@ -89,7 +105,8 @@ int BPF_PROG(trace_tcp_retransmit, struct sock *sk, struct sk_buff *skb, int seg
 
     // Get network namespace inode
     __u64 inum = 0;
-    if (!get_and_validate_inum(sk, &inum))
+    __u32 generation = 0;
+    if (!get_and_validate_inum(sk, &inum, &generation))
         return 0;
 
     // Read socket info - ports only; addresses come from
@@ -114,6 +131,7 @@ int BPF_PROG(trace_tcp_retransmit, struct sock *sk, struct sk_buff *skb, int seg
     if (state == TCP_SYN_SENT) {
         struct conn_attempt key = {
             .inum = inum,
+            .generation = generation,
             .sport = skc.skc_num,
             .dport = bpf_ntohs(skc.skc_dport),
             .protocol = 6, // TCP
@@ -180,7 +198,8 @@ int BPF_PROG(trace_tcp_connect, struct sock *sk, struct sockaddr *uaddr, int add
 
     // Get network namespace inode
     __u64 inum = 0;
-    if (!get_and_validate_inum(sk, &inum))
+    __u32 generation = 0;
+    if (!get_and_validate_inum(sk, &inum, &generation))
         return 0;
 
     // Read socket info - ports only; addresses come from read_sock_addrs
@@ -200,6 +219,7 @@ int BPF_PROG(trace_tcp_connect, struct sock *sk, struct sockaddr *uaddr, int add
     // Track this connection attempt
     struct conn_attempt key = {
         .inum = inum,
+        .generation = generation,
         .sport = skc.skc_num,
         .dport = bpf_ntohs(skc.skc_dport),
         .protocol = 6, // TCP
@@ -230,7 +250,8 @@ int BPF_PROG(trace_tcp_state_change, struct sock *sk, int state)
     if (state == TCP_ESTABLISHED) {
         // Get network namespace inode
         __u64 inum = 0;
-        if (!get_and_validate_inum(sk, &inum))
+        __u32 generation = 0;
+        if (!get_and_validate_inum(sk, &inum, &generation))
             return 0;
 
         // Read socket info - ports only; addresses come from read_sock_addrs
@@ -248,6 +269,7 @@ int BPF_PROG(trace_tcp_state_change, struct sock *sk, int state)
 
         struct conn_attempt key = {
             .inum = inum,
+            .generation = generation,
             .sport = skc.skc_num,
             .dport = bpf_ntohs(skc.skc_dport),
             .protocol = 6,
@@ -272,14 +294,22 @@ int BPF_PROG(trace_tcp_state_change, struct sock *sk, int state)
 // sends udpv6_sendmsg delegates back to it, and native IPv6 UDP only
 // ever passes through udpv6_sendmsg. The v6 hook sets skip_v4_mapped so
 // a delegated send is not counted twice (it would double syn_count).
-static __always_inline int handle_udp_send(struct sock *sk, bool skip_v4_mapped)
+//
+// `msg` carries the destination for an UNCONNECTED socket, which the
+// socket itself does not know — see read_msghdr_dest in helper.h. This
+// path had the same blindness as the network probe's twin: an
+// unconnected sendto() looked like a send to 0.0.0.0:0 and was filtered
+// out, so no send attempt was tracked and a blocked UDP flow from a musl
+// workload left no trace on either side of the controller.
+static __always_inline int handle_udp_send(struct sock *sk, struct msghdr *msg, bool skip_v4_mapped)
 {
     if (!sk)
         return 0;
 
     // Get network namespace inode
     __u64 inum = 0;
-    if (!get_and_validate_inum(sk, &inum))
+    __u32 generation = 0;
+    if (!get_and_validate_inum(sk, &inum, &generation))
         return 0;
 
     // Read socket info - ports only; addresses come from read_sock_addrs
@@ -292,20 +322,36 @@ static __always_inline int handle_udp_send(struct sock *sk, bool skip_v4_mapped)
     if (!read_sock_addrs(sk, saddr, daddr))
         return 0;
 
+    __u16 dport = bpf_ntohs(skc.skc_dport);
+
+    // Message-level destination wins where there is one, exactly as the
+    // kernel does it. Must precede the skip_v4_mapped test, which asks
+    // what the destination is.
+    __u8 msg_daddr[IPV6_ADDR_LEN];
+    __u16 msg_dport = 0;
+    if (read_msghdr_dest(msg, msg_daddr, &msg_dport))
+    {
+        __builtin_memcpy(daddr, msg_daddr, IPV6_ADDR_LEN);
+        dport = msg_dport;
+    }
+
     // See the contract above: the v6 entry point leaves v4-mapped sends
     // to the v4 hook the kernel is about to invoke.
     if (skip_v4_mapped && addr_is_v4_mapped(daddr))
         return 0;
 
-    // Apply filtering
-    if (should_filter_traffic(saddr, daddr))
+    // Apply filtering. A socket bound to INADDR_ANY has no source
+    // address until the route is picked, which happens after this hook —
+    // see should_filter_udp_egress in helper.h.
+    if (should_filter_udp_egress(saddr, daddr))
         return 0;
 
     // Track UDP send attempts (useful for detecting patterns)
     struct conn_attempt key = {
         .inum = inum,
+        .generation = generation,
         .sport = skc.skc_num,
-        .dport = bpf_ntohs(skc.skc_dport),
+        .dport = dport,
         .protocol = 17, // UDP
     };
     __builtin_memcpy(key.saddr, saddr, IPV6_ADDR_LEN);
@@ -336,7 +382,7 @@ static __always_inline int handle_udp_send(struct sock *sk, bool skip_v4_mapped)
 SEC("fentry/udp_sendmsg")
 int BPF_PROG(trace_udp_send, struct sock *sk, struct msghdr *msg, size_t len)
 {
-    return handle_udp_send(sk, /* skip_v4_mapped = */ false);
+    return handle_udp_send(sk, msg, /* skip_v4_mapped = */ false);
 }
 
 // Twin entry point for native IPv6 UDP — see the network probe's twin
@@ -345,5 +391,5 @@ int BPF_PROG(trace_udp_send, struct sock *sk, struct msghdr *msg, size_t len)
 SEC("fentry/udpv6_sendmsg")
 int BPF_PROG(trace_udpv6_send, struct sock *sk, struct msghdr *msg, size_t len)
 {
-    return handle_udp_send(sk, /* skip_v4_mapped = */ true);
+    return handle_udp_send(sk, msg, /* skip_v4_mapped = */ true);
 }

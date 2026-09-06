@@ -48,6 +48,22 @@
 // syscall the OLD pod had already reported — silently punching holes
 // in a seccomp profile. Folding the generation into the dedup key
 // makes a reused inode start from a clean slate.
+//
+// This applies to EVERY node-wide map keyed on the netns inode, not
+// just the syscall probe's. The network probe's `connections` map and
+// the netpolicy probe's `connection_tracking` map made exactly this
+// mistake: both are node-wide LRU hashes that nothing cleans up on pod
+// death, and both refresh their entry on every hit, so a hot key never
+// ages out. A replacement pod landing on a recycled inode inherited its
+// predecessor's "already reported" state and was permanently silenced
+// for that flow tuple. TCP mostly survived it — a pod talks to many
+// destinations, so only the repeated ones were lost — but DNS is a
+// SINGLE tuple per pod (pod -> kube-dns:53), so one suppressed key
+// meant zero DNS rows for that pod for its whole life, and a generated
+// policy with no DNS egress rule breaks the workload the moment it is
+// enforced. Any new dedup key built from an inode must fold in the
+// generation; get_and_validate_inum below hands it to every caller so
+// there is no excuse not to.
 #define KG_GEN_SHIFT         4
 #define KG_TIER_OF(flags)    (((flags) >> KG_TIER_SHIFT) & KG_TIER_MASK)
 #define KG_GEN_OF(flags)     ((flags) >> KG_GEN_SHIFT)
@@ -159,7 +175,12 @@ static __always_inline bool addr_is_loopback(const __u8 *a)
 
 // Common filtering helper to avoid code duplication
 // Optimized to check cheap conditions first before map lookups
-static __always_inline bool should_filter_traffic(const __u8 *saddr, const __u8 *daddr)
+//
+// `allow_unspecified_source` exists for exactly one caller — see
+// should_filter_udp_egress below. Everything else must go through
+// should_filter_traffic.
+static __always_inline bool filter_traffic(const __u8 *saddr, const __u8 *daddr,
+                                           bool allow_unspecified_source)
 {
     // Fast path: check cheap conditions first (no map lookups)
 
@@ -168,7 +189,10 @@ static __always_inline bool should_filter_traffic(const __u8 *saddr, const __u8 
         return true;
 
     // Filter unspecified addresses (:: and ::ffff:0.0.0.0)
-    if (addr_is_unspecified(saddr) || addr_is_unspecified(daddr))
+    if (addr_is_unspecified(daddr))
+        return true;
+
+    if (addr_is_unspecified(saddr) && !allow_unspecified_source)
         return true;
 
     // Filter localhost (::1 and ::ffff:127.0.0.1)
@@ -184,6 +208,31 @@ static __always_inline bool should_filter_traffic(const __u8 *saddr, const __u8 
         return true;
 
     return false;
+}
+
+static __always_inline bool should_filter_traffic(const __u8 *saddr, const __u8 *daddr)
+{
+    return filter_traffic(saddr, daddr, /* allow_unspecified_source = */ false);
+}
+
+// Filtering for the UDP egress paths, where an unspecified SOURCE is
+// normal rather than a sign of a socket we should ignore.
+//
+// A process that sends with sendto() on a socket bound to INADDR_ANY —
+// musl's resolver does exactly this for every DNS query — never picks a
+// source address at all: the route lookup that chooses one happens
+// after the udp_sendmsg hook, so skc_rcv_saddr is still 0.0.0.0 here.
+// Rejecting the send for that reason threw away the only record of the
+// flow. Nothing downstream misses the address either: the wire saddr is
+// only logged, and the pod_ip on the row userspace builds comes from
+// the netns -> pod map (network.rs build_traffic_event uses
+// pod_data.status.pod_ip), so the flow is attributed correctly.
+//
+// The destination is still required to be specified — an event with no
+// destination describes no traffic and cannot become a policy rule.
+static __always_inline bool should_filter_udp_egress(const __u8 *saddr, const __u8 *daddr)
+{
+    return filter_traffic(saddr, daddr, /* allow_unspecified_source = */ true);
 }
 
 // Write an IPv4 address (network byte order, as it sits in
@@ -281,8 +330,123 @@ static __always_inline bool read_sock_addrs(struct sock *sk, __u8 *saddr, __u8 *
     return false;
 }
 
-// Helper to get user space inode and validate it exists
-static __always_inline bool get_and_validate_inum(struct sock *sk, __u64 *inum_out)
+// Destination of a UDP send taken from the MESSAGE rather than the
+// socket.
+//
+// The socket is the wrong place to look for an unconnected UDP socket.
+// sendto() on a socket that never called connect() leaves skc_daddr and
+// skc_dport zero, so should_filter_traffic() discarded the send as
+// unspecified and the flow was never recorded at all. That is not a
+// corner case: musl's resolver (res_msend.c) binds a socket to
+// INADDR_ANY:0 and uses sendto() for every query, so EVERY DNS lookup
+// from an Alpine-based workload was invisible, and a generated policy
+// missing its DNS egress rule breaks the pod the moment it is enforced.
+// glibc connect()s its resolver socket, which is the only reason
+// glibc-based pods were captured and made the gap look like a
+// distro-specific mystery rather than a hook reading the wrong field.
+//
+// Precedence follows the kernel's own, which takes the destination from
+// msg_name whenever it is present and only falls back to the connected
+// peer when it is not (udp_sendmsg: `if (usin) { daddr =
+// usin->sin_addr.s_addr; ... } else { ... daddr = inet->inet_daddr; }`).
+// Mirroring that also records a sendto() aimed somewhere other than the
+// connected peer as the address it actually went to.
+//
+// Returns false — caller keeps the socket's own addresses, which is the
+// connected-socket path that already worked — when there is no
+// message-level address, when msg_namelen is too short for the family
+// it claims, when the family is not one we track, or when the port is
+// zero (which the kernel itself rejects with -EINVAL).
+//
+// msg_name is KERNEL memory, not user memory: both sendmsg and sendto
+// copy the caller's sockaddr into a kernel `struct sockaddr_storage`
+// (__sys_sendto / ___sys_sendmsg) before either udp_sendmsg path runs.
+// Only the bytes each family actually needs are read, so a caller that
+// passed something smaller than a sockaddr_storage cannot be
+// over-read.
+// Bytes of each sockaddr this needs: through the address field and not
+// one byte further. Spelled with the UAPI field names rather than with
+// the trailing padding member's, whose name is a kernel implementation
+// detail. The asserts pin the two lengths a caller could get wrong.
+#define KG_SOCKADDR_IN_LEN                                   \
+    (__builtin_offsetof(struct sockaddr_in, sin_addr) + sizeof(struct in_addr))
+#define KG_SOCKADDR_IN6_LEN                                  \
+    (__builtin_offsetof(struct sockaddr_in6, sin6_addr) + sizeof(struct in6_addr))
+_Static_assert(KG_SOCKADDR_IN_LEN == 8, "sockaddr_in layout is UAPI-frozen");
+_Static_assert(KG_SOCKADDR_IN6_LEN == 24,
+               "sockaddr_in6 layout is UAPI-frozen (this is SIN6_LEN_RFC2133)");
+
+static __always_inline bool read_msghdr_dest(struct msghdr *msg, __u8 *daddr, __u16 *dport)
+{
+    if (!msg)
+        return false;
+
+    void *name = NULL;
+    int namelen = 0;
+    BPF_CORE_READ_INTO(&name, msg, msg_name);
+    BPF_CORE_READ_INTO(&namelen, msg, msg_namelen);
+
+    if (!name)
+        return false;
+
+    // sa_family is the first two bytes of every sockaddr; read it on its
+    // own before committing to a layout.
+    __u16 family = 0;
+    if (bpf_probe_read_kernel(&family, sizeof(family), name) != 0)
+        return false;
+
+    if (family == AF_INET)
+    {
+        // Same minimum udp_sendmsg enforces: `msg_namelen < sizeof(*usin)`.
+        if (namelen < (int)sizeof(struct sockaddr_in))
+            return false;
+
+        struct sockaddr_in sin = {};
+        if (bpf_probe_read_kernel(&sin, KG_SOCKADDR_IN_LEN, name) != 0)
+            return false;
+
+        if (sin.sin_port == 0)
+            return false;
+
+        ipv4_to_v4_mapped(daddr, sin.sin_addr.s_addr);
+        *dport = bpf_ntohs(sin.sin_port);
+        return true;
+    }
+
+    if (family == AF_INET6)
+    {
+        // SIN6_LEN_RFC2133 is udpv6_sendmsg's own minimum, and is exactly
+        // enough to cover sin6_addr; sin6_scope_id is not read.
+        if (namelen < (int)KG_SOCKADDR_IN6_LEN)
+            return false;
+
+        struct sockaddr_in6 sin6 = {};
+        if (bpf_probe_read_kernel(&sin6, KG_SOCKADDR_IN6_LEN, name) != 0)
+            return false;
+
+        if (sin6.sin6_port == 0)
+            return false;
+
+        __builtin_memcpy(daddr, &sin6.sin6_addr, IPV6_ADDR_LEN);
+        *dport = bpf_ntohs(sin6.sin6_port);
+        return true;
+    }
+
+    return false;
+}
+
+// Helper to get user space inode and validate it exists.
+//
+// `gen_out` is not optional decoration. The netns inode alone is NOT a
+// stable identity for a pod: the kernel recycles inode numbers, so a
+// map keyed on the bare inode serves a dead pod's state to whatever
+// lands on its number next. Every dedup key built from this inode must
+// fold in the generation — see KG_GEN_SHIFT above for the full failure
+// mode. Handing the generation back from the single place that
+// validates the inode is what makes forgetting it hard: the flags value
+// used to be looked up here and thrown away, which is why the network
+// probe could not fold in a generation even in principle.
+static __always_inline bool get_and_validate_inum(struct sock *sk, __u64 *inum_out, __u32 *gen_out)
 {
     if (!sk)
         return false;
@@ -291,11 +455,12 @@ static __always_inline bool get_and_validate_inum(struct sock *sk, __u64 *inum_o
     BPF_CORE_READ_INTO(&net_ns_inum, sk, __sk_common.skc_net.net, ns.inum);
 
     __u64 key = (__u64)net_ns_inum;
-    __u32 *user_space_inum_ptr = bpf_map_lookup_elem(&inode_num, &key);
+    __u32 *flags = bpf_map_lookup_elem(&inode_num, &key);
 
-    if (!user_space_inum_ptr)
+    if (!flags)
         return false;
 
     *inum_out = key;
+    *gen_out = KG_GEN_OF(*flags);
     return true;
 }
