@@ -33,7 +33,7 @@ annotation:
 | `full` (default) | every syscall |
 | `high` | everything except hot-path noise (`read`, `write`, `futex`, `epoll_*`, `mmap`, `clock_gettime`, …) |
 | `medium` | `low` plus the network, file-permission/link and process-lifecycle families |
-| `low` | 56 security-relevant syscalls (`execve`, `socket`, `mount`, `ptrace`, `bpf`, …) |
+| `low` | 57 security-relevant syscalls (`execve`, `socket`, `mount`, `ptrace`, `bpf`, …) |
 | `custom` | an operator-supplied list |
 
 **Only a `full` capture yields a profile that is safe to enforce.** A profile
