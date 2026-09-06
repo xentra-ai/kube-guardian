@@ -1,9 +1,9 @@
 use crate::capture_tiers::CaptureLevel;
 use crate::models::{pod_flags, ContainerMap, PodRegistration};
 use crate::network::canonicalize_ip;
+use crate::watch_loop::run_watch;
 use crate::{api_post_call, Error, PodDetail, PodInfo, PodInspect};
 use chrono::Utc;
-use futures::TryStreamExt;
 use k8s_openapi::api::apps::v1::{DaemonSet, Deployment, ReplicaSet, StatefulSet};
 use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::{Pod, PodIP};
@@ -57,54 +57,87 @@ pub async fn watch_pods(
         cluster_capture_level,
     );
 
-    let watch = watcher(pods, wc)
-        .applied_objects()
-        .default_backoff()
-        .try_for_each(|p| {
-            let t = tx.clone();
-            let sender_ip = sender_ip.clone();
-            let container_map = Arc::clone(&container_map);
-            let node_name = node_name.clone();
-            let c = c.clone();
-            async move {
-                if let Some(reg) = process_pod(
-                    &p,
-                    container_map,
-                    excluded_namespaces,
-                    sender_ip,
-                    ignore_daemonset_traffic,
-                    &node_name,
-                    &c,
-                    cluster_capture_level,
-                )
-                .await
-                {
-                    if let Err(e) = t.send(reg).await {
-                        tracing::error!("Failed to send pod registration: {:?}", e);
-                    }
-                    // debug not info — fires on every pod event that
-                    // passes the per-node + namespace-exclusion filter,
-                    // including the full re-sync on controller startup
-                    // AND every pod-status transition (rolling deploys
-                    // generate hundreds per minute on busy nodes). The
-                    // inode-to-pod mapping is debug-relevant only when
-                    // chasing eBPF event correlation issues; operators
-                    // under default RUST_LOG=info don't need it.
-                    debug!(
-                        "Pod {:?}, inode num {:?}, flags {:#x}",
-                        p.name(),
-                        reg.netns_inode,
-                        reg.flags
-                    );
-                }
-                Ok(())
-            }
-        });
+    // `.default_backoff()` wraps the RAW watcher stream, BEFORE
+    // `.applied_objects()`. That is the order kube-rs's own examples
+    // use (see kube_runtime::controller's docs), and it matters:
+    // `applied_objects` decodes the Init/InitDone markers away, so with
+    // the backoff on the outside a successful re-list of a node whose
+    // field selector matches nothing yields no `Ok` at all and the
+    // backoff never resets. It was the other way round here, which is
+    // part of how this chain came to read as "retries, with backoff"
+    // when it did neither.
+    //
+    // Cloned rather than moved because `run_watch` rebuilds the stream
+    // if it ever ends; an Api handle and a Config are cheap to clone.
+    let watch_api = pods;
+    let watch_cfg = wc;
 
-    // Run both concurrently. If either ends (watch stream error, or the
-    // resync list fails fatally), propagate so main's try_join! exits and
-    // the kubelet restarts the controller for a clean re-sync.
-    tokio::try_join!(async move { watch.await.map_err(Error::from) }, resync)?;
+    // `run_watch` never returns: an apiserver outage degrades the watch
+    // and nothing else. See watch_loop's module docs for the 2026-09-04
+    // incident that made that non-negotiable — in short, `try_for_each`
+    // dropped this stream on its first `Err` (backoff sleep included,
+    // so not one retry happened) and the `?` took main's try_join! down
+    // with it, eBPF handle and all. 26 of 42 nodes lost kernel capture
+    // state that nothing backfills.
+    let watch = async move {
+        run_watch(
+            "pod",
+            move || {
+                watcher(watch_api.clone(), watch_cfg.clone())
+                    .default_backoff()
+                    .applied_objects()
+            },
+            move |p| {
+                let t = tx.clone();
+                let sender_ip = sender_ip.clone();
+                let container_map = Arc::clone(&container_map);
+                let node_name = node_name.clone();
+                let c = c.clone();
+                async move {
+                    if let Some(reg) = process_pod(
+                        &p,
+                        container_map,
+                        excluded_namespaces,
+                        sender_ip,
+                        ignore_daemonset_traffic,
+                        &node_name,
+                        &c,
+                        cluster_capture_level,
+                    )
+                    .await
+                    {
+                        if let Err(e) = t.send(reg).await {
+                            tracing::error!("Failed to send pod registration: {:?}", e);
+                        }
+                        // debug not info — fires on every pod event that
+                        // passes the per-node + namespace-exclusion filter,
+                        // including the full re-sync on controller startup
+                        // AND every pod-status transition (rolling deploys
+                        // generate hundreds per minute on busy nodes). The
+                        // inode-to-pod mapping is debug-relevant only when
+                        // chasing eBPF event correlation issues; operators
+                        // under default RUST_LOG=info don't need it.
+                        debug!(
+                            "Pod {:?}, inode num {:?}, flags {:#x}",
+                            p.name(),
+                            reg.netns_inode,
+                            reg.flags
+                        );
+                    }
+                }
+            },
+        )
+        .await;
+        // Unreachable: `run_watch` loops forever. Present only to give
+        // this block the Result type `try_join!` needs.
+        Ok::<(), Error>(())
+    };
+
+    // Run both concurrently, for the life of the process. Neither half
+    // returns any more: the watch is supervised in-band, and the resync
+    // loop already treats a failed LIST as a tick to skip. Cancellation
+    // on SIGTERM comes from main's shutdown select!, not from here.
+    tokio::try_join!(watch, resync)?;
     Ok(())
 }
 

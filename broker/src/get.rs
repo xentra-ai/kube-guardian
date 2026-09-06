@@ -1,4 +1,8 @@
 use crate::ip::canonical_ip;
+use crate::read_budget::{
+    cost_kib, ReadBudget, ASSUMED_MAX_PODS, ASSUMED_MAX_SERVICES, AUDIT_ROW_COST_BYTES,
+    MAX_PODS_PER_NODE, POD_DETAIL_ROW_COST_BYTES, SYSCALL_ROWS_CHARGED, TRAFFIC_ROW_COST_BYTES,
+};
 use crate::{schema, PodDetail, PodSyscalls, PodTraffic, SvcDetail};
 use actix_web::{get, web, HttpResponse, Responder};
 use diesel::dsl::sql;
@@ -13,10 +17,32 @@ type DbError = Box<dyn std::error::Error + Send + Sync>;
 #[get("/pod/traffic")]
 pub async fn get_pod_traffic(
     pool: web::Data<DbPool>,
+    budget: web::Data<ReadBudget>,
     query: web::Query<PodTrafficQuery>,
 ) -> actix_web::Result<impl Responder> {
-    debug!("select pod traffic table");
     let row_limit = clamp_pod_traffic_limit(query.limit);
+    // INFO, not DEBUG. This is the single most expensive request the broker
+    // serves — one hard-cap call peaks at ~50 MiB (read_budget::
+    // TRAFFIC_ROW_COST_BYTES) — and it was logged at `debug!` while the
+    // broker runs at INFO, so the requests most likely to cause an incident
+    // left no trace at all. During the OOMKill post-mortem there was nothing
+    // in the log to show these had even been served, while the far cheaper
+    // per-pod `/pod/traffic/{name}` below logged at `info!`. Logging the
+    // resolved `row_limit` (not the raw param) means the log line states the
+    // cost that was actually incurred.
+    info!(row_limit, "select pod traffic table (cluster-wide)");
+
+    // Bound concurrent whole-result-set reads by memory, not by pool size.
+    // Held until this fn returns, i.e. across both the query and the
+    // `.json()` serialise below, which is where the peak actually occurs.
+    let _permit = match budget
+        .acquire(cost_kib(row_limit, TRAFFIC_ROW_COST_BYTES))
+        .await
+    {
+        Ok(p) => p,
+        Err(shed) => return Ok(shed.into_response()),
+    };
+
     let pod_traffic = web::block(move || {
         let mut conn = pool.get()?;
         pod_traffic(&mut conn, row_limit)
@@ -49,8 +75,24 @@ pub struct PodTrafficQuery {
 /// body. That stalled the broker, spiked its memory, and overran the
 /// mcp-server's 10 MB response cap, so the client failed to decode the
 /// truncated body with "unexpected EOF" (i.e. cluster-traffic was broken).
-/// At ~350 B/row of JSON, the 20000-row cap is ~7 MB — safely under that cap —
-/// and the default 5000 is ~1.7 MB. The sole cluster-wide consumer
+///
+/// This comment used to claim ~350 B/row of JSON, and sized the caps from it.
+/// That figure was never measured and is 63% low: the byte-exact allocator
+/// profile in `tests/read_memory_profile.rs` puts a real row at **572.1 JSON
+/// B/row**, so the 20000-row cap is ~10.9 MB on the wire (not ~7 MB) and the
+/// 5000-row default ~2.8 MB (not ~1.7 MB). The 20000-row cap therefore sits
+/// just *above* the mcp-server's 10 MB response ceiling it was chosen to stay
+/// under — a caller passing an explicit `?limit=20000` can still overrun it.
+/// The 5000 default has ample margin, which is why the cap is left where it
+/// is rather than lowered: lowering it would silently shorten the advisor's
+/// cluster-wide read and produce policies with missing rules. Anyone sizing
+/// limits from this comment should use 572 B/row, and re-derive it from that
+/// test rather than estimating.
+///
+/// Resident cost is higher still — 723.5 B/row as Rust structs, and ~1982
+/// B/row of peak heap once the serialise transient is counted. That per-row
+/// peak, not the wire size, is what `read_budget` charges against the memory
+/// budget. The sole cluster-wide consumer
 /// (mcp-server's get_cluster_traffic) only aggregates the rows into per-pod
 /// counts, so a most-recent-first window is the right shape; its counts now
 /// describe the recent window rather than all history.
@@ -87,8 +129,29 @@ pub fn pod_traffic(
 }
 
 #[get("/pod/info")]
-pub async fn get_pod_details(pool: web::Data<DbPool>) -> actix_web::Result<impl Responder> {
+pub async fn get_pod_details(
+    pool: web::Data<DbPool>,
+    budget: web::Data<ReadBudget>,
+) -> actix_web::Result<impl Responder> {
     debug!("select pod details table");
+
+    // `pod_details_all` has NO row limit — it is a whole-table read. It is
+    // charged a flat reservation rather than an exact `rows x cost` estimate
+    // because the row count is not known until the query has already run, and
+    // adding a row cap here would silently shorten the pod inventory the
+    // advisor derives podSelectors from. Bounded by cluster size (thousands)
+    // rather than telemetry accumulation (millions), so the reservation
+    // over-charges a small cluster and under-charges an unusually large one;
+    // see read_budget::ASSUMED_MAX_PODS for why that trade is acceptable
+    // here and not for the traffic tables.
+    let _permit = match budget
+        .acquire(cost_kib(ASSUMED_MAX_PODS, POD_DETAIL_ROW_COST_BYTES))
+        .await
+    {
+        Ok(p) => p,
+        Err(shed) => return Ok(shed.into_response()),
+    };
+
     let pod_detail = web::block(move || {
         let mut conn = pool.get()?;
         pod_details(&mut conn)
@@ -184,10 +247,23 @@ pub fn pod_details(conn: &mut PgConnection) -> Result<Option<Vec<PodDetail>>, Db
 #[get("/pod/list/{node}")]
 pub async fn get_pods_by_node(
     pool: web::Data<DbPool>,
+    budget: web::Data<ReadBudget>,
     node: web::Path<String>,
 ) -> actix_web::Result<impl Responder> {
     debug!("Getting pods for node: {}", node);
     let node_name = node.into_inner();
+
+    // Unbounded per-node read. Charged at the per-node pod ceiling rather
+    // than the whole-cluster one — kubelet's default max-pods is 110, so a
+    // node's inventory is an order of magnitude below the cluster's.
+    let _permit = match budget
+        .acquire(cost_kib(MAX_PODS_PER_NODE, POD_DETAIL_ROW_COST_BYTES))
+        .await
+    {
+        Ok(p) => p,
+        Err(shed) => return Ok(shed.into_response()),
+    };
+
     let pods = web::block(move || {
         let mut conn = pool.get()?;
         pods_by_node(&mut conn, &node_name)
@@ -213,8 +289,24 @@ pub fn pods_by_node(conn: &mut PgConnection, node: &str) -> Result<Vec<PodDetail
 }
 
 #[get("/svc/info")]
-pub async fn get_svc_details(pool: web::Data<DbPool>) -> actix_web::Result<impl Responder> {
+pub async fn get_svc_details(
+    pool: web::Data<DbPool>,
+    budget: web::Data<ReadBudget>,
+) -> actix_web::Result<impl Responder> {
     debug!("select svc details table");
+
+    // Whole-table read with no row limit, same as /pod/info. `service_spec`
+    // is a stored manifest (compacted by `compact_svc_spec` at write time),
+    // so per-row cost is manifest-shaped, not string-shaped — charged at the
+    // pod_details rate.
+    let _permit = match budget
+        .acquire(cost_kib(ASSUMED_MAX_SERVICES, POD_DETAIL_ROW_COST_BYTES))
+        .await
+    {
+        Ok(p) => p,
+        Err(shed) => return Ok(shed.into_response()),
+    };
+
     let svc_detail = web::block(move || {
         let mut conn = pool.get()?;
         svc_details_all(&mut conn)
@@ -460,10 +552,31 @@ pub fn pod_ip(conn: &mut PgConnection, ip: &str) -> Result<Option<PodDetail>, Db
 #[get("/pod/traffic/{name}")]
 pub async fn get_pod_traffic_name(
     pool: web::Data<DbPool>,
+    budget: web::Data<ReadBudget>,
     name: web::Path<String>,
 ) -> actix_web::Result<impl Responder> {
     info!("select pod traffic for the pod name");
     let pod_name = name.into_inner();
+
+    // Shares the hazard with the cluster-wide endpoint, and is charged the
+    // same: `pod_traffic_by_name` carries the identical 20000-row ceiling, so
+    // a per-pod read of a pathological pod (the direction-heuristic artifact
+    // that accumulated tens of thousands of one-port rows per peer) costs the
+    // same ~50 MiB. It is also called once per pod by the advisor's policy
+    // generator, so it is the endpoint most likely to be issued concurrently
+    // — the exact shape that turns a per-request bound into an aggregate
+    // overrun.
+    let _permit = match budget
+        .acquire(cost_kib(
+            PER_POD_TRAFFIC_ROW_CEILING,
+            TRAFFIC_ROW_COST_BYTES,
+        ))
+        .await
+    {
+        Ok(p) => p,
+        Err(shed) => return Ok(shed.into_response()),
+    };
+
     let pod_detail = web::block(move || {
         let mut conn = pool.get()?;
         pod_traffic_by_name(&mut conn, &pod_name)
@@ -496,20 +609,43 @@ pub fn pod_traffic_by_name(
     let pod_tr = pod_traffic
         .filter(pod_name.eq(name.to_string()))
         .order((time_stamp.desc(), uuid.desc()))
-        .limit(clamp_pod_traffic_limit(Some(20_000)))
+        .limit(clamp_pod_traffic_limit(Some(PER_POD_TRAFFIC_ROW_CEILING)))
         .load::<PodTraffic>(conn)
         .optional()?;
     Ok(pod_tr)
 }
 
+/// Row ceiling for `/pod/traffic/{name}`. Named rather than inlined because
+/// `get_pod_traffic_name` must charge the read budget the same number the
+/// query is bounded by — if the two drift, the budget under-charges the
+/// endpoint and the aggregate memory bound quietly stops holding.
+pub(crate) const PER_POD_TRAFFIC_ROW_CEILING: i64 = 20_000;
+
 // POD SYS CALLS BY PODNAME
 #[get("/pod/syscalls/{name}")]
 pub async fn get_pod_syscall_name(
     pool: web::Data<DbPool>,
+    budget: web::Data<ReadBudget>,
     name: web::Path<String>,
 ) -> actix_web::Result<impl Responder> {
     info!("select pod syscall for the pod name");
     let pod_name = name.into_inner();
+
+    // `pod_syscalls_by_name` has no row limit either, but pod_name is the
+    // table's primary key so it returns ~1 row. The cost that matters is the
+    // `syscalls` TEXT blob (the full captured syscall set for the pod, a few
+    // KB), not the row count — hence a small flat charge rather than a
+    // rows-based estimate. Included so every whole-result-set handler goes
+    // through the same door; an endpoint left outside the budget is a hole in
+    // the aggregate bound even when its own cost is modest.
+    let _permit = match budget
+        .acquire(cost_kib(SYSCALL_ROWS_CHARGED, POD_DETAIL_ROW_COST_BYTES))
+        .await
+    {
+        Ok(p) => p,
+        Err(shed) => return Ok(shed.into_response()),
+    };
+
     let pod_syscalls = web::block(move || {
         let mut conn = pool.get()?;
         pod_syscalls_by_name(&mut conn, &pod_name)
@@ -611,6 +747,7 @@ pub(crate) fn validate_enum_filter(
 #[get("/audit/verdicts")]
 pub async fn get_audit_verdicts(
     pool: web::Data<DbPool>,
+    budget: web::Data<ReadBudget>,
     query: web::Query<AuditVerdictsQuery>,
 ) -> actix_web::Result<impl Responder> {
     let q = query.into_inner();
@@ -643,6 +780,18 @@ pub async fn get_audit_verdicts(
             return Ok(HttpResponse::BadRequest().body(msg));
         }
     }
+    // Charged like every other whole-result-set read. This endpoint is a
+    // minor contributor — `clamp_audit_limit` caps it at 500 rows, so ~500
+    // KiB worst case against a 262144 KiB budget — but leaving it uncharged
+    // would let a burst of audit reads consume memory the traffic endpoints
+    // had already been told was theirs, and the aggregate bound is only worth
+    // as much as its least-covered path. The 400s above are returned before
+    // this point: rejecting bad input must not first wait on a budget.
+    let _permit = match budget.acquire(cost_kib(limit, AUDIT_ROW_COST_BYTES)).await {
+        Ok(p) => p,
+        Err(shed) => return Ok(shed.into_response()),
+    };
+
     let rows = web::block(move || {
         let mut conn = pool.get()?;
         audit_verdicts_query(

@@ -139,8 +139,19 @@ The `SeccompProfile` manifest for the observed set, ready to commit.
 | `name` | `suggestedName` | `metadata.name` of the CR (DNS-1123, ≤ 253) |
 | `defaultAction` | `SCMP_ACT_LOG` | one of `SCMP_ACT_LOG`, `SCMP_ACT_ERRNO`, `SCMP_ACT_KILL`, `SCMP_ACT_KILL_PROCESS` |
 | `format` | `yaml` | `json` returns the same object (no comments) as `application/json` |
+| `acknowledgePartial` | `false` | take an enforcing profile built from a partial capture anyway (`true`/`1`/`yes`/`on`) |
 
-Bad values are a `400`; `404` if the workload has no observed set.
+Bad values are a `400`; `404` if the workload has no observed set; `409` if
+the capture is partial and `defaultAction` enforces (see below).
+
+Every response — including the `409` — carries the capture verdict in
+headers, so a caller streaming the body to a file can branch without
+parsing YAML:
+
+```
+X-Kguardian-Capture-Level: low
+X-Kguardian-Capture-Complete: false
+```
 
 ### Response — `200`
 
@@ -154,6 +165,9 @@ kind: SeccompProfile
 metadata:
   name: deployment-web
   namespace: prod
+  annotations:
+    kguardian.dev/capture-complete: "true"
+    kguardian.dev/capture-level: full
 spec:
   defaultAction: SCMP_ACT_LOG
   architectures:
@@ -170,7 +184,18 @@ spec:
 ```
 
 Names are sorted; `architectures` is omitted when the observed set has none.
-When `capture.complete` is `false` the header also carries:
+
+Every manifest states the tier it was built from in `metadata.annotations`
+(`kguardian.dev/capture-level` and `kguardian.dev/capture-complete`). Unlike
+the comment header — which `kubectl apply` discards and most GitOps
+renderers strip — annotations are part of the object: they survive apply,
+show up in `kubectl get -o yaml`, and an admission policy can require
+`capture-complete: "true"` before a profile is allowed to enforce. They are
+also the only capture signal in the `format=json` document, which has no
+comments at all.
+
+When `capture.complete` is `false` the object also carries
+`kguardian.dev/capture-warning`, and the YAML header adds:
 
 ```yaml
 # WARNING: partial capture (low on 2 pod(s): web-2 (low), web-4 (unknown)) — this profile will block
@@ -178,8 +203,26 @@ When `capture.complete` is `false` the header also carries:
 # WARNING: annotation or SYSCALL_CAPTURE_LEVEL) and re-export before enforcing.
 ```
 
-Export is never refused for an incomplete capture; the warning travels with
-the manifest so it survives into code review.
+### Response — `409` (partial capture, enforcing action)
+
+Only the `full` tier observes every syscall, so a profile built from a lower
+tier omits calls the workload really makes. Rendering that with a denying
+`defaultAction` is refused:
+
+```
+refusing to export an enforcing profile (SCMP_ACT_ERRNO) from a partial capture:
+low on 1 pod(s): web-2 (low).
+Only the full tier observes every syscall, so this profile would block syscalls
+the workload makes. Raise the tier to full (the kguardian.dev/syscall-capture pod
+annotation, or SYSCALL_CAPTURE_LEVEL cluster-wide), let the profile re-accrue,
+then export again.
+Or export with defaultAction=SCMP_ACT_LOG for an audit-only profile now, or pass
+acknowledgePartial=true to take this one as it is.
+```
+
+`SCMP_ACT_LOG` (the default) is never refused: it records rather than
+blocks, so growing a profile in audit mode from a partial capture is safe
+and is the supported workflow.
 
 ## POST /seccomp/profiles/{namespace}/{kind}/{name}/export
 
@@ -196,10 +239,11 @@ pre-export editor uses.
 }
 ```
 
-Every field is optional. The exported set is `(observed ∪ add) \ remove`.
+Every field is optional; `acknowledgePartial` is accepted here too, as a
+JSON bool or a string. The exported set is `(observed ∪ add) \ remove`.
 Names must match `^[a-z][a-z0-9_]{0,63}$`, ≤ 512 per list, and may not
 appear in both lists (`400`). The observed union in the broker is never
-modified by this call.
+modified by this call. The same `409` partial-capture gate applies.
 
 ---
 

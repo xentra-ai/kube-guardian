@@ -72,7 +72,7 @@ The controller traces syscalls at one of five tiers, set cluster-wide in Helm:
 | `full` (default) | every syscall | yes |
 | `high` | everything except hot-path noise (`read`, `write`, `futex`, `epoll_*`, `mmap`, `clock_gettime`, …) | no |
 | `medium` | `low` plus the network, file-permission/link and process-lifecycle families | no |
-| `low` | the 56 security-relevant syscalls (`execve`, `socket`, `mount`, `ptrace`, `bpf`, …) | no |
+| `low` | the 57 security-relevant syscalls (`execve`, `socket`, `mount`, `ptrace`, `bpf`, …) | no |
 | `custom` | exactly `syscalls.customList` | no |
 
 `full` costs about the same CPU as `low`: the probe de-duplicates per pod

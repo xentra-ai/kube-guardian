@@ -11,7 +11,7 @@ use api::{
     get_seccomp_profile, get_seccomp_profile_file, get_svc_by_ip, get_svc_details, get_version,
     list_seccomp_profiles, mark_pod_dead, post_seccomp_node_status, put_seccomp_cr,
     set_statement_timeout, spawn_peer_late_resolve, spawn_retention, spawn_version_check,
-    AuditClient, StatementTimeoutCustomizer, VersionCheckState,
+    AuditClient, ReadBudget, StatementTimeoutCustomizer, VersionCheckState,
 };
 
 use diesel::r2d2;
@@ -335,6 +335,13 @@ async fn main() -> Result<(), std::io::Error> {
     let version_state = web::Data::new(VersionCheckState::default());
     spawn_version_check(pool.clone(), version_state.clone());
 
+    // Aggregate memory bound for whole-result-set reads. Constructed before
+    // the server so its resolved budget (and any coherence clamp) is logged
+    // at startup next to the pool size it has to coexist with — the two
+    // numbers were previously chosen independently, which is what let 32
+    // concurrent heavy reads be admitted into a 1 GiB container.
+    let read_budget = web::Data::new(ReadBudget::from_env());
+
     let listener = broker_listener()?;
     info!(addr = %listener.local_addr()?, "broker HTTP server starting");
     HttpServer::new(move || {
@@ -353,6 +360,7 @@ async fn main() -> Result<(), std::io::Error> {
             .app_data(web::Data::new(audit_client.clone()))
             .app_data(web::Data::new(auth_config.clone()))
             .app_data(version_state.clone())
+            .app_data(read_budget.clone())
             .service(add_pods_batch)
             .service(add_pod_details)
             .service(add_pods_syscalls)
@@ -440,6 +448,9 @@ pub(crate) fn render_metrics_text(
     audit_dropped_total: u64,
     db_pool_idle: u32,
     db_pool_max: u32,
+    read_budget_kib_total: u32,
+    read_budget_kib_available: u32,
+    read_shed_total: u64,
     uptime_secs: u64,
 ) -> String {
     format!(
@@ -465,6 +476,15 @@ pub(crate) fn render_metrics_text(
             "# HELP broker_db_pool_max Configured max_size of the r2d2 pool (DB_POOL_MAX_SIZE env / broker.dbPoolMaxSize value)\n",
             "# TYPE broker_db_pool_max gauge\n",
             "broker_db_pool_max {db_pool_max}\n",
+            "# HELP broker_read_budget_kib_total Configured in-flight read memory budget in KiB (BROKER_READ_MEMORY_BUDGET_MB)\n",
+            "# TYPE broker_read_budget_kib_total gauge\n",
+            "broker_read_budget_kib_total {read_budget_kib_total}\n",
+            "# HELP broker_read_budget_kib_available Unreserved read memory budget in KiB (saturation = total - this); sustained 0 means reads are queueing on memory\n",
+            "# TYPE broker_read_budget_kib_available gauge\n",
+            "broker_read_budget_kib_available {read_budget_kib_available}\n",
+            "# HELP broker_read_shed_total Reads refused with 503 because the memory budget was exhausted (refused, never truncated)\n",
+            "# TYPE broker_read_shed_total counter\n",
+            "broker_read_shed_total {read_shed_total}\n",
             "# HELP broker_uptime_seconds Process uptime\n",
             "# TYPE broker_uptime_seconds counter\n",
             "broker_uptime_seconds {uptime_secs}\n",
@@ -476,6 +496,9 @@ pub(crate) fn render_metrics_text(
         audit_dropped_total = audit_dropped_total,
         db_pool_idle = db_pool_idle,
         db_pool_max = db_pool_max,
+        read_budget_kib_total = read_budget_kib_total,
+        read_budget_kib_available = read_budget_kib_available,
+        read_shed_total = read_shed_total,
         uptime_secs = uptime_secs,
     )
 }
@@ -494,6 +517,7 @@ pub(crate) fn render_metrics_text(
 pub async fn metrics(
     pool: web::Data<r2d2::Pool<r2d2::ConnectionManager<diesel::PgConnection>>>,
     audit: web::Data<api::AuditClient>,
+    read_budget: web::Data<ReadBudget>,
 ) -> HttpResponse {
     let pool_inner = pool.get_ref().clone();
     let schema_state = tokio::task::spawn_blocking(
@@ -542,6 +566,9 @@ pub async fn metrics(
         audit_dropped,
         db_pool_idle,
         db_pool_max,
+        read_budget.get_ref().total_kib(),
+        read_budget.get_ref().available_kib(),
+        read_budget.get_ref().shed_count(),
         uptime_secs,
     );
 
@@ -562,7 +589,7 @@ mod tests {
 
     #[test]
     fn renders_all_metric_names() {
-        let body = render_metrics_text(1, 1, 1, 16, 0, 16, 16, 0);
+        let body = render_metrics_text(1, 1, 1, 16, 0, 16, 16, 262_144, 262_144, 0, 0);
         for name in [
             "broker_db_schema_ready",
             "broker_db_reachable",
@@ -571,6 +598,9 @@ mod tests {
             "broker_audit_dropped_total",
             "broker_db_pool_idle",
             "broker_db_pool_max",
+            "broker_read_budget_kib_total",
+            "broker_read_budget_kib_available",
+            "broker_read_shed_total",
             "broker_uptime_seconds",
         ] {
             assert!(body.contains(name), "missing metric: {name}");
@@ -579,7 +609,7 @@ mod tests {
 
     #[test]
     fn each_metric_has_help_and_type() {
-        let body = render_metrics_text(1, 1, 1, 16, 0, 16, 16, 0);
+        let body = render_metrics_text(1, 1, 1, 16, 0, 16, 16, 262_144, 262_144, 0, 0);
         // Each metric must have a # HELP and a # TYPE line.
         for name in [
             "broker_db_schema_ready",
@@ -589,6 +619,9 @@ mod tests {
             "broker_audit_dropped_total",
             "broker_db_pool_idle",
             "broker_db_pool_max",
+            "broker_read_budget_kib_total",
+            "broker_read_budget_kib_available",
+            "broker_read_shed_total",
             "broker_uptime_seconds",
         ] {
             let help_line = format!("# HELP {name}");
@@ -602,7 +635,7 @@ mod tests {
     fn renders_zero_state() {
         // All-zero state: DB unreachable, audit disabled, no permits available,
         // pool saturated (0 idle).
-        let body = render_metrics_text(0, 0, 0, 0, 0, 0, 0, 0);
+        let body = render_metrics_text(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
         assert!(body.contains("\nbroker_db_schema_ready 0\n"));
         assert!(body.contains("\nbroker_db_reachable 0\n"));
         assert!(body.contains("\nbroker_audit_enabled 0\n"));
@@ -610,25 +643,34 @@ mod tests {
         assert!(body.contains("\nbroker_audit_dropped_total 0\n"));
         assert!(body.contains("\nbroker_db_pool_idle 0\n"));
         assert!(body.contains("\nbroker_db_pool_max 0\n"));
+        assert!(body.contains("\nbroker_read_budget_kib_total 0\n"));
+        assert!(body.contains("\nbroker_read_budget_kib_available 0\n"));
+        assert!(body.contains("\nbroker_read_shed_total 0\n"));
         assert!(body.contains("\nbroker_uptime_seconds 0\n"));
     }
 
     #[test]
     fn renders_populated_state() {
-        let body = render_metrics_text(1, 1, 1, 16, 7, 12, 16, 12345);
+        let body = render_metrics_text(1, 1, 1, 16, 7, 12, 16, 262_144, 131_072, 3, 12345);
         assert!(body.contains("\nbroker_db_schema_ready 1\n"));
         assert!(body.contains("\nbroker_audit_inflight_available 16\n"));
         assert!(body.contains("\nbroker_audit_dropped_total 7\n"));
         // 12 idle out of 16 max = 4 in use; pin both so saturation is computable
         assert!(body.contains("\nbroker_db_pool_idle 12\n"));
         assert!(body.contains("\nbroker_db_pool_max 16\n"));
+        // Half the read budget reserved, 3 reads shed — the pair an operator
+        // alerts on: saturation = total - available, and any nonzero shed
+        // counter means requests were refused for lack of memory.
+        assert!(body.contains("\nbroker_read_budget_kib_total 262144\n"));
+        assert!(body.contains("\nbroker_read_budget_kib_available 131072\n"));
+        assert!(body.contains("\nbroker_read_shed_total 3\n"));
         assert!(body.contains("\nbroker_uptime_seconds 12345\n"));
     }
 
     #[test]
     fn wire_shape_is_prometheus_compatible() {
         // Each non-comment line must look like `<name> <value>\n`.
-        let body = render_metrics_text(1, 1, 0, 8, 0, 4, 16, 60);
+        let body = render_metrics_text(1, 1, 0, 8, 0, 4, 16, 262_144, 0, 0, 60);
         for line in body.lines() {
             if line.is_empty() || line.starts_with('#') {
                 continue;

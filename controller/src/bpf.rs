@@ -441,11 +441,15 @@ pub fn ebpf_handle(
             while drained < MAX_DRAIN_PER_ITERATION {
                 let Ok(reg) = rx.try_recv() else { break };
                 drained += 1;
-                // The same flags value goes into all three maps. The
-                // network and netpolicy probes only test the key for
-                // presence and POD_TRACKED is always set, so the tier
-                // and generation bits are inert for them; the syscall
-                // probe reads both out of its instance.
+                // The same flags value goes into all three maps. All
+                // three probes read the generation bits out of their
+                // instance — every per-netns dedup map in the tree is
+                // keyed on (inode, generation), because the kernel
+                // recycles netns inode numbers and a bare-inode key
+                // hands a dead pod's "already reported" state to its
+                // replacement (see KG_GEN_SHIFT in src/bpf/helper.h).
+                // Only the syscall probe reads the tier bits; for the
+                // network and netpolicy probes those stay inert.
                 let key = reg.netns_inode.to_ne_bytes();
                 let val = reg.flags.to_ne_bytes();
                 let _ = network_sk

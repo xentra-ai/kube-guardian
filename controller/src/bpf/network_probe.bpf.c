@@ -52,6 +52,19 @@ struct
 
 // Connection tracking to reduce duplicate events
 // Uses 4-tuple (no source port) to handle ephemeral port rotation
+//
+// `generation` is part of the key for the reason spelled out at
+// KG_GEN_SHIFT in helper.h, and it is the field this struct was missing
+// while the syscall probe's equivalent key already had it. `connections`
+// below is node-wide, nothing deletes from it when a pod dies, and every
+// hit refreshes last_seen so a hot entry never falls out of the LRU. A
+// replacement pod that reused a dead pod's netns inode — routine on
+// EKS/VPC-CNI, where inode numbers and pod IPs both recycle from
+// node-local pools — therefore hashed straight onto its predecessor's
+// entry and was told "already reported, stay quiet" for the rest of its
+// life. DNS was the visible casualty: it is one tuple per pod, so a
+// single suppressed key meant the pod produced no UDP rows at all and
+// its generated policy silently omitted the DNS egress rule.
 struct conn_key {
     __u64 inum;                  // Network namespace inode
     __u8 saddr[IPV6_ADDR_LEN];   // Source IP (v4-mapped when IPv4)
@@ -59,10 +72,12 @@ struct conn_key {
     __u16 dport;                 // Destination port
     __u8 protocol;               // 1=TCP, 2=UDP
     __u8 direction;              // 1=Egress, 2=Ingress
-    __u32 _pad;                  // Explicit tail padding: hash map keys are
-                                 // compared byte-wise, and only *named*
-                                 // members are guaranteed zeroed by a
-                                 // designated initialiser.
+    __u32 generation;            // Registration generation for `inum`. Also
+                                 // occupies what would otherwise be implicit
+                                 // tail padding: hash map keys are compared
+                                 // byte-wise, and only *named* members are
+                                 // guaranteed zeroed by a designated
+                                 // initialiser.
     // NOTE: sport (source port) intentionally omitted to handle ephemeral ports
 };
 
@@ -112,6 +127,9 @@ static __always_inline bool is_new_connection(struct conn_key *key)
 struct tcp_connect_ctx {
     struct sock *sk;
     __u64 inum;
+    __u32 generation; // carried alongside inum so the kretprobe can build the
+                      // same generation-qualified conn_key as every other
+                      // emitter; the accepted socket is not available on entry
 };
 
 // Use LRU map to automatically evict stale entries if thread dies
@@ -134,12 +152,16 @@ struct
 // skip_v4_mapped is set by the v6 hook: a v4-mapped destination is
 // about to be handed to udp_sendmsg by the kernel, where the v4 hook
 // records it, so skipping here keeps each send tracked exactly once.
-static __always_inline int handle_udp_send(struct sock *sk, bool skip_v4_mapped)
+//
+// `msg` is not decoration either — for an unconnected socket it holds
+// the only copy of the destination. See read_msghdr_dest in helper.h.
+static __always_inline int handle_udp_send(struct sock *sk, struct msghdr *msg, bool skip_v4_mapped)
 {
 
     // Validate socket and get inode - single lookup
     __u64 inum = 0;
-    if (!get_and_validate_inum(sk, &inum))
+    __u32 generation = 0;
+    if (!get_and_validate_inum(sk, &inum, &generation))
         return 0;
 
     // Read socket common structure once (batch read) - ports only; the
@@ -157,20 +179,41 @@ static __always_inline int handle_udp_send(struct sock *sk, bool skip_v4_mapped)
     if (!read_sock_addrs(sk, saddr, daddr))
         return 0;
 
+    __u16 dport = bpf_ntohs(skc.skc_dport);
+
+    // The socket only knows a peer if the application connect()ed. An
+    // unconnected sendto() — how musl's resolver issues every DNS query
+    // — carries its destination in the message header instead, and
+    // taking it from the socket yielded 0.0.0.0:0, which the filter
+    // below then dropped as unspecified. Must run BEFORE the
+    // skip_v4_mapped test: that test asks what the destination is, and
+    // until this point an unconnected v6 socket answers `::`.
+    __u8 msg_daddr[IPV6_ADDR_LEN];
+    __u16 msg_dport = 0;
+    if (read_msghdr_dest(msg, msg_daddr, &msg_dport))
+    {
+        __builtin_memcpy(daddr, msg_daddr, IPV6_ADDR_LEN);
+        dport = msg_dport;
+    }
+
     // See the contract above: the v6 entry point leaves v4-mapped sends
     // to the v4 hook the kernel is about to invoke.
     if (skip_v4_mapped && addr_is_v4_mapped(daddr))
         return 0;
 
-    // Apply common filtering helper
-    if (should_filter_traffic(saddr, daddr))
+    // Apply common filtering helper. The udp_egress variant tolerates an
+    // unspecified SOURCE, which is what a socket bound to INADDR_ANY has
+    // at this point in the send — the route that picks one has not run
+    // yet. See should_filter_udp_egress in helper.h.
+    if (should_filter_udp_egress(saddr, daddr))
         return 0;
 
     // Check if this is a new connection (reduces duplicate events by 80-90%)
     // Uses 4-tuple to handle ephemeral source port rotation
     struct conn_key conn = {
         .inum = inum,
-        .dport = bpf_ntohs(skc.skc_dport),
+        .generation = generation,
+        .dport = dport,
         .protocol = 2, // UDP
         .direction = 1, // Egress
     };
@@ -191,7 +234,7 @@ static __always_inline int handle_udp_send(struct sock *sk, bool skip_v4_mapped)
     __builtin_memcpy(event->saddr, saddr, IPV6_ADDR_LEN);
     __builtin_memcpy(event->daddr, daddr, IPV6_ADDR_LEN);
     event->sport = skc.skc_num;
-    event->dport = bpf_ntohs(skc.skc_dport);
+    event->dport = dport;
     event->kind = 3; // UDP
     event->_pad = 0; // ring-buffer memory is not zeroed on reserve
 
@@ -205,7 +248,7 @@ static __always_inline int handle_udp_send(struct sock *sk, bool skip_v4_mapped)
 SEC("fentry/udp_sendmsg")
 int BPF_PROG(trace_udp_send, struct sock *sk, struct msghdr *msg, size_t len)
 {
-    return handle_udp_send(sk, /* skip_v4_mapped = */ false);
+    return handle_udp_send(sk, msg, /* skip_v4_mapped = */ false);
 }
 
 // Twin entry point for native IPv6 UDP. Without it, AF_INET6 UDP egress
@@ -216,7 +259,7 @@ int BPF_PROG(trace_udp_send, struct sock *sk, struct msghdr *msg, size_t len)
 SEC("fentry/udpv6_sendmsg")
 int BPF_PROG(trace_udpv6_send, struct sock *sk, struct msghdr *msg, size_t len)
 {
-    return handle_udp_send(sk, /* skip_v4_mapped = */ true);
+    return handle_udp_send(sk, msg, /* skip_v4_mapped = */ true);
 }
 
 // Hook into tcp_set_state to detect ESTABLISHED connections (outbound)
@@ -245,7 +288,8 @@ int BPF_PROG(trace_tcp_state_change, struct sock *sk, int state)
 
     // Get network namespace inode
     __u64 inum = 0;
-    if (!get_and_validate_inum(sk, &inum))
+    __u32 generation = 0;
+    if (!get_and_validate_inum(sk, &inum, &generation))
         return 0;
 
     // Apply common filtering helper
@@ -288,6 +332,7 @@ int BPF_PROG(trace_tcp_state_change, struct sock *sk, int state)
     // connection look new, defeating kernel-side dedup entirely.
     struct conn_key conn = {
         .inum = inum,
+        .generation = generation,
         .dport = (direction == 2) ? sport : dport,
         .protocol = 1, // TCP
         .direction = direction,
@@ -324,7 +369,8 @@ int BPF_KPROBE(tcp_accept_entry, struct sock *sk)
 {
     // Early validation - only store context if socket is in tracked namespace
     __u64 inum = 0;
-    if (!get_and_validate_inum(sk, &inum))
+    __u32 generation = 0;
+    if (!get_and_validate_inum(sk, &inum, &generation))
         return 0;
 
     // Store both listening socket and inum for kretprobe
@@ -332,6 +378,7 @@ int BPF_KPROBE(tcp_accept_entry, struct sock *sk)
     struct tcp_connect_ctx ctx_data = {
         .sk = NULL, // Will use new_sk from kretprobe
         .inum = inum,
+        .generation = generation,
     };
 
     __u32 tid = bpf_get_current_pid_tgid();
@@ -351,6 +398,7 @@ int BPF_KRETPROBE(tcp_accept_exit, struct sock *new_sk)
         return 0;
 
     __u64 inum = ctx_data->inum;
+    __u32 generation = ctx_data->generation;
     bpf_map_delete_elem(&tcp_ctx, &tid);
 
     // Check for failed accept
@@ -381,6 +429,7 @@ int BPF_KRETPROBE(tcp_accept_exit, struct sock *new_sk)
 
     struct conn_key conn = {
         .inum = inum,
+        .generation = generation,
         .dport = skc.skc_num,
         .protocol = 1, // TCP
         .direction = 2, // Ingress

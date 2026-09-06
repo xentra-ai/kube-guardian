@@ -134,7 +134,7 @@ never intend to ship profiles and want the old footprint back:
 
 ```yaml
 syscalls:
-  captureLevel: low      # exactly the previous 56 syscalls, by name
+  captureLevel: low      # the previous 56 syscalls, by name, plus mkdirat
 ```
 
 The other tiers are `high` (everything except hot-path noise), `medium`
