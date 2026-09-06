@@ -12,10 +12,17 @@
 //! arch does not have (`open`, `fork`, `getdents` on aarch64) is logged at
 //! warn and skipped — never a startup failure.
 //!
-//! Only `full` is complete enough to build a seccomp profile from; the
-//! broker refuses to publish a profile whose workload runs at a lower
-//! tier. The tiers exist for operators who want the security signal at a
-//! fraction of the event volume.
+//! Only `full` is complete enough to build an *enforcing* seccomp
+//! profile from. A profile built from a lower tier is missing syscalls
+//! the workload really makes, so the broker's `/export` refuses to
+//! render one with a denying `defaultAction` unless the caller passes
+//! `acknowledgePartial=true`; an audit-only (`SCMP_ACT_LOG`) export is
+//! always allowed, because it records rather than blocks. Every exported
+//! manifest also carries its tier in `metadata.annotations`
+//! (`kguardian.dev/capture-level` / `-complete`), so the gap stays
+//! visible after `kubectl apply` has dropped the comments. The tiers
+//! exist for operators who want the security signal at a fraction of the
+//! event volume.
 
 use libseccomp::{ScmpArch, ScmpSyscall};
 use std::collections::BTreeSet;
@@ -131,7 +138,7 @@ impl std::fmt::Display for CaptureLevel {
 
 /// Default cluster-wide tier when `SYSCALL_CAPTURE_LEVEL` is unset.
 /// `full`, because the in-kernel per-netns dedup makes complete capture
-/// nearly free and only `full` can feed a published seccomp profile.
+/// nearly free and only `full` can feed an enforcing seccomp profile.
 pub const DEFAULT_LEVEL: CaptureLevel = CaptureLevel::Full;
 
 /// `low`: the security-relevant subset — exactly the allowlist the
@@ -166,6 +173,15 @@ pub const LOW: &[&str] = &[
     "renameat",
     "renameat2",
     "mkdir",
+    // Every legacy name here is paired with its `*at` variant, because
+    // the `*at` form is the one modern code actually issues (Go, and
+    // anything working from a dirfd, call `mkdirat` directly) and it is
+    // the only form that exists on arm64. `mkdir` was the one pair left
+    // half-written, so directory creation went unrecorded at `low` and
+    // `medium` on every architecture. `rmdir` needs no partner: it does
+    // not exist on aarch64 either, and `unlinkat(AT_REMOVEDIR)` — i.e.
+    // `unlinkat`, already listed above — is how it is issued.
+    "mkdirat",
     "rmdir",
     "symlink",
     "symlinkat",
@@ -570,11 +586,53 @@ mod tests {
     #[test]
     fn low_names_are_the_original_allowlist() {
         // The old populate_syscall_allowlist carried 56 numbers (the
-        // design doc rounds it to "~55"); the name list must match it
-        // one for one.
-        assert_eq!(LOW.len(), 56);
+        // design doc rounds it to "~55"); the name list started as a
+        // one-for-one copy of it, plus `mkdirat` — the one legacy/`*at`
+        // pair the original left half-written.
+        assert_eq!(LOW.len(), 57);
         let unique: BTreeSet<&str> = LOW.iter().copied().collect();
-        assert_eq!(unique.len(), 56, "LOW has a duplicate");
+        assert_eq!(unique.len(), 57, "LOW has a duplicate");
+    }
+
+    #[test]
+    fn every_legacy_file_syscall_is_paired_with_its_at_variant() {
+        // The omission this pairing check exists to catch: `mkdirat` is
+        // the only form on aarch64 and the form modern code issues on
+        // every arch, so a missing partner means the tier silently stops
+        // recording that operation. `rmdir` is deliberately unpaired —
+        // `unlinkat(AT_REMOVEDIR)` covers it and `unlinkat` is listed.
+        let names: BTreeSet<&str> = medium_names().into_iter().collect();
+        for (legacy, modern) in [
+            ("open", "openat"),
+            ("link", "linkat"),
+            ("chmod", "fchmodat"),
+            ("chown", "fchownat"),
+            ("lchown", "fchownat"),
+            ("getdents", "getdents64"),
+            ("mknod", "mknodat"),
+            ("unlink", "unlinkat"),
+            ("rename", "renameat"),
+            ("symlink", "symlinkat"),
+            ("mkdir", "mkdirat"),
+        ] {
+            assert!(names.contains(legacy), "{legacy} missing from the tiers");
+            assert!(
+                names.contains(modern),
+                "{legacy} is listed but its modern variant {modern} is not"
+            );
+        }
+
+        // And `mkdirat` must reach the `low` tier by number on both
+        // arches — the legacy `mkdir` does not exist on aarch64.
+        for a in [ScmpArch::X8664, ScmpArch::Aarch64] {
+            let t = resolve_tiers_for_arch(&[], a);
+            let (nr, unknown) = resolve_names(["mkdirat"], a);
+            assert!(unknown.is_empty(), "mkdirat unresolved on {a:?}");
+            assert!(
+                nr.is_subset(&t.low) && nr.is_subset(&t.medium),
+                "mkdirat missing from low/medium on {a:?}"
+            );
+        }
     }
 
     #[test]
