@@ -25,8 +25,14 @@
 //!    pods that contributed to a workload's union to the LOWEST tier and
 //!    `complete` is true only when every contributor is `full`;
 //! 2. **recommends**: the `/export` route renders the observed set as a
-//!    CR manifest the user can commit, with a loud warning comment when
-//!    the capture is partial;
+//!    CR manifest the user can commit. Every manifest states its capture
+//!    tier in `metadata.annotations` (`kguardian.dev/capture-level` /
+//!    `-complete` / `-warning`) and on `X-Kguardian-Capture-*` response
+//!    headers, so the partial-capture signal survives `kubectl apply`
+//!    and GitOps rendering instead of living only in a YAML comment. An
+//!    *enforcing* `defaultAction` on a partial capture is refused with
+//!    `409` unless the caller passes `acknowledgePartial=true`;
+//!    audit-only (`SCMP_ACT_LOG`) exports are always allowed;
 //! 3. **reports**: the controller mirrors every CR it sees into
 //!    `seccomp_crs` and every node's on-disk files into
 //!    `seccomp_node_status`, and the summary endpoints fold those into a
@@ -42,7 +48,7 @@ use actix_web::{get, post, web, HttpResponse, Responder};
 use diesel::prelude::*;
 use diesel::r2d2::{self, ConnectionManager};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use tracing::{debug, info, warn};
 
 type DbPool = r2d2::Pool<ConnectionManager<PgConnection>>;
@@ -72,6 +78,37 @@ const VALID_DEFAULT_ACTIONS: [&str; 4] = [
     "SCMP_ACT_KILL",
     "SCMP_ACT_KILL_PROCESS",
 ];
+
+/// Does this `defaultAction` *deny* an unlisted syscall?
+///
+/// `SCMP_ACT_LOG` records what it would have blocked and lets the call
+/// through, so an incomplete profile in log mode is harmless — that is
+/// exactly the workflow for tightening a profile safely. Every other
+/// action denies, so an incomplete profile is a workload outage on the
+/// pod's next restart. The export gate keys off this distinction rather
+/// than on the tier alone: the tier only matters once something enforces.
+fn action_enforces(action: &str) -> bool {
+    action != "SCMP_ACT_LOG"
+}
+
+/// Capture provenance stamped onto every exported CR's
+/// `metadata.annotations`.
+///
+/// The warning used to live only in YAML comments, which `kubectl apply`
+/// discards and most GitOps renderers strip long before an operator sees
+/// them — so a profile built from a partial capture was indistinguishable
+/// from a complete one the moment it left this endpoint. Annotations are
+/// part of the object: they survive apply, they are visible in
+/// `kubectl get -o yaml`, they travel with the manifest in git, and an
+/// admission policy can refuse to enforce a profile that is not marked
+/// complete. The `true`/`false` values are strings because Kubernetes
+/// annotation values always are.
+const CAPTURE_LEVEL_ANNOTATION: &str = "kguardian.dev/capture-level";
+const CAPTURE_COMPLETE_ANNOTATION: &str = "kguardian.dev/capture-complete";
+const CAPTURE_WARNING_ANNOTATION: &str = "kguardian.dev/capture-warning";
+
+/// Query/body flag a caller sets to take a partial profile deliberately.
+const ACK_PARTIAL_PARAM: &str = "acknowledgePartial";
 
 /// FNV-1a (64-bit) over the canonical `syscalls\x1earches\x1edefault_action`
 /// string. A content fingerprint, not a security primitive: the input is
@@ -339,6 +376,27 @@ impl CaptureSummary {
             format!("{} (+{unlisted} more)", listed.join(", "))
         } else {
             listed.join(", ")
+        }
+    }
+
+    /// Contributing pods, listed and unlisted.
+    fn contributors(&self) -> usize {
+        self.pods.len() + self.more
+    }
+
+    /// Why this capture is partial, in one line — the shared wording for
+    /// the export's refusal message and the CR's warning annotation, so
+    /// an operator meets the same sentence at the API and in the object.
+    fn partial_reason(&self) -> String {
+        if self.contributors() == 0 {
+            "no pod has contributed syscalls yet".to_string()
+        } else {
+            format!(
+                "{} on {} pod(s): {}",
+                self.level,
+                self.incomplete,
+                self.culprits()
+            )
         }
     }
 }
@@ -1127,6 +1185,10 @@ pub async fn get_seccomp_profile_file(
 struct ExportMeta {
     name: String,
     namespace: String,
+    /// Capture provenance — see the `CAPTURE_*_ANNOTATION` constants.
+    /// Always populated, so a complete capture is *positively* marked
+    /// rather than merely lacking a warning.
+    annotations: BTreeMap<String, String>,
 }
 
 #[derive(Serialize)]
@@ -1156,6 +1218,50 @@ struct ExportDoc {
     spec: ExportSpec,
 }
 
+/// Accept a flag as a JSON bool (`true`) or as a string (`"true"`, `"1"`,
+/// `"yes"`, `"on"`, case- and whitespace-insensitive). One field is read
+/// from two places — a hand-typed query string on GET, where everything
+/// is a string, and a JSON body on POST, where a client will naturally
+/// send a bool — and a 400 on `?acknowledgePartial=1` would be a trap.
+/// Anything unrecognised is false: this flag waives a safety check, so it
+/// is never granted by accident.
+fn de_lenient_bool<'de, D>(d: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct V;
+    impl<'de> serde::de::Visitor<'de> for V {
+        type Value = bool;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str(
+                "a boolean or one of \"true\"/\"false\"/\"1\"/\"0\"/\"yes\"/\"no\"/\"on\"/\"off\"",
+            )
+        }
+        fn visit_bool<E>(self, v: bool) -> Result<bool, E> {
+            Ok(v)
+        }
+        fn visit_str<E>(self, v: &str) -> Result<bool, E> {
+            Ok(matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "true" | "1" | "yes" | "on"
+            ))
+        }
+        fn visit_unit<E>(self) -> Result<bool, E> {
+            Ok(false)
+        }
+        fn visit_none<E>(self) -> Result<bool, E> {
+            Ok(false)
+        }
+        fn visit_some<D2>(self, d: D2) -> Result<bool, D2::Error>
+        where
+            D2: serde::Deserializer<'de>,
+        {
+            d.deserialize_any(V)
+        }
+    }
+    d.deserialize_any(V)
+}
+
 /// Edits and options an export applies. Query string on GET, JSON body
 /// on POST (the POST form carries the frontend's staged add/remove).
 #[derive(Debug, Deserialize, Default)]
@@ -1171,6 +1277,14 @@ pub struct ExportOptions {
     add: Vec<String>,
     #[serde(default)]
     remove: Vec<String>,
+    /// Take a partial-capture profile with an *enforcing* action anyway.
+    /// Without it that combination is refused; see `export_impl`.
+    #[serde(
+        default,
+        rename = "acknowledgePartial",
+        deserialize_with = "de_lenient_bool"
+    )]
+    acknowledge_partial: bool,
 }
 
 const MAX_EDIT_LIST: usize = 512;
@@ -1182,6 +1296,7 @@ struct ExportPlan {
     json: bool,
     add: BTreeSet<String>,
     remove: BTreeSet<String>,
+    acknowledge_partial: bool,
 }
 
 fn validate_export(opts: ExportOptions) -> Result<ExportPlan, actix_web::Error> {
@@ -1191,6 +1306,7 @@ fn validate_export(opts: ExportOptions) -> Result<ExportPlan, actix_web::Error> 
         format,
         add,
         remove,
+        acknowledge_partial,
     } = opts;
     let name = name.map(|n| n.trim().to_string()).filter(|n| !n.is_empty());
     if let Some(n) = &name {
@@ -1240,6 +1356,7 @@ fn validate_export(opts: ExportOptions) -> Result<ExportPlan, actix_web::Error> 
         json,
         add,
         remove,
+        acknowledge_partial,
     })
 }
 
@@ -1258,6 +1375,24 @@ fn export_document(obs: &Observed, plan: &ExportPlan) -> (ExportDoc, Vec<String>
         .filter_map(|a| arch_token(a))
         .map(String::from)
         .collect();
+    let c = &obs.capture;
+    let mut annotations = BTreeMap::from([
+        (CAPTURE_LEVEL_ANNOTATION.to_string(), c.level.to_string()),
+        (
+            CAPTURE_COMPLETE_ANNOTATION.to_string(),
+            c.complete.to_string(),
+        ),
+    ]);
+    if !c.complete {
+        annotations.insert(
+            CAPTURE_WARNING_ANNOTATION.to_string(),
+            format!(
+                "partial capture ({}) — this profile omits syscalls the workload makes; \
+                 raise the tier to full and re-export before enforcing",
+                c.partial_reason()
+            ),
+        );
+    }
     let doc = ExportDoc {
         api_version: "kguardian.dev/v1alpha1",
         kind: "SeccompProfile",
@@ -1267,6 +1402,7 @@ fn export_document(obs: &Observed, plan: &ExportPlan) -> (ExportDoc, Vec<String>
                 .clone()
                 .unwrap_or_else(|| suggested_cr_name(&r.workload_kind, &r.workload_name)),
             namespace: r.pod_namespace.clone(),
+            annotations,
         },
         spec: ExportSpec {
             default_action: plan.default_action.clone(),
@@ -1286,8 +1422,7 @@ fn export_document(obs: &Observed, plan: &ExportPlan) -> (ExportDoc, Vec<String>
         },
     };
 
-    let c = &obs.capture;
-    let contributors = c.pods.len() + c.more;
+    let contributors = c.contributors();
     let mut header = vec![
         "kguardian SeccompProfile export".to_string(),
         format!(
@@ -1323,11 +1458,7 @@ fn export_document(obs: &Observed, plan: &ExportPlan) -> (ExportDoc, Vec<String>
         ));
     }
     if !c.complete {
-        let detail = if contributors == 0 {
-            "no pod has contributed syscalls yet".to_string()
-        } else {
-            format!("{} on {} pod(s): {}", c.level, c.incomplete, c.culprits())
-        };
+        let detail = c.partial_reason();
         header.push(format!(
             "WARNING: partial capture ({detail}) — this profile will block"
         ));
@@ -1395,6 +1526,12 @@ fn render_yaml(doc: &ExportDoc, header: &[String]) -> String {
         "  namespace: {}\n",
         yaml_scalar(&doc.metadata.namespace)
     ));
+    if !doc.metadata.annotations.is_empty() {
+        y.push_str("  annotations:\n");
+        for (k, v) in &doc.metadata.annotations {
+            y.push_str(&format!("    {}: {}\n", yaml_scalar(k), yaml_scalar(v)));
+        }
+    }
     y.push_str("spec:\n");
     y.push_str(&format!(
         "  defaultAction: {}\n",
@@ -1430,15 +1567,50 @@ fn render_yaml(doc: &ExportDoc, header: &[String]) -> String {
     y
 }
 
+/// The gate the tier documentation promises: `Some(message)` when this
+/// export must be refused, `None` when it may proceed.
+///
+/// Only `full` observes every syscall, so a profile built from a lower
+/// tier is missing calls the workload really makes. A denying
+/// `defaultAction` turns those misses into a workload outage on the pod's
+/// next restart — hours after the manifest was applied, and nowhere near
+/// it. The comment header this used to rely on is discarded by `kubectl
+/// apply` and stripped by most GitOps renderers, so it could never be the
+/// safety check; a status code cannot be stripped.
+///
+/// Scoped to *enforcing* actions on purpose. `SCMP_ACT_LOG` (the default
+/// this endpoint renders) only records what it would have blocked, so a
+/// partial audit profile breaks nothing and is the normal way to grow a
+/// profile safely — refusing it would cost a real workflow and prevent
+/// nothing. The opt-out exists for the operator who has decided the gap
+/// is acceptable; it is explicit, so it cannot be taken by accident.
+fn partial_export_refusal(c: &CaptureSummary, plan: &ExportPlan) -> Option<String> {
+    if c.complete || !action_enforces(&plan.default_action) || plan.acknowledge_partial {
+        return None;
+    }
+    Some(format!(
+        "refusing to export an enforcing profile ({}) from a partial capture: {}.\n\
+         Only the full tier observes every syscall, so this profile would block syscalls \
+         the workload makes. Raise the tier to full (the kguardian.dev/syscall-capture pod \
+         annotation, or SYSCALL_CAPTURE_LEVEL cluster-wide), let the profile re-accrue, \
+         then export again.\n\
+         Or export with defaultAction={DEFAULT_SECCOMP_ACTION} for an audit-only profile \
+         now, or pass {ACK_PARTIAL_PARAM}=true to take this one as it is.\n",
+        plan.default_action,
+        c.partial_reason(),
+    ))
+}
+
 async fn export_impl(
     pool: web::Data<DbPool>,
     (namespace, kind, name): (String, String, String),
     plan: ExportPlan,
 ) -> actix_web::Result<HttpResponse> {
     info!(%namespace, %kind, %name, json = plan.json, "export seccomp profile CR");
+    let (ns, k, n) = (namespace.clone(), kind.clone(), name.clone());
     let obs = web::block(move || {
         let mut conn = pool.get()?;
-        one_observed(&mut conn, &namespace, &kind, &name)
+        one_observed(&mut conn, &ns, &k, &n)
     })
     .await?
     .map_err(actix_web::error::ErrorInternalServerError)?;
@@ -1446,20 +1618,57 @@ async fn export_impl(
     let Some(obs) = obs else {
         return Ok(HttpResponse::NotFound().body("no seccomp profile for that workload"));
     };
+
+    let c = &obs.capture;
+    if let Some(msg) = partial_export_refusal(c, &plan) {
+        warn!(
+            %namespace, %kind, %name,
+            level = c.level,
+            incomplete = c.incomplete,
+            action = %plan.default_action,
+            "refused enforcing seccomp export from a partial capture"
+        );
+        return Ok(capture_headers(HttpResponse::Conflict(), c)
+            .content_type("text/plain; charset=utf-8")
+            .body(msg));
+    }
+
     let (doc, header) = export_document(&obs, &plan);
     Ok(if plan.json {
-        HttpResponse::Ok().json(doc)
+        capture_headers(HttpResponse::Ok(), c).json(doc)
     } else {
-        HttpResponse::Ok()
+        capture_headers(HttpResponse::Ok(), c)
             .content_type("application/yaml")
             .body(render_yaml(&doc, &header))
     })
 }
 
-/// `GET /seccomp/profiles/{namespace}/{kind}/{name}/export?name=&defaultAction=&format=`
+/// Stamp the capture verdict on the response itself.
+///
+/// The document carries the same facts in `metadata.annotations`, but a
+/// caller that streams the body straight to a file (`curl -o`, a CI step)
+/// can branch on these without parsing YAML — and they are present on the
+/// refusal too, so a client can tell *why* it was refused from the
+/// headers alone.
+fn capture_headers(
+    mut builder: actix_web::HttpResponseBuilder,
+    c: &CaptureSummary,
+) -> actix_web::HttpResponseBuilder {
+    builder.insert_header(("X-Kguardian-Capture-Level", c.level));
+    builder.insert_header((
+        "X-Kguardian-Capture-Complete",
+        if c.complete { "true" } else { "false" },
+    ));
+    builder
+}
+
+/// `GET /seccomp/profiles/{namespace}/{kind}/{name}/export?name=&defaultAction=&format=&acknowledgePartial=`
 /// — the observed set as a `SeccompProfile` CR manifest (YAML by
 /// default; `format=json`). Never writes anything: the user commits
 /// and applies it.
+///
+/// `409` when the capture is partial and `defaultAction` enforces,
+/// unless `acknowledgePartial=true`.
 #[get("/seccomp/profiles/{namespace}/{kind}/{name}/export")]
 pub async fn export_seccomp_profile(
     pool: web::Data<DbPool>,
@@ -1473,6 +1682,7 @@ pub async fn export_seccomp_profile(
 /// `POST /seccomp/profiles/{namespace}/{kind}/{name}/export` — same
 /// document, with the options in a JSON body plus `add` / `remove`
 /// syscall edits applied to the observed set (the UI's staged edits).
+/// Same partial-capture gate as the GET form.
 #[post("/seccomp/profiles/{namespace}/{kind}/{name}/export")]
 pub async fn export_seccomp_profile_post(
     pool: web::Data<DbPool>,
@@ -2437,6 +2647,9 @@ kind: SeccompProfile
 metadata:
   name: deployment-web
   namespace: prod
+  annotations:
+    kguardian.dev/capture-complete: \"true\"
+    kguardian.dev/capture-level: full
 spec:
   defaultAction: SCMP_ACT_LOG
   architectures:
@@ -2479,6 +2692,10 @@ kind: SeccompProfile
 metadata:
   name: web-audit
   namespace: prod
+  annotations:
+    kguardian.dev/capture-complete: \"false\"
+    kguardian.dev/capture-level: low
+    kguardian.dev/capture-warning: \"partial capture (low on 1 pod(s): web-2 (low)) — this profile omits syscalls the workload makes; raise the tier to full and re-export before enforcing\"
 spec:
   defaultAction: SCMP_ACT_ERRNO
   syscalls:
@@ -2516,7 +2733,17 @@ spec:
             serde_json::json!({
                 "apiVersion": "kguardian.dev/v1alpha1",
                 "kind": "SeccompProfile",
-                "metadata": { "name": "deployment-web", "namespace": "prod" },
+                "metadata": {
+                    "name": "deployment-web",
+                    "namespace": "prod",
+                    // JSON drops the comment header entirely, so the
+                    // annotations are the ONLY capture signal a
+                    // `format=json` consumer ever sees.
+                    "annotations": {
+                        "kguardian.dev/capture-level": "full",
+                        "kguardian.dev/capture-complete": "true"
+                    }
+                },
                 "spec": {
                     "defaultAction": "SCMP_ACT_LOG",
                     "architectures": ["SCMP_ARCH_ARM64"],
@@ -2525,6 +2752,157 @@ spec:
                 }
             })
         );
+    }
+
+    // ---- the partial-capture export gate --------------------------------
+
+    fn partial() -> CaptureSummary {
+        capture_summary(&pods(&[("web-1", Some("full")), ("web-2", Some("low"))]))
+    }
+
+    fn complete() -> CaptureSummary {
+        capture_summary(&pods(&[("web-1", Some("full"))]))
+    }
+
+    #[test]
+    fn enforcing_export_from_a_partial_capture_is_refused() {
+        // The defect this gate closes: every enforcing action would
+        // otherwise hand back a profile that blocks syscalls the
+        // workload makes.
+        for action in ["SCMP_ACT_ERRNO", "SCMP_ACT_KILL", "SCMP_ACT_KILL_PROCESS"] {
+            let p = plan(serde_json::json!({ "defaultAction": action }));
+            let msg = partial_export_refusal(&partial(), &p)
+                .unwrap_or_else(|| panic!("{action} on a partial capture must be refused"));
+            // The message must name the action, the tier, the culprit
+            // pod and both ways out — it is the only thing a CLI user
+            // sees.
+            assert!(msg.contains(action), "{msg}");
+            assert!(msg.contains("web-2 (low)"), "{msg}");
+            assert!(msg.contains("SYSCALL_CAPTURE_LEVEL"), "{msg}");
+            assert!(msg.contains("acknowledgePartial=true"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn audit_export_from_a_partial_capture_is_allowed() {
+        // SCMP_ACT_LOG cannot break a workload, and growing a profile in
+        // log mode is the supported path — gating it would cost a real
+        // workflow and prevent nothing.
+        let p = plan(serde_json::json!({ "defaultAction": "SCMP_ACT_LOG" }));
+        assert!(partial_export_refusal(&partial(), &p).is_none());
+        // ...and it is the default, so a plain export still works.
+        assert!(partial_export_refusal(&partial(), &plan(serde_json::json!({}))).is_none());
+    }
+
+    #[test]
+    fn a_complete_capture_is_never_refused() {
+        for action in VALID_DEFAULT_ACTIONS {
+            let p = plan(serde_json::json!({ "defaultAction": action }));
+            assert!(
+                partial_export_refusal(&complete(), &p).is_none(),
+                "{action}"
+            );
+        }
+    }
+
+    #[test]
+    fn acknowledging_the_gap_permits_the_enforcing_export() {
+        let p = plan(serde_json::json!({
+            "defaultAction": "SCMP_ACT_ERRNO", "acknowledgePartial": true
+        }));
+        assert!(partial_export_refusal(&partial(), &p).is_none());
+        // A workload with no contributors at all is partial too, and the
+        // opt-out covers it.
+        assert!(partial_export_refusal(&capture_summary(&[]), &p).is_none());
+        let p = plan(serde_json::json!({ "defaultAction": "SCMP_ACT_ERRNO" }));
+        assert!(partial_export_refusal(&capture_summary(&[]), &p)
+            .is_some_and(|m| m.contains("no pod has contributed syscalls yet")));
+    }
+
+    #[test]
+    fn acknowledge_partial_reads_bools_and_strings_and_defaults_to_false() {
+        // GET sends a string, POST sends a JSON bool; a 400 on
+        // `?acknowledgePartial=1` would be a trap.
+        for v in [
+            serde_json::json!(true),
+            serde_json::json!("true"),
+            serde_json::json!("TRUE"),
+            serde_json::json!(" yes "),
+            serde_json::json!("1"),
+            serde_json::json!("on"),
+        ] {
+            let p = plan(serde_json::json!({ "acknowledgePartial": v }));
+            assert!(p.acknowledge_partial, "{v} must waive the gate");
+        }
+        // Anything unrecognised leaves the safety check in place: this
+        // flag is never granted by accident.
+        for v in [
+            serde_json::json!(false),
+            serde_json::json!("false"),
+            serde_json::json!("0"),
+            serde_json::json!("off"),
+            serde_json::json!("maybe"),
+            serde_json::json!(""),
+            serde_json::json!(null),
+        ] {
+            let p = plan(serde_json::json!({ "acknowledgePartial": v }));
+            assert!(!p.acknowledge_partial, "{v} must not waive the gate");
+        }
+        assert!(!plan(serde_json::json!({})).acknowledge_partial);
+
+        // And the query-string form the GET route actually parses.
+        let q: ExportOptions =
+            serde_urlencoded::from_str("defaultAction=SCMP_ACT_ERRNO&acknowledgePartial=true")
+                .unwrap();
+        assert!(q.acknowledge_partial);
+        let q: ExportOptions = serde_urlencoded::from_str("acknowledgePartial=1").unwrap();
+        assert!(q.acknowledge_partial);
+        let q: ExportOptions = serde_urlencoded::from_str("name=x").unwrap();
+        assert!(!q.acknowledge_partial);
+    }
+
+    #[test]
+    fn every_export_stamps_its_capture_tier_on_the_object() {
+        // The annotations are the point of the fix: a YAML comment is
+        // dropped by `kubectl apply` and by GitOps rendering, so the
+        // provenance has to live in the object to survive the trip.
+        let mut obs = observed_fixture("read", "x86_64", Vec::new());
+        let (doc, _) = export_document(&obs, &plan(serde_json::json!({})));
+        assert_eq!(
+            doc.metadata.annotations.get(CAPTURE_LEVEL_ANNOTATION),
+            Some(&"full".to_string())
+        );
+        assert_eq!(
+            doc.metadata.annotations.get(CAPTURE_COMPLETE_ANNOTATION),
+            Some(&"true".to_string())
+        );
+        // A complete capture is positively marked and carries no warning,
+        // so an admission policy can require the positive assertion
+        // rather than trusting the absence of a warning.
+        assert!(!doc
+            .metadata
+            .annotations
+            .contains_key(CAPTURE_WARNING_ANNOTATION));
+
+        obs.capture = partial();
+        let (doc, _) = export_document(&obs, &plan(serde_json::json!({})));
+        assert_eq!(
+            doc.metadata.annotations.get(CAPTURE_COMPLETE_ANNOTATION),
+            Some(&"false".to_string())
+        );
+        assert_eq!(
+            doc.metadata.annotations.get(CAPTURE_LEVEL_ANNOTATION),
+            Some(&"low".to_string())
+        );
+        let w = doc
+            .metadata
+            .annotations
+            .get(CAPTURE_WARNING_ANNOTATION)
+            .expect("partial capture must carry a warning annotation");
+        assert!(w.contains("web-2 (low)"), "{w}");
+        // One line: a newline here would render as a YAML block scalar
+        // and break the manifest.
+        assert!(!w.contains('\n'), "{w}");
     }
 
     #[test]
