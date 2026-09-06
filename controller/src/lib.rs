@@ -7,6 +7,9 @@ pub mod error;
 pub mod pod_reconciler;
 pub mod pod_watcher;
 pub mod service_watcher;
+/// Shared supervision for the long-lived apiserver watches above.
+/// Internal: nothing outside the crate should drive a watch directly.
+pub(crate) mod watch_loop;
 use error::*;
 
 pub mod models;

@@ -151,7 +151,33 @@ async fn main() -> Result<(), Error> {
         Ok::<(), Error>(())
     };
 
-    // Wait for all tasks to complete or shutdown signal
+    // Wait for all tasks to complete or shutdown signal.
+    //
+    // `try_join!` means the FIRST subsystem to return `Err` tears down
+    // every other one. That is deliberate for the ones left here, and
+    // it is no longer a trapdoor for the apiserver watches: `watch_pods`
+    // and `watch_service` handle their stream errors in-band and never
+    // return at all now (see watch_loop). Before that, a single dropped
+    // apiserver connection resolved their `try_for_each`, propagated a
+    // `?` through here, and took kernel-side capture down with it — 26
+    // of 42 Controllers exited that way inside six minutes on
+    // 2026-09-04, each losing a `connections` LRU, its `inode_num`
+    // registrations and its tier allowlists with nothing to backfill
+    // them. Watch failures degrade the watch; they do not stop capture.
+    //
+    // `ebpf_handle` stays in the join on purpose, and the asymmetry is
+    // the point. Kernel-side capture is the product: a Controller whose
+    // eBPF loader has died is not degraded, it is blind, and a blind
+    // Controller that keeps running turns kguardian's core guarantee
+    // (observed-absence means safe-to-deny) into a lie that nothing
+    // marks. Exiting non-zero is the only signal that reaches an
+    // operator today — there is no readiness endpoint on this
+    // DaemonSet — so a capture failure must still restart the pod.
+    // Pulling it out of the join would buy nothing and hide that.
+    //
+    // The remaining hazard is that all of these are polled on ONE task,
+    // so a blocking mistake anywhere wedges everything. That is #1346
+    // and is not addressed here.
     tokio::select! {
         result = async {
             tokio::try_join!(
@@ -166,6 +192,11 @@ async fn main() -> Result<(), Error> {
                 async { ebpf_handle.await? }
             )
         } => { result?; }
+        // The watches are infinite by construction now, so the join
+        // branch above no longer completes on its own in the normal
+        // case: this arm is the ordinary way the process ends. Both
+        // futures are polled on this task, so completing here drops the
+        // join and cancels every subsystem with it.
         _ = shutdown => {
             info!("Graceful shutdown complete");
         }

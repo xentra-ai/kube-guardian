@@ -1,7 +1,7 @@
 use crate::network::canonicalize_ip;
+use crate::watch_loop::run_watch;
 use crate::{api_post_call, Error, SvcDetail};
 use chrono::Utc;
-use futures::TryStreamExt;
 use k8s_openapi::api::core::v1::Service;
 use kube::{
     runtime::{watcher, WatchStreamExt},
@@ -12,41 +12,56 @@ use tracing::{debug, error, warn};
 
 pub async fn watch_service() -> Result<(), Error> {
     let c = Client::try_default().await?;
-    let svc: Api<Service> = Api::all(c.clone());
+    let svc: Api<Service> = Api::all(c);
     let wc = watcher::Config::default();
-    watcher(svc, wc)
-        .applied_objects()
-        .default_backoff()
-        .try_for_each(|p| {
-            async move {
-                if let Some(unready_reason) = svc_unready(&p) {
-                    warn!("{}", unready_reason);
-                } else {
-                    // debug not info — fires for every Service watch
-                    // event including the full re-sync on startup
-                    // (one line per Service in the cluster). Same
-                    // noise class as the per-pod-event info logs
-                    // dropped in becf12c7 / da590498 / faf10771. The
-                    // controller is correctly tracking Services
-                    // either way; operators don't need the per-event
-                    // confirmation at INFO. Symmetric with the broker
-                    // side's add_svc_details info → debug in 482cae24.
-                    debug!("SVC  {} Ready", p.name_any());
 
-                    let ep = update_serviceinfo(p).await;
-                    // log the error and proceed
-                    if let Err(e) = ep {
-                        error!(
-                            "Failed while updating the endpoint slice info {}",
-                            e.to_string()
-                        );
-                    }
+    // `.default_backoff()` before `.applied_objects()` (kube-rs's own
+    // ordering), and `run_watch` instead of `try_for_each`. The old
+    // chain resolved on the first `Err` and dropped the stream along
+    // with the backoff sleep it had just armed, so the watch never
+    // reconnected and the `?` propagated into main's try_join! — which
+    // is what exited 26 of 42 Controllers, kernel-side capture
+    // included, during the six-minute apiserver disruption on
+    // 2026-09-04. Service metadata going stale for a few minutes is a
+    // degraded correlation lookup; losing the eBPF maps is a hole in
+    // the observed baseline that nothing can backfill. See watch_loop.
+    run_watch(
+        "service",
+        move || {
+            watcher(svc.clone(), wc.clone())
+                .default_backoff()
+                .applied_objects()
+        },
+        |p| async move {
+            if let Some(unready_reason) = svc_unready(&p) {
+                warn!("{}", unready_reason);
+            } else {
+                // debug not info — fires for every Service watch
+                // event including the full re-sync on startup
+                // (one line per Service in the cluster). Same
+                // noise class as the per-pod-event info logs
+                // dropped in becf12c7 / da590498 / faf10771. The
+                // controller is correctly tracking Services
+                // either way; operators don't need the per-event
+                // confirmation at INFO. Symmetric with the broker
+                // side's add_svc_details info → debug in 482cae24.
+                debug!("SVC  {} Ready", p.name_any());
+
+                let ep = update_serviceinfo(p).await;
+                // log the error and proceed
+                if let Err(e) = ep {
+                    error!(
+                        "Failed while updating the endpoint slice info {}",
+                        e.to_string()
+                    );
                 }
-                Ok(())
             }
-        })
-        .await?;
+        },
+    )
+    .await;
 
+    // Unreachable: `run_watch` loops forever. main's try_join! keeps
+    // holding this future until the shutdown select! cancels it.
     Ok(())
 }
 
