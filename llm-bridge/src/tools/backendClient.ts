@@ -109,10 +109,6 @@ export async function clusterPolicySupport(): Promise<ClusterPolicySupport> {
   return cniCache.value;
 }
 
-/** Back-compat shim for callers that only care which CNI is installed. */
-export async function clusterCni(): Promise<string> {
-  return (await clusterPolicySupport()).cni;
-}
 
 /** Test hook: clear the CNI cache. */
 export function resetClusterCniCache(): void {

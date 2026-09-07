@@ -1,4 +1,5 @@
 import type { PolicyType } from '../hooks/policyEditor/usePolicyExport';
+import { recommendedPolicyType } from './cniPolicySupport';
 
 /** The kinds of finding the Findings view surfaces per workload. */
 export type FindingKind = 'denied-traffic' | 'sensitive-syscalls' | 'egress-fanout' | 'would-deny';
@@ -12,5 +13,8 @@ export type FindingKind = 'denied-traffic' | 'sensitive-syscalls' | 'egress-fano
  */
 export function policyTypeForFinding(kind: FindingKind, cni: string = 'unknown'): PolicyType {
   if (kind === 'sensitive-syscalls') return 'seccomp';
-  return cni === 'cilium' ? 'cilium' : 'network';
+  // Delegated, not restated. This rule also decides the Policy Builder's
+  // default tab, and two copies of "which kind can this cluster enforce"
+  // drift the moment a CNI is added to one and not the other.
+  return recommendedPolicyType(cni);
 }

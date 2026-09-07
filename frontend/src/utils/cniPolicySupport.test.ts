@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest';
+import { policyTypeForFinding } from './findingPolicyType';
 import {
   recommendedPolicyType,
   enforcementAdvisory,
@@ -81,6 +82,26 @@ describe('enforcementAdvisory', () => {
           if (a) expect(a.detail).not.toMatch(/works on any CNI/i);
         }
       }
+    }
+  });
+});
+
+describe('one rule, one place', () => {
+  // The regression this guards is one I introduced and nearly shipped:
+  // findingPolicyType already encoded "cilium gets a CiliumNetworkPolicy,
+  // everything else gets a NetworkPolicy", and adding a second copy in
+  // recommendedPolicyType meant a CNI added to one would silently not be
+  // added to the other. They must agree by construction, not by memory.
+  it('findingPolicyType agrees with recommendedPolicyType for every CNI', () => {
+    for (const cni of ['cilium', 'aws-vpc-cni', 'calico', 'flannel', 'antrea', 'weave', 'unknown']) {
+      expect(policyTypeForFinding('denied-traffic', cni)).toBe(recommendedPolicyType(cni));
+      expect(policyTypeForFinding('would-deny', cni)).toBe(recommendedPolicyType(cni));
+    }
+  });
+
+  it('still routes a syscall finding to seccomp regardless of CNI', () => {
+    for (const cni of ['cilium', 'aws-vpc-cni', 'unknown']) {
+      expect(policyTypeForFinding('sensitive-syscalls', cni)).toBe('seccomp');
     }
   });
 });

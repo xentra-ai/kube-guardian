@@ -13,6 +13,7 @@ import { SettingsPanel } from './components/SettingsPanel';
 import { useSettings } from './contexts/SettingsContext';
 import { useClusterEnvironment } from './hooks/useClusterEnvironment';
 import { policyTypeForFinding, type FindingKind } from './utils/findingPolicyType';
+import { recommendedPolicyType } from './utils/cniPolicySupport';
 import type { PolicyType } from './hooks/policyEditor';
 import { useCluster } from './contexts/ClusterContext';
 
@@ -156,7 +157,7 @@ function App() {
 
   const handleBuildPolicy = (pod: PodNodeData) => {
     setPolicyBuilderInitialPod(pod);
-    setPolicyBuilderInitialType('network');
+    setPolicyBuilderInitialType(recommendedPolicyType(cni));
     setIsPolicyBuilderOpen(true);
   };
 
@@ -173,9 +174,9 @@ function App() {
   // otherwise with no pod so it shows the workload picker.
   const openPolicyBuilder = useCallback(() => {
     setPolicyBuilderInitialPod(selectedPod && !selectedPod.isExternal ? selectedPod : null);
-    setPolicyBuilderInitialType('network');
+    setPolicyBuilderInitialType(recommendedPolicyType(cni));
     setIsPolicyBuilderOpen(true);
-  }, [selectedPod]);
+  }, [selectedPod, cni]);
 
   const handleAILayoutChange = useCallback((isSidePanel: boolean, isCollapsed: boolean, width?: number) => {
     setAISidePanel({ isSidePanel, isCollapsed, width: width ?? UI_DIMENSIONS.AI_PANEL_DEFAULT_WIDTH });
