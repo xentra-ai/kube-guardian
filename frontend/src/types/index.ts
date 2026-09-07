@@ -154,6 +154,18 @@ export interface ClusterEnvironment {
   provider: string;
   distro: string;
   node_os: string;
+  /**
+   * Whether a NetworkPolicy would actually be enforced in this cluster:
+   * 'enforced' | 'unenforced' | 'mixed' | 'unknown'.
+   *
+   * Separate from `cni` because the two are orthogonal. AWS VPC CNI
+   * supports NetworkPolicy only when explicitly enabled and ships with
+   * it off; with it off the CNI accepts a policy and silently ignores
+   * it. So knowing the CNI never answered whether a generated policy
+   * will do anything, which is the only question the operator actually
+   * has.
+   */
+  policy_enforcement: string;
   nodes: number;
 }
 
@@ -163,5 +175,6 @@ export const UNKNOWN_CLUSTER_ENVIRONMENT: ClusterEnvironment = {
   provider: 'unknown',
   distro: 'unknown',
   node_os: 'unknown',
+  policy_enforcement: 'unknown',
   nodes: 0,
 };

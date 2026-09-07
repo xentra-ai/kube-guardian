@@ -1,40 +1,61 @@
 import React, { useState } from 'react';
 import { AlertTriangle, X } from 'lucide-react';
+import { isDismissible, type PolicyAdvisory } from '../../utils/cniPolicySupport';
 
-interface CniMismatchNoticeProps {
-  /** The detected cluster CNI (never 'unknown' or 'cilium' here —
-   *  callers only render this on a real mismatch). */
-  cni: string;
+interface PolicyAdvisoryNoticeProps {
+  advisory: PolicyAdvisory;
 }
 
 /**
- * Dismissible notice shown on the Cilium Policy tab when the cluster's
- * detected CNI is something else: the CiliumNetworkPolicy CRD is
- * likely absent (apply fails), or — worse — present but unenforced
- * (policy applies and is silently inert). Export stays enabled: the
- * YAML may be destined for a different cluster.
+ * Notice shown above the policy body when the cluster cannot enforce
+ * the kind of policy on screen.
+ *
+ * Two changes from the CNI-only notice this replaces, both of which
+ * matter more than they look:
+ *
+ * It no longer claims "a standard Network Policy works on any CNI".
+ * That was false. A NetworkPolicy is enforced only where the CNI
+ * enforces policy, and AWS VPC CNI — the default on EKS — ships with
+ * enforcement OFF, in which case it accepts the object and silently
+ * ignores it. Telling an operator their policy "works" there is the
+ * worst available answer for a tool whose promise is that
+ * observed-absence means safe-to-deny.
+ *
+ * And an `error` advisory is NOT dismissible. The operator opened this
+ * editor to restrict a workload; letting them wave away the single
+ * message saying the restriction will not happen defeats the point.
+ * Lesser advisories stay dismissible so the console does not nag.
  */
-export const CniMismatchNotice: React.FC<CniMismatchNoticeProps> = ({ cni }) => {
+export const PolicyAdvisoryNotice: React.FC<PolicyAdvisoryNoticeProps> = ({ advisory }) => {
   const [dismissed, setDismissed] = useState(false);
-  if (dismissed) return null;
+  const dismissible = isDismissible(advisory);
+  if (dismissed && dismissible) return null;
+
+  const tone =
+    advisory.severity === 'error'
+      ? 'bg-hubble-error/10 border-hubble-error/30 text-hubble-error'
+      : advisory.severity === 'warning'
+        ? 'bg-hubble-warning/10 border-hubble-warning/30 text-hubble-warning'
+        : 'bg-surface-raised border-border text-tertiary';
+
   return (
     <div
-      role="note"
-      className="flex items-start gap-2 px-4 py-2.5 bg-hubble-warning/10 border-b border-hubble-warning/30 text-xs text-secondary"
+      role={advisory.severity === 'error' ? 'alert' : 'note'}
+      className={`flex items-start gap-2 px-4 py-2.5 border-b text-xs ${tone}`}
     >
-      <AlertTriangle className="w-4 h-4 text-hubble-warning shrink-0 mt-0.5" />
-      <p className="flex-1">
-        Cluster CNI detected as <span className="font-mono text-primary">{cni}</span> — the
-        CiliumNetworkPolicy CRD is likely not installed here, and even if it is, only Cilium
-        enforces it. A standard Network Policy works on any CNI.
+      <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
+      <p className="flex-1 text-secondary">
+        <span className="font-medium text-primary">{advisory.title}.</span> {advisory.detail}
       </p>
-      <button
-        onClick={() => setDismissed(true)}
-        aria-label="Dismiss CNI notice"
-        className="text-tertiary hover:text-primary transition-colors"
-      >
-        <X className="w-3.5 h-3.5" />
-      </button>
+      {dismissible && (
+        <button
+          onClick={() => setDismissed(true)}
+          aria-label="Dismiss policy notice"
+          className="text-tertiary hover:text-primary transition-colors"
+        >
+          <X className="w-3.5 h-3.5" />
+        </button>
+      )}
     </div>
   );
 };
