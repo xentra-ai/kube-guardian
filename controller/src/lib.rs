@@ -22,3 +22,7 @@ pub mod bpf;
 pub mod capture_tiers;
 pub mod log;
 pub mod node_facts;
+/// One task per subsystem, with explicit supervision over what each
+/// one stopping means. Replaces the `try_join!` fabric main used to
+/// have; see the module docs for what that fused together.
+pub mod supervisor;

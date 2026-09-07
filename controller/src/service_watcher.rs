@@ -60,8 +60,9 @@ pub async fn watch_service() -> Result<(), Error> {
     )
     .await;
 
-    // Unreachable: `run_watch` loops forever. main's try_join! keeps
-    // holding this future until the shutdown select! cancels it.
+    // Unreachable: `run_watch` loops forever. The supervisor holds
+    // this task until shutdown cancels it; if this line is ever
+    // reached, that is a fault and it is reported as one.
     Ok(())
 }
 

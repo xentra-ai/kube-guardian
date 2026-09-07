@@ -17,8 +17,8 @@ use tracing::{info, warn};
 
 // Each ring-buffer callback runs on the libbpf-rs poll thread, which is
 // inside a `task::spawn_blocking` and therefore not cancelable by Tokio.
-// If the corresponding mpsc receiver is dropped (e.g. its task in
-// `try_join!` got cancelled because a sister task errored), every
+// If the corresponding mpsc receiver is dropped (e.g. its consumer
+// task stopped, or the supervisor cancelled it on shutdown), every
 // subsequent eBPF event would log a "(receiver closed)" line, flooding
 // stderr at syscall frequency. Latch the first failure per channel,
 // log it loudly via the structured logger, then drop subsequent events
@@ -28,18 +28,30 @@ static NETWORK_SEND_FAILED: AtomicBool = AtomicBool::new(false);
 static SYSCALL_SEND_FAILED: AtomicBool = AtomicBool::new(false);
 static POLICY_DROP_SEND_FAILED: AtomicBool = AtomicBool::new(false);
 
-// Set when ANY receiver closes — signals the spawn_blocking poll loop
-// to exit on its next iteration. Without this, the poll loop would keep
-// running indefinitely after try_join! cancels its sibling tasks (the
-// underlying root cause of the spam #880 patched). Exiting forces the
-// JoinHandle to resolve, which in turn surfaces an error to main's
-// try_join! and the kubelet restarts the pod cleanly. Self-heal
-// pattern, mirrored from broker /health (#876).
+// Set when ANY receiver closes, and by main on its way out — signals
+// the spawn_blocking poll loop to exit on its next iteration. Without
+// this, the poll loop would keep running indefinitely after the
+// consumers are gone (the underlying root cause of the spam #880
+// patched). Exiting forces the JoinHandle to resolve, which surfaces a
+// fault to the supervisor and the kubelet restarts the pod cleanly.
+// Self-heal pattern, mirrored from broker /health (#876).
 static EBPF_SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
-/// Trip the eBPF shutdown flag from a receiver-closed callback. Idempotent.
+/// Trip the eBPF shutdown flag. Idempotent.
+///
+/// Called from the receiver-closed callbacks below, and by `main` on
+/// its way out. The second caller is not optional: the poll loop runs
+/// inside `spawn_blocking`, and dropping the runtime waits — with no
+/// timeout — for every blocking task that has already started
+/// (`BlockingPool::drop` → `shutdown(None)`). So on SIGTERM the
+/// process cannot exit until this loop notices and returns. It used to
+/// notice only when a `blocking_send` failed against a dropped
+/// receiver, which requires an eBPF event to arrive: on an idle node
+/// there might not be one for minutes, and SIGTERM turned into "wait
+/// for the kubelet's SIGKILL". Telling it directly makes shutdown
+/// deterministic at one poll interval (~100ms).
 #[inline]
-fn signal_ebpf_shutdown() {
+pub fn signal_ebpf_shutdown() {
     EBPF_SHUTDOWN.store(true, Ordering::Relaxed);
 }
 
@@ -370,14 +382,14 @@ pub fn ebpf_handle(
 
         loop {
             // Honour the shutdown flag before polling so we exit promptly
-            // (within ~100ms) when a receiver-closed handler flips it.
-            // Returning Err propagates up through the JoinHandle into
-            // main's try_join!, which fails the controller and prompts
-            // the kubelet to restart the pod — clean recovery instead
-            // of a stuck process.
+            // (within ~100ms) when a receiver-closed handler — or main's
+            // shutdown path — flips it. Returning Err propagates up
+            // through the JoinHandle to the supervisor, which fails the
+            // controller and prompts the kubelet to restart the pod —
+            // clean recovery instead of a stuck process.
             if ebpf_shutdown_requested() {
                 return Err(Error::Custom(
-                    "eBPF poll loop exiting: an event-channel receiver was closed (likely a sister task in try_join! errored). Pod will restart.".into(),
+                    "eBPF poll loop exiting: shutdown was signalled (an event-channel receiver closed, or the Controller is terminating). Pod will restart if this was not a graceful shutdown.".into(),
                 ));
             }
             // Poll all ring buffers with a single call (much more efficient!)
@@ -570,6 +582,54 @@ mod tests {
         assert!(ebpf_shutdown_requested());
     }
 
+    /// The idle-node shutdown path, pinned.
+    ///
+    /// The poll loop lives in a `spawn_blocking` that nothing can
+    /// cancel, and dropping the runtime waits for it with no timeout
+    /// (tokio 1.53.1: `BlockingPool::drop` → `shutdown(None)` →
+    /// `shutdown_rx.wait(None)`). So this flag is the only thing that
+    /// lets the process exit at all.
+    ///
+    /// Before `signal_ebpf_shutdown` was reachable from outside this
+    /// module, the only thing that raised it was a `blocking_send`
+    /// failing against a dropped receiver — which requires an eBPF
+    /// event to arrive. Under traffic that is instant; on a node with
+    /// no traffic no event fires, nothing trips, and SIGTERM hung until
+    /// the kubelet's SIGKILL (30s, the default: this DaemonSet sets no
+    /// terminationGracePeriodSeconds and has no probes). "SIGTERM works"
+    /// was only ever true under load, which is exactly the kind of
+    /// thing that regresses invisibly.
+    ///
+    /// What this pins is the independence: the flag goes up with no
+    /// channel, no callback and no send failure anywhere.
+    #[test]
+    fn shutdown_can_be_requested_with_no_event_ever_arriving() {
+        let _guard = TEST_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        reset_state();
+
+        // An idle node: nothing has been sent, so none of the
+        // send-failure latches has fired.
+        assert!(!ebpf_shutdown_requested());
+        assert!(!NETWORK_SEND_FAILED.load(Ordering::Relaxed));
+        assert!(!SYSCALL_SEND_FAILED.load(Ordering::Relaxed));
+        assert!(!POLICY_DROP_SEND_FAILED.load(Ordering::Relaxed));
+
+        signal_ebpf_shutdown();
+
+        assert!(
+            ebpf_shutdown_requested(),
+            "the poll loop checks this at the top of every iteration, so raising it is what \
+             bounds SIGTERM at one ~100ms poll interval on a node with no traffic"
+        );
+        assert!(
+            !NETWORK_SEND_FAILED.load(Ordering::Relaxed)
+                && !SYSCALL_SEND_FAILED.load(Ordering::Relaxed)
+                && !POLICY_DROP_SEND_FAILED.load(Ordering::Relaxed),
+            "shutdown must not route through the send-failure latches; depending on them is \
+             precisely what made this path need traffic to work"
+        );
+    }
+
     #[test]
     fn signal_is_idempotent() {
         let _guard = TEST_GUARD.lock().unwrap_or_else(|p| p.into_inner());
@@ -578,6 +638,45 @@ mod tests {
         signal_ebpf_shutdown();
         signal_ebpf_shutdown();
         assert!(ebpf_shutdown_requested());
+    }
+
+    /// The shutdown *sequence*, not just the flag.
+    ///
+    /// `shutdown_can_be_requested_with_no_event_ever_arriving` above
+    /// proves the flag CAN be raised. It does not prove anything raises
+    /// it — mutation testing confirmed that deleting the call from the
+    /// shutdown path left the whole suite green while restoring the
+    /// idle-node hang. This drives the sequence `main` actually calls.
+    ///
+    /// `block_on` rather than `#[tokio::test]` so `TEST_GUARD` is never
+    /// held across an await: these statics are process-global and the
+    /// other tests in this module race for them.
+    #[test]
+    fn the_controller_shutdown_sequence_raises_the_ebpf_flag() {
+        let _guard = TEST_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        reset_state();
+        assert!(!ebpf_shutdown_requested());
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build a test runtime");
+        let recovered = rt.block_on(async {
+            let mut supervisor = crate::supervisor::Supervisor::new();
+            crate::supervisor::shut_down(&mut supervisor, crate::supervisor::Draining::Gracefully)
+                .await
+        });
+
+        assert!(
+            recovered.is_empty(),
+            "nothing was running, so nothing faulted"
+        );
+        assert!(
+            ebpf_shutdown_requested(),
+            "the shutdown sequence must raise the flag: the poll loop is a spawn_blocking \
+             that nothing can cancel, and dropping the runtime waits for it with no \
+             timeout, so this is the only thing that lets the process exit on an idle node"
+        );
     }
 
     #[test]

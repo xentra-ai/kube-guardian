@@ -2,11 +2,14 @@
 # enforced rule rather than a comment.
 #
 # DashMap::get returns a Ref that holds the shard's read lock until dropped.
-# Held across an .await it deadlocks the whole controller, because every
-# subsystem is composed into one task by try_join! in main.rs and the pod
-# watcher's insert() then blocks the thread on that shard. That outage shipped
-# once already: a stalled controller, Running with zero restarts and silent
-# logs, and it took a production report to find.
+# Held across an .await it deadlocks the controller: the pod watcher's insert()
+# blocks its worker thread outright on that shard, and if that is the thread
+# that would have polled the guard-holding future to completion, neither side
+# ever moves. That outage shipped once already: a stalled controller, Running
+# with zero restarts and silent logs, and it took a production report to find.
+# Each subsystem has its own task now (see src/supervisor.rs), which bounds how
+# much of the controller one held guard can take down. It does not make holding
+# one safe, and the guard is still held across the await either way.
 #
 # clippy::await_holding_lock does NOT catch it — dashmap wraps the parking_lot
 # guard in its own Ref type, which the lint cannot see through. Neither do the
