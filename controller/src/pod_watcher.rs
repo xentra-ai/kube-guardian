@@ -1,6 +1,7 @@
 use crate::capture_tiers::CaptureLevel;
 use crate::models::{pod_flags, ContainerMap, PodRegistration};
 use crate::network::canonicalize_ip;
+use crate::supervisor::{Draining, Subsystem, Supervisor};
 use crate::watch_loop::run_watch;
 use crate::{api_post_call, Error, PodDetail, PodInfo, PodInspect};
 use chrono::Utc;
@@ -20,15 +21,26 @@ use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
 use tokio::sync::mpsc;
+
+/// Watch this node's pods and keep the netns-inode → pod map current.
+///
+/// Takes `excluded_namespaces` **by value**. It used to be a
+/// `&[String]` borrowed from `main`'s stack, which made the returned
+/// future non-`'static` and therefore impossible to `tokio::spawn` —
+/// which is why every subsystem ended up fused into one task by
+/// `try_join!` in the first place (#1346). An `Arc<[String]>` inside
+/// gives the two halves below a cheap shared handle without cloning
+/// the list per pod event.
 pub async fn watch_pods(
     node_name: String,
     tx: mpsc::Sender<PodRegistration>,
     container_map: ContainerMap,
-    excluded_namespaces: &[String],
+    excluded_namespaces: Vec<String>,
     sender_ip: mpsc::Sender<String>,
     ignore_daemonset_traffic: bool,
     cluster_capture_level: CaptureLevel,
 ) -> Result<(), Error> {
+    let excluded_namespaces: Arc<[String]> = excluded_namespaces.into();
     let c = Client::try_default().await?;
     let pods: Api<Pod> = Api::all(c.clone());
     #[cfg(not(debug_assertions))]
@@ -50,7 +62,7 @@ pub async fn watch_pods(
         node_name.clone(),
         tx.clone(),
         Arc::clone(&container_map),
-        excluded_namespaces.to_vec(),
+        Arc::clone(&excluded_namespaces),
         sender_ip.clone(),
         ignore_daemonset_traffic,
         c.clone(),
@@ -91,13 +103,14 @@ pub async fn watch_pods(
                 let t = tx.clone();
                 let sender_ip = sender_ip.clone();
                 let container_map = Arc::clone(&container_map);
+                let excluded_namespaces = Arc::clone(&excluded_namespaces);
                 let node_name = node_name.clone();
                 let c = c.clone();
                 async move {
                     if let Some(reg) = process_pod(
                         &p,
                         container_map,
-                        excluded_namespaces,
+                        &excluded_namespaces,
                         sender_ip,
                         ignore_daemonset_traffic,
                         &node_name,
@@ -129,16 +142,32 @@ pub async fn watch_pods(
         )
         .await;
         // Unreachable: `run_watch` loops forever. Present only to give
-        // this block the Result type `try_join!` needs.
+        // this block the `Result` the supervisor expects.
         Ok::<(), Error>(())
     };
 
-    // Run both concurrently, for the life of the process. Neither half
-    // returns any more: the watch is supervised in-band, and the resync
-    // loop already treats a failed LIST as a tick to skip. Cancellation
-    // on SIGTERM comes from main's shutdown select!, not from here.
-    tokio::try_join!(watch, resync)?;
-    Ok(())
+    // Two halves, two tasks, supervised.
+    //
+    // They used to be `try_join!`ed here, which put both on the task
+    // that ran them — so a containerd RPC stalling inside the watch's
+    // `process_pod` also stalled the resync loop. That is precisely
+    // backwards: the resync exists BECAUSE the streaming watch is not
+    // reliable (a `spec.nodeName` field-selector watch drops the
+    // unscheduled→scheduled transition), so the safety net must not
+    // share a fate with the thing it is a net for.
+    //
+    // Either half stopping is still fatal, exactly as `try_join!`
+    // made it — but now a clean `Ok` return is caught too, not just
+    // an `Err`. Both are infinite by construction, so either one
+    // returning means pod ingestion has silently stopped.
+    let mut subsystems = Supervisor::new();
+    subsystems.spawn(Subsystem::PodWatchStream, watch);
+    subsystems.spawn(Subsystem::PodResync, resync);
+    let fault = subsystems.watch().await;
+    // Logs any fault the other half had already queued, so a stall in
+    // one is not reported without the error that caused it.
+    let _ = subsystems.shutdown(Draining::AfterFault).await;
+    Err(fault.into())
 }
 
 /// Periodic re-list of this node's pods, registering any the streaming
@@ -151,7 +180,7 @@ async fn resync_pods(
     node_name: String,
     tx: mpsc::Sender<PodRegistration>,
     container_map: ContainerMap,
-    excluded_namespaces: Vec<String>,
+    excluded_namespaces: Arc<[String]>,
     sender_ip: mpsc::Sender<String>,
     ignore_daemonset_traffic: bool,
     client: Client,

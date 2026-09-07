@@ -5,12 +5,42 @@ use tracing::debug;
 
 use lazy_static::lazy_static;
 
-lazy_static! {
-    static ref CLIENT: reqwest::Client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .connect_timeout(std::time::Duration::from_secs(10))
+/// Ceiling on a whole broker request, connect through body.
+pub(crate) const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Ceiling on establishing the TCP/TLS connection to the broker.
+pub(crate) const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Build an HTTP client with explicit ceilings on both halves of a
+/// request.
+///
+/// Factored out so no caller can get a client without them.
+/// `pod_reconciler` used to build its own with `ReqwestClient::new()`,
+/// which has NO timeouts at all — reqwest's default is to wait
+/// forever — so its broker GET could park indefinitely and pods
+/// stopped being marked dead with nothing logged. Timeouts are not a
+/// per-call-site decision; they belong to the client.
+fn build_http_client(
+    request_timeout: std::time::Duration,
+    connect_timeout: std::time::Duration,
+) -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(request_timeout)
+        .connect_timeout(connect_timeout)
         .build()
-        .expect("Failed to create HTTP client");
+        .expect("Failed to create HTTP client")
+}
+
+lazy_static! {
+    static ref CLIENT: reqwest::Client = build_http_client(REQUEST_TIMEOUT, CONNECT_TIMEOUT);
+}
+
+/// The Controller's one HTTP client for broker traffic.
+///
+/// Shared rather than per-subsystem: it carries the timeouts above, and
+/// reqwest pools connections behind an `Arc`, so every caller reusing
+/// this one also stops re-dialling the broker on each request.
+pub(crate) fn http_client() -> &'static reqwest::Client {
+    &CLIENT
 }
 
 /// Build the broker URL for a given path, robust against trailing
@@ -202,6 +232,99 @@ pub(crate) async fn api_get_bytes(path: &str) -> Result<Vec<u8>, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A listener that accepts and never responds — a broker that has
+    /// stopped serving without closing its socket. `reqwest`'s default
+    /// client waits on this forever.
+    fn hung_broker() -> (std::net::TcpListener, String) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        (listener, format!("http://{addr}/pod/list/node-a"))
+    }
+
+    /// The defect, pinned: this is exactly the client `pod_reconciler`
+    /// built (`ReqwestClient::new()`), and against a hung broker its
+    /// GET never returns.
+    #[tokio::test]
+    async fn a_default_reqwest_client_waits_forever() {
+        let (_listener, url) = hung_broker();
+        let client = reqwest::Client::new();
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_millis(750),
+            client.get(&url).send(),
+        )
+        .await;
+
+        assert!(
+            outcome.is_err(),
+            "reqwest::Client::new() has no request timeout; if this ever resolves, reqwest              has changed its defaults"
+        );
+    }
+
+    /// The fix: a client from the shared constructor gives up.
+    #[tokio::test]
+    async fn a_client_from_the_shared_builder_times_out() {
+        let (_listener, url) = hung_broker();
+        let client = build_http_client(
+            std::time::Duration::from_millis(200),
+            std::time::Duration::from_millis(100),
+        );
+
+        let started = tokio::time::Instant::now();
+        let err = client
+            .get(&url)
+            .send()
+            .await
+            .expect_err("a hung broker must produce an error, not a response");
+
+        assert!(err.is_timeout(), "expected a timeout, got {err}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// The shipped ceilings, guarded.
+    ///
+    /// Every timeout test in this crate injects its own short ceiling so
+    /// the suite stays fast (200ms here, 300ms in `container`). That
+    /// proves the mechanism and leaves the production numbers asserted
+    /// nowhere: mutation testing raised `REQUEST_TIMEOUT` to 24 hours
+    /// with the whole suite and CI green. A bound costs nothing at
+    /// runtime and makes changing these deliberate rather than silent.
+    ///
+    /// The bound is not arbitrary. The controller posts to the broker
+    /// from subsystems that run on a clock — the syscall recorder every
+    /// 10s, the network batch flush every 1s — so a broker that is
+    /// wedged rather than down must not hold one of them past several
+    /// of its own ticks. 30s already allows that; a minute is the point
+    /// where it stops being a ceiling at all.
+    #[test]
+    fn the_shipped_broker_ceilings_stay_bounded() {
+        assert!(
+            REQUEST_TIMEOUT <= std::time::Duration::from_secs(60),
+            "a {REQUEST_TIMEOUT:?} request ceiling lets a wedged broker stall a subsystem \
+             across many of its own ticks; that is the #1344 hang with extra steps"
+        );
+        assert!(
+            CONNECT_TIMEOUT < REQUEST_TIMEOUT,
+            "the connect budget must be a fraction of the whole-request budget, not equal \
+             to or larger than it"
+        );
+    }
+
+    /// The shared client is the one built with the production
+    /// ceilings, and every caller gets the same pooled instance.
+    #[test]
+    fn the_shared_client_is_a_single_pooled_instance() {
+        assert!(
+            std::ptr::eq(http_client(), http_client()),
+            "callers must share one client, so connections are pooled rather than re-dialled"
+        );
+        assert!(CONNECT_TIMEOUT < REQUEST_TIMEOUT);
+    }
 
     // build_url is the URL constructor for every controller → broker
     // POST. Robustness against trailing slashes prevents double-slash

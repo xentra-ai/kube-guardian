@@ -66,36 +66,41 @@ fn find_dead_pod_details<'a>(
 /// Marks pods as dead if they're no longer running on this node
 pub async fn reconcile_pods_task(node_name: String, broker_url: String) -> Result<(), Error> {
     let mut ticker = interval(Duration::from_secs(RECONCILE_INTERVAL_SECS));
-    let reqwest_client = ReqwestClient::new();
+    // The crate's shared client, not `ReqwestClient::new()`.
+    //
+    // `new()` builds a client with no request timeout and no connect
+    // timeout — reqwest's default is to wait forever — so the broker
+    // GET below could park indefinitely against a broker that accepted
+    // the connection and then stopped serving. Nothing logged, nothing
+    // retried, and pods on this node simply stopped being marked dead:
+    // their broker rows stayed alive holding IPs that had already been
+    // recycled onto other workloads. `client.rs` has carried 30s
+    // request / 10s connect ceilings all along; this reads them from
+    // the same place instead of quietly opting out, and reuses its
+    // connection pool while it is there.
+    let reqwest_client = crate::client::http_client();
     let kube_client = Client::try_default().await?;
 
     loop {
         ticker.tick().await;
 
-        if let Err(e) = reconcile_pods(&node_name, &broker_url, &reqwest_client, &kube_client).await
+        if let Err(e) = reconcile_pods(&node_name, &broker_url, reqwest_client, &kube_client).await
         {
             error!("Pod reconciliation failed: {}", e);
         }
     }
 }
 
-async fn reconcile_pods(
-    node_name: &str,
-    broker_url: &str,
+/// Fetch this node's alive pod rows from the broker.
+///
+/// Split out so the timeout behaviour of the client is exercisable
+/// without a kube client or a live broker — this is the GET that used
+/// to hang forever.
+async fn fetch_db_pods(
     reqwest_client: &ReqwestClient,
-    kube_client: &Client,
-) -> Result<(), Error> {
-    // debug not info — this fires every RECONCILE_INTERVAL_SECS (60s)
-    // forever, which is 1440 daily per controller per node. The
-    // outcome of the reconcile pass is already logged conditionally
-    // below (info when pods were marked dead, debug for "no changes"),
-    // so the per-tick "starting" line is pure noise at INFO.
-    debug!(
-        "reconcile_pods: starting pod reconciliation for node: {}",
-        node_name
-    );
-
-    // Get list of pods from database for this node (only alive pods).
+    broker_url: &str,
+    node_name: &str,
+) -> Result<Vec<PodDetail>, Error> {
     // Trim trailing slashes from broker_url so a configured
     // API_ENDPOINT="http://broker:9090/" doesn't produce a doubled
     // slash in the URL — same robustness pattern applied to
@@ -118,10 +123,30 @@ async fn reconcile_pods(
         )));
     }
 
-    let db_pods: Vec<PodDetail> = response
+    response
         .json::<Vec<PodDetail>>()
         .await
-        .map_err(|e| Error::Custom(format!("Failed to parse broker response: {}", e)))?;
+        .map_err(|e| Error::Custom(format!("Failed to parse broker response: {}", e)))
+}
+
+async fn reconcile_pods(
+    node_name: &str,
+    broker_url: &str,
+    reqwest_client: &ReqwestClient,
+    kube_client: &Client,
+) -> Result<(), Error> {
+    // debug not info — this fires every RECONCILE_INTERVAL_SECS (60s)
+    // forever, which is 1440 daily per controller per node. The
+    // outcome of the reconcile pass is already logged conditionally
+    // below (info when pods were marked dead, debug for "no changes"),
+    // so the per-tick "starting" line is pure noise at INFO.
+    debug!(
+        "reconcile_pods: starting pod reconciliation for node: {}",
+        node_name
+    );
+
+    // Get list of pods from database for this node (only alive pods).
+    let db_pods = fetch_db_pods(reqwest_client, broker_url, node_name).await?;
 
     // Get list of currently running pods from Kubernetes API for this node
     let pods_api: Api<Pod> = Api::all(kube_client.clone());
@@ -200,6 +225,65 @@ async fn reconcile_pods(
 mod tests {
     use super::*;
     use chrono::NaiveDateTime;
+
+    /// A broker that accepts the connection and then never answers —
+    /// the shape a broker takes when it is wedged rather than down.
+    /// A closed port produces a fast, ordinary error; this does not.
+    fn hung_broker() -> (std::net::TcpListener, String) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        (listener, format!("http://{addr}"))
+    }
+
+    /// The defect, pinned, through the real production code path: with
+    /// the client `reconcile_pods_task` used to build, this GET never
+    /// returns. The reconciler is the only thing that marks pods dead,
+    /// so a wedged broker meant recycled pod IPs stayed attributed to
+    /// workloads that no longer existed — indefinitely, with nothing
+    /// logged.
+    #[tokio::test]
+    async fn the_old_reconciler_client_hangs_on_a_wedged_broker() {
+        let (_listener, url) = hung_broker();
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_millis(750),
+            fetch_db_pods(&ReqwestClient::new(), &url, "node-a"),
+        )
+        .await;
+
+        assert!(
+            outcome.is_err(),
+            "ReqwestClient::new() has no timeouts, so this GET is unbounded"
+        );
+    }
+
+    /// The fix: the same wedged broker, through the same code path,
+    /// with a client carrying `client.rs`'s ceilings. The pass fails,
+    /// is logged by the caller, and the next tick tries again.
+    #[tokio::test]
+    async fn the_reconciler_gives_up_on_a_wedged_broker_and_ticks_again() {
+        let (_listener, url) = hung_broker();
+        let bounded = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(200))
+            .connect_timeout(std::time::Duration::from_millis(100))
+            .build()
+            .expect("build client");
+
+        let started = tokio::time::Instant::now();
+        let err = fetch_db_pods(&bounded, &url, "node-a")
+            .await
+            .expect_err("a wedged broker must surface as an error");
+
+        assert!(
+            err.to_string().contains("Failed to fetch pods from broker"),
+            "the operator must be told which step failed: {err}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "took {:?}",
+            started.elapsed()
+        );
+    }
 
     fn db_pod(namespace: Option<&str>, name: &str) -> PodDetail {
         PodDetail {

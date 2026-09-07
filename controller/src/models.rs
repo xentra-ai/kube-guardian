@@ -81,11 +81,14 @@ pub struct PodRegistration {
 /// The value is an `Arc` on purpose. `DashMap` is NOT lock-free despite what
 /// the call sites used to claim: it is an array of `RwLock`-guarded shards,
 /// and `get()` hands back a `Ref` that keeps that shard read-locked until it
-/// is dropped. Holding one across an `.await` deadlocks the controller,
-/// because every subsystem is joined into a single task by `try_join!` in
-/// main.rs — a sibling future calling `insert()` on the same shard blocks the
-/// thread, and the future holding the guard can then never be polled to
-/// release it. Nothing recovers; the process stays alive and silent.
+/// is dropped. Holding one across an `.await` deadlocks the controller: the
+/// pod watcher calling `insert()` on the same shard blocks its worker
+/// thread outright, and if that thread is the one that would have polled
+/// the guard-holding future to completion, neither side ever moves.
+/// Nothing recovers; the process stays alive and silent. Each subsystem
+/// has its own task now (see `supervisor`), which bounds how much of the
+/// Controller one held guard can take down — it does not make holding one
+/// safe.
 ///
 /// Wrapping the value in `Arc` makes the safe pattern free: copy the handle
 /// out of the guard, let the guard drop, and only then await. See

@@ -10,6 +10,7 @@ use kguardian::log::init_logger;
 use kguardian::network::{handle_network_events, handle_policy_drop_events, PolicyDropEvent};
 use kguardian::seccomp_distributor::run as run_seccomp_distributor;
 use kguardian::service_watcher::watch_service;
+use kguardian::supervisor::{report, shut_down, Draining, Subsystem, Supervisor};
 use kguardian::syscall::{
     handle_syscall_events, send_syscall_cache_periodically, SyscallEventData,
 };
@@ -46,8 +47,9 @@ async fn main() -> Result<(), Error> {
 
     // One-shot, fire-and-forget: derive this node's environment facts
     // (provider/distro/CNI/IP family/OS) and report them to the broker
-    // for the anonymous telemetry check-in. Deliberately NOT part of
-    // the try_join! fabric — telemetry must never take capture down.
+    // for the anonymous telemetry check-in. Deliberately unsupervised —
+    // telemetry must never take capture down, and it is expected to
+    // finish.
     tokio::spawn(kguardian::node_facts::report_node_facts(
         node_name.clone(),
         broker_url.clone(),
@@ -89,39 +91,27 @@ async fn main() -> Result<(), Error> {
     let (sender_ip, recv_ip) = mpsc::channel(1000); // Use tokio's mpsc channel
 
     // Shared inode -> pod map. NOTE: DashMap is sharded RwLocks, not lock-free.
-    // Every subsystem below is joined into ONE task by try_join!, so a shard
-    // guard held across an .await blocks the whole controller permanently.
-    // Read it only via models::lookup_pod. See ContainerMap for the detail.
+    // A shard guard held across an .await blocks every subsystem that
+    // touches this map, and on a busy node that is most of them. Each
+    // subsystem has its own task now, so the blast radius is smaller
+    // than it was — but a held guard is still a cross-task deadlock,
+    // not a local stall. Read it only via models::lookup_pod. See
+    // ContainerMap for the detail.
     let container_map: ContainerMap = Arc::new(DashMap::new());
     let pod_c = Arc::clone(&container_map);
     let network_map = Arc::clone(&container_map);
     let syscall_map = Arc::clone(&container_map);
 
-    let pods = watch_pods(
-        node_name.clone(),
-        tx,
-        pod_c,
-        &excluded_namespaces,
-        sender_ip,
-        ignore_daemonset_traffic,
-        cluster_capture_level,
-    );
     info!("Ignoring namespaces: {:?}", excluded_namespaces);
-
-    let service = watch_service();
-
-    // Start pod reconciliation task
-    let pod_reconciler = reconcile_pods_task(node_name, broker_url);
 
     let (network_event_sender, network_event_receiver) = mpsc::channel::<NetworkEventData>(1000);
     let (syscall_event_sender, syscall_event_receiver) = mpsc::channel::<SyscallEventData>(1000);
     let (netpolicy_drop_sender, netpolicy_drop_receiver) = mpsc::channel::<PolicyDropEvent>(1000);
 
-    let network_event_handler = handle_network_events(network_event_receiver, network_map);
-    let netpolicy_drop_handler =
-        handle_policy_drop_events(netpolicy_drop_receiver, Arc::clone(&container_map));
-    let syscall_event_handler = handle_syscall_events(syscall_event_receiver, syscall_map);
-
+    // Spawned before anything is supervised: `ebpf_handle` is a
+    // `spawn_blocking` that starts loading and attaching programs the
+    // moment it is called, and its `JoinHandle` is what the supervised
+    // future below awaits.
     let ebpf_handle = ebpf_handle(
         network_event_sender,
         syscall_event_sender,
@@ -132,12 +122,87 @@ async fn main() -> Result<(), Error> {
         resolved_tiers,
     );
 
-    let syscall_recorder = send_syscall_cache_periodically();
+    // One task per subsystem.
+    //
+    // These nine used to be composed with `tokio::try_join!`, which is
+    // nine futures on ONE task. A task is polled by at most one worker
+    // and cannot be stolen mid-poll, so a blocking call in any of them
+    // froze all nine — measured on this 14-worker runtime: the in-join
+    // heartbeat stopped for good while a separately spawned task kept
+    // ticking — and all nine drained a single 128-operation cooperative
+    // budget between them. See the supervisor module docs.
+    //
+    // Almost everything here is `Required`: these subsystems are meant
+    // to run until the process does, and any of them stopping —
+    // including returning `Ok(())` — ends the Controller non-zero. That
+    // is not a new severity, it is the one `try_join!` already had for
+    // `Err`, extended to cover the clean exits it ignored:
+    // `handle_syscall_events`, `handle_network_events` and
+    // `handle_policy_drop_events` all return `Ok(())` when their
+    // channel closes, and `try_join!` went on waiting for the other
+    // eight — a live, healthy-looking, partially-blind Controller.
+    //
+    // Keeping them `Required` also keeps a second signal that per-task
+    // supervision makes easy to lose. Each of the three subsystems that
+    // builds a kube client can `?` out of that build when the apiserver
+    // is unreachable at boot; today that exits non-zero and the kubelet
+    // backs off, and with no liveness, readiness or startup probe on
+    // this DaemonSet that CrashLoopBackOff is the only thing an
+    // operator sees. It must not become an invisible in-process retry.
+    //
+    // `ebpf-loader` in particular keeps the property PR #1473 argued
+    // for: a Controller whose eBPF loader has died is not degraded, it
+    // is blind, and a blind Controller that stays up turns
+    // observed-absence-means-safe-to-deny into a lie that nothing
+    // marks. Isolating the subsystems from each other's stalls must not
+    // isolate the operator from their deaths.
+    let mut supervisor = Supervisor::new();
 
+    supervisor.spawn(
+        Subsystem::PodWatcher,
+        watch_pods(
+            node_name.clone(),
+            tx,
+            pod_c,
+            excluded_namespaces,
+            sender_ip,
+            ignore_daemonset_traffic,
+            cluster_capture_level,
+        ),
+    );
+    supervisor.spawn(Subsystem::ServiceWatch, watch_service());
+    supervisor.spawn(
+        Subsystem::NetworkEvents,
+        handle_network_events(network_event_receiver, network_map),
+    );
+    supervisor.spawn(
+        Subsystem::SyscallEvents,
+        handle_syscall_events(syscall_event_receiver, syscall_map),
+    );
+    supervisor.spawn(
+        Subsystem::NetpolicyDropEvents,
+        handle_policy_drop_events(netpolicy_drop_receiver, Arc::clone(&container_map)),
+    );
+    supervisor.spawn(
+        Subsystem::SyscallRecorder,
+        send_syscall_cache_periodically(),
+    );
+    supervisor.spawn(
+        Subsystem::PodReconciler,
+        reconcile_pods_task(node_name, broker_url),
+    );
     // Writes broker-generated per-workload seccomp profiles onto this
-    // node. No-ops unless SECCOMP_DISTRIBUTE=true; best-effort, so a
-    // failure here never restarts the controller.
-    let seccomp_distributor = run_seccomp_distributor();
+    // node. The one subsystem allowed to retire: `run` returns `Ok(())`
+    // straight away unless SECCOMP_DISTRIBUTE=true, which is the
+    // default install, so alarming on that would cry wolf everywhere.
+    //
+    // `MayRetire` exempts the clean `Ok` and nothing else — an `Err`
+    // from this subsystem is still a fault that ends the process.
+    // `run` has no `?` and no `return Err` today, so that is
+    // unreachable; if you add one, that is the behaviour you are
+    // choosing, and "best-effort" will no longer describe it.
+    supervisor.spawn(Subsystem::SeccompDistributor, run_seccomp_distributor());
+    supervisor.spawn(Subsystem::EbpfLoader, async move { ebpf_handle.await? });
 
     // Graceful shutdown on SIGTERM/SIGINT
     let shutdown = async {
@@ -148,58 +213,52 @@ async fn main() -> Result<(), Error> {
             _ = sigterm.recv() => info!("Received SIGTERM, shutting down"),
             _ = sigint => info!("Received SIGINT, shutting down"),
         }
-        Ok::<(), Error>(())
     };
 
-    // Wait for all tasks to complete or shutdown signal.
+    // Run until a subsystem faults or the kubelet asks us to stop.
     //
-    // `try_join!` means the FIRST subsystem to return `Err` tears down
-    // every other one. That is deliberate for the ones left here, and
-    // it is no longer a trapdoor for the apiserver watches: `watch_pods`
-    // and `watch_service` handle their stream errors in-band and never
-    // return at all now (see watch_loop). Before that, a single dropped
-    // apiserver connection resolved their `try_for_each`, propagated a
-    // `?` through here, and took kernel-side capture down with it — 26
-    // of 42 Controllers exited that way inside six minutes on
-    // 2026-09-04, each losing a `connections` LRU, its `inode_num`
-    // registrations and its tier allowlists with nothing to backfill
-    // them. Watch failures degrade the watch; they do not stop capture.
+    // The watches and the event consumers are infinite by construction,
+    // so the shutdown arm is the ordinary way this process ends; the
+    // supervision arm is the incident.
     //
-    // `ebpf_handle` stays in the join on purpose, and the asymmetry is
-    // the point. Kernel-side capture is the product: a Controller whose
-    // eBPF loader has died is not degraded, it is blind, and a blind
-    // Controller that keeps running turns kguardian's core guarantee
-    // (observed-absence means safe-to-deny) into a lie that nothing
-    // marks. Exiting non-zero is the only signal that reaches an
-    // operator today — there is no readiness endpoint on this
-    // DaemonSet — so a capture failure must still restart the pod.
-    // Pulling it out of the join would buy nothing and hide that.
+    // `Supervisor::watch` is cancel-safe, so losing this select! costs
+    // nothing: the tasks live in the JoinSet, not in this future.
+    let fault = tokio::select! {
+        fault = supervisor.watch() => Some(fault),
+        _ = shutdown => None,
+    };
+
+    // Stop the eBPF poll loop first, then abort and drain the rest.
+    // `shut_down` owns that ordering and explains why it is not
+    // negotiable; it is a function rather than two lines here so the
+    // sequence is covered by a test (`bpf::tests::
+    // the_controller_shutdown_sequence_raises_the_ebpf_flag`) instead
+    // of living in `main`, which has none.
     //
-    // The remaining hazard is that all of these are polled on ONE task,
-    // so a blocking mistake anywhere wedges everything. That is #1346
-    // and is not addressed here.
-    tokio::select! {
-        result = async {
-            tokio::try_join!(
-                service,
-                pods,
-                network_event_handler,
-                syscall_event_handler,
-                netpolicy_drop_handler,
-                syscall_recorder,
-                seccomp_distributor,
-                pod_reconciler,
-                async { ebpf_handle.await? }
-            )
-        } => { result?; }
-        // The watches are infinite by construction now, so the join
-        // branch above no longer completes on its own in the normal
-        // case: this arm is the ordinary way the process ends. Both
-        // futures are polled on this task, so completing here drops the
-        // join and cancels every subsystem with it.
-        _ = shutdown => {
+    // Draining also recovers faults that were already queued when we
+    // aborted. That matters on the fault path: when the eBPF loader
+    // dies it closes the event channels on its way out, so a consumer's
+    // clean `Ok` can win the race to be reported and the loader's own
+    // error would otherwise never be printed at all. On the graceful
+    // path the same drain stays quiet, because the poll loop returning
+    // `Err` after being told to stop is expected, not an incident.
+    let draining = match fault {
+        Some(_) => Draining::AfterFault,
+        None => Draining::Gracefully,
+    };
+    let _ = shut_down(&mut supervisor, draining).await;
+
+    match fault {
+        // `report` logs the fault and converts it into the error main
+        // returns, which is the non-zero exit and the pod restart. Every
+        // fault gets that treatment, a clean `Ok(())` retirement
+        // included — a subsystem that stopped is a hole in this node's
+        // observations whether or not it called it an error, and this
+        // DaemonSet has no other way to say so.
+        Some(fault) => Err(report(fault)),
+        None => {
             info!("Graceful shutdown complete");
+            Ok(())
         }
     }
-    Ok(())
 }

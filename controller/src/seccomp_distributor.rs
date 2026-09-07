@@ -171,13 +171,17 @@ pub async fn run() -> Result<(), Error> {
         tokio::select! {
             ev = stream.next() => match ev {
                 // The backoff watcher is meant to be endless, but if it
-                // does end we must NOT return: try_join! would never
-                // notice, and CR reconciliation would be silently dead
-                // until the pod restarted for some other reason. And we
-                // must not Err either — a distributor failure never
-                // interrupts tracing. So: back off, rebuild the reflector
-                // + watcher, carry on. The ticker keeps firing meanwhile
-                // (against the last known store contents).
+                // does end we must NOT return. This subsystem is
+                // supervised as `MayRetire` — it is allowed to return
+                // `Ok(())`, because it does exactly that when
+                // SECCOMP_DISTRIBUTE is unset — so a return here is
+                // taken as a deliberate retirement and CR reconciliation
+                // would be silently dead until the pod restarted for
+                // some other reason. And we must not Err either — a
+                // distributor failure never interrupts tracing. So: back
+                // off, rebuild the reflector + watcher, carry on. The
+                // ticker keeps firing meanwhile (against the last known
+                // store contents).
                 None => {
                     let delay = rebuild_delay(stream_ends);
                     stream_ends = stream_ends.saturating_add(1);

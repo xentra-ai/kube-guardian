@@ -53,7 +53,9 @@
 //! * A watch that stays broken escalates from `warn` to `error`, so a
 //!   permanently-wedged watcher cannot masquerade as a healthy one.
 //! * The loop is infinite by construction and holds no blocking work,
-//!   so main's shutdown `select!` can still cancel it on SIGTERM.
+//!   so the supervisor can still cancel its task promptly on SIGTERM.
+//!   Being infinite is also why a watch returning at all is treated as
+//!   a fault now — see `supervisor`.
 
 use futures::{Stream, StreamExt};
 use std::{
@@ -125,10 +127,11 @@ fn rebuild_delay(consecutive_ends: u32) -> Duration {
 
 /// Drive a watch stream for the lifetime of the process.
 ///
-/// **Never returns.** The only ways out are main's shutdown `select!`
-/// cancelling the future, or the process exiting. Callers that need a
-/// `Result` (to sit in a `try_join!`) should wrap the call in an async
-/// block that appends `Ok(())` after it.
+/// **Never returns.** The only ways out are the supervisor cancelling
+/// the task on shutdown, or the process exiting. Callers that need a
+/// `Result` (every supervised subsystem does) should wrap the call in an
+/// async block that appends `Ok(())` after it — unreachable, but it
+/// gives the block the right type.
 ///
 /// `make_stream` is called once up front and again whenever the stream
 /// ends, so it must rebuild from cloned handles rather than move them.
@@ -215,13 +218,14 @@ pub(crate) async fn run_watch<T, E, S, MkStream, F, Fut>(
         // cannot happen — its `ExponentialBackoff` is built
         // `.without_max_times()`, so `next()` never yields `None` and
         // `StreamBackoff` never reaches its `GivenUp` state — but a
-        // kube upgrade could change that, and the failure would be
-        // invisible. Do not return: main's `try_join!` would sit
-        // forever on a watch that is silently dead. Do not error out
-        // either: that restarts the pod and destroys exactly the kernel
-        // state this module exists to protect. Back off, rebuild, carry
-        // on — the same conclusion the SeccompProfile watcher reached
-        // in seccomp_distributor::run.
+        // kube upgrade could change that. Do not return: the
+        // supervisor would (correctly) read that as the watch having
+        // stopped and end the process. Do not error out either: that
+        // restarts the pod and destroys exactly the kernel state this
+        // module exists to protect. A stream that ends is recoverable
+        // in place, so recover in place — back off, rebuild, carry on,
+        // the same conclusion the SeccompProfile watcher reached in
+        // seccomp_distributor::run.
         let delay = rebuild_delay(consecutive_ends);
         consecutive_ends = consecutive_ends.saturating_add(1);
         degraded_since.get_or_insert_with(Instant::now);
