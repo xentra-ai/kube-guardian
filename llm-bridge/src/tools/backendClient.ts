@@ -62,26 +62,56 @@ export function auditVerdictsQuery(args: {
 // --- cluster environment -------------------------------------------
 
 /**
- * The cluster's detected CNI from GET /cluster/environment, cached
- * (success ~5min, failure ~60s). Every failure — older broker 404,
- * timeout, junk — resolves to "unknown", which callers MUST treat as
- * "no signal, behave as before". Never throws.
+ * The cluster's detected CNI and whether it enforces NetworkPolicy,
+ * from GET /cluster/environment, cached (success ~5min, failure ~60s).
+ * Every failure — older broker 404, timeout, junk — resolves to
+ * "unknown", which callers MUST treat as "no signal, behave as
+ * before". Never throws.
+ *
+ * The two fields answer different questions and both matter. Which CNI
+ * decides whether a CiliumNetworkPolicy is even readable here;
+ * enforcement decides whether ANY policy does something. AWS VPC CNI
+ * supports NetworkPolicy only when explicitly enabled and ships with it
+ * off, in which case it accepts the object and silently ignores it, so
+ * "the CNI is X" has never been enough to tell an operator their policy
+ * will take effect.
  */
 const CNI_TTL_OK_MS = 5 * 60_000;
 const CNI_TTL_ERR_MS = 60_000;
-let cniCache: { value: string; expires: number } | null = null;
 
-export async function clusterCni(): Promise<string> {
+export interface ClusterPolicySupport {
+  cni: string;
+  /** 'enforced' | 'unenforced' | 'mixed' | 'unknown' */
+  enforcement: string;
+}
+
+let cniCache: { value: ClusterPolicySupport; expires: number } | null = null;
+
+export async function clusterPolicySupport(): Promise<ClusterPolicySupport> {
   const now = Date.now();
   if (cniCache && now < cniCache.expires) return cniCache.value;
+  const str = (v: unknown) => (typeof v === "string" && v.length > 0 ? v : "unknown");
   try {
-    const env = (await brokerGetJSON("/cluster/environment")) as { cni?: unknown };
-    const cni = typeof env.cni === "string" && env.cni.length > 0 ? env.cni : "unknown";
-    cniCache = { value: cni, expires: now + CNI_TTL_OK_MS };
+    const env = (await brokerGetJSON("/cluster/environment")) as {
+      cni?: unknown;
+      policy_enforcement?: unknown;
+    };
+    cniCache = {
+      value: { cni: str(env.cni), enforcement: str(env.policy_enforcement) },
+      expires: now + CNI_TTL_OK_MS,
+    };
   } catch {
-    cniCache = { value: "unknown", expires: now + CNI_TTL_ERR_MS };
+    cniCache = {
+      value: { cni: "unknown", enforcement: "unknown" },
+      expires: now + CNI_TTL_ERR_MS,
+    };
   }
   return cniCache.value;
+}
+
+/** Back-compat shim for callers that only care which CNI is installed. */
+export async function clusterCni(): Promise<string> {
+  return (await clusterPolicySupport()).cni;
 }
 
 /** Test hook: clear the CNI cache. */

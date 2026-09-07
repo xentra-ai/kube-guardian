@@ -1,6 +1,6 @@
 import { log } from "../logger.js";
 import { TOOL_DEFS } from "./registry.js";
-import { brokerGetJSON, auditVerdictsQuery, clusterCni } from "./backendClient.js";
+import { brokerGetJSON, auditVerdictsQuery, clusterPolicySupport } from "./backendClient.js";
 import {
   filterByNamespace, compactTrafficSummary, compactPodsSummary, filterAlivePods, compactSvc,
 } from "./compaction.js";
@@ -102,17 +102,31 @@ const handlers: Record<string, Handler> = {
     // Align with the cluster CNI (issue #1413): never refuse and never
     // silently switch kinds — annotate, so the model (or a scripted
     // caller) sees the mismatch in the result and can self-correct.
-    // clusterCni() degrades to "unknown" on any failure, which leaves
+    // clusterPolicySupport() degrades to "unknown" on any failure, leaving
     // the output byte-identical to pre-detection behavior (the parity
     // and G2 fixtures pin exactly that).
-    if (type === "cilium") {
-      const cni = await clusterCni();
-      if (cni !== "unknown" && cni !== "cilium") {
-        return `# WARNING: cluster CNI detected as '${cni}' — the CiliumNetworkPolicy CRD is likely unavailable here, and only Cilium enforces it. Use policy_type 'kubernetes' for a policy any CNI enforces.
-${yaml}`;
-      }
+    const { cni, enforcement } = await clusterPolicySupport();
+    const warnings: string[] = [];
+    if (type === "cilium" && cni !== "unknown" && cni !== "cilium") {
+      warnings.push(
+        `# WARNING: cluster CNI detected as '${cni}' — the CiliumNetworkPolicy CRD is likely unavailable here, and only Cilium reads it. A standard Kubernetes NetworkPolicy is the portable kind, but see the enforcement note below before assuming it will take effect.`,
+      );
     }
-    return yaml;
+    // The enforcement warning is the one that used to be missing, and
+    // its absence let this tool tell an operator to switch to a
+    // "policy any CNI enforces" — which does not exist. A NetworkPolicy
+    // is enforced only where the CNI enforces policy, and AWS VPC CNI
+    // ships with enforcement off, accepting the object and ignoring it.
+    if (enforcement === "unenforced") {
+      warnings.push(
+        `# WARNING: this cluster is NOT enforcing NetworkPolicy (cni '${cni}'). Applying this will succeed and kubectl will show the object, but no traffic will be restricted. On AWS VPC CNI, enable it with --enable-network-policy on the node agent.`,
+      );
+    } else if (enforcement === "mixed") {
+      warnings.push(
+        `# WARNING: NetworkPolicy enforcement is inconsistent across nodes in this cluster, so this policy will restrict a pod on one node and not on another depending on where it is scheduled.`,
+      );
+    }
+    return warnings.length > 0 ? `${warnings.join("\n")}\n${yaml}` : yaml;
   },
   // Seccomp is generated in-process from the pod's observed syscalls — no
   // advisor hop. Returned as pretty JSON; the profile is G2-locked to
