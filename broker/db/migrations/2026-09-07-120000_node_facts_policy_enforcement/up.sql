@@ -1,0 +1,20 @@
+-- Whether a NetworkPolicy applied to a node's pods would actually be
+-- enforced, reported per node alongside the CNI that was detected.
+--
+-- Kept separate from `cni` rather than folded into it because the two
+-- are orthogonal. AWS VPC CNI supports NetworkPolicy only when
+-- explicitly enabled and ships with it OFF; with it off the CNI accepts
+-- a policy and silently ignores it, so `kubectl apply` succeeds,
+-- `kubectl get` shows the object, and nothing is enforced. Cilium and
+-- Calico can likewise be deployed with policy disabled, and flannel
+-- implements none at all. So "which CNI" never answered "will this
+-- policy do anything", and the console had no way to tell an operator
+-- the difference.
+--
+-- Nullable with no default on purpose. A NULL row is a node whose
+-- controller predates this column, and that is a genuinely different
+-- state from a node that reported "unknown" — the reader treats both as
+-- "cannot tell", but conflating them at write time would throw away the
+-- distinction between "an old controller" and "a controller that
+-- looked and could not establish it".
+ALTER TABLE node_facts ADD COLUMN IF NOT EXISTS policy_enforcement VARCHAR;

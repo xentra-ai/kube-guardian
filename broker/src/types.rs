@@ -244,6 +244,17 @@ pub struct NodeFact {
     pub node_os: String,
     #[serde(default = "chrono_now")]
     pub time_stamp: NaiveDateTime,
+    /// Whether a NetworkPolicy would actually be enforced on this node:
+    /// `enforced`, `unenforced`, or `unknown`.
+    ///
+    /// Optional on the wire, and last in the struct because `Queryable`
+    /// is positional and must match `schema::node_facts`. A controller
+    /// predating this field sends nothing and the column stays NULL,
+    /// which readers treat as "cannot tell" — the same as `unknown`,
+    /// but distinguishable in the database from a controller that
+    /// looked and could not establish it.
+    #[serde(default)]
+    pub policy_enforcement: Option<String>,
 }
 
 /// Serde default for rows arriving without a timestamp (the controller

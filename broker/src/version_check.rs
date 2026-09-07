@@ -210,6 +210,14 @@ pub struct ClusterEnvironment {
     pub provider: String,
     pub distro: String,
     pub node_os: String,
+    /// Whether a NetworkPolicy would actually be enforced in this
+    /// cluster: `enforced`, `unenforced`, `mixed`, or `unknown`.
+    ///
+    /// The console needs this to avoid telling an operator their
+    /// generated policy is in force when the CNI is silently ignoring
+    /// it. See `aggregate_policy_enforcement` for why a mixed fleet is
+    /// its own answer rather than a majority vote.
+    pub policy_enforcement: String,
     pub nodes: i64,
 }
 
@@ -246,10 +254,21 @@ pub async fn get_cluster_environment(pool: web::Data<DbPool>) -> impl Responder 
         cni: clamp_enum(
             signals.cni,
             &[
-                "cilium", "calico", "flannel", "weave", "antrea", "kindnet", "unknown",
+                "cilium",
+                "calico",
+                "flannel",
+                "weave",
+                "antrea",
+                "kindnet",
+                "aws-vpc-cni",
+                "unknown",
             ],
         ),
         ip_family: clamp_enum(signals.ip_family, &["ipv4", "ipv6", "dual", "unknown"]),
+        policy_enforcement: clamp_enum(
+            signals.policy_enforcement,
+            &["enforced", "unenforced", "mixed", "unknown"],
+        ),
         provider: clamp_enum(
             signals.provider,
             &[
@@ -364,6 +383,7 @@ pub(crate) struct EnvSignals {
     cni: String,
     ip_family: String,
     node_os: String,
+    policy_enforcement: String,
     pods_bucket: String,
     features: String,
 }
@@ -376,6 +396,7 @@ impl Default for EnvSignals {
             cni: "unknown".into(),
             ip_family: "unknown".into(),
             node_os: "unknown".into(),
+            policy_enforcement: "unknown".into(),
             pods_bucket: "unknown".into(),
             features: "none".into(),
         }
@@ -395,6 +416,42 @@ fn mode(values: &[String]) -> String {
         .max_by_key(|(_, n)| *n)
         .map(|(v, _)| v.to_string())
         .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// Cluster-wide policy enforcement from per-node answers.
+///
+/// NOT a majority vote, unlike the other aggregates. Enforcement is a
+/// safety claim, and the console uses it to decide whether to tell an
+/// operator their generated policy will actually take effect. A fleet
+/// where some nodes enforce and others do not is genuinely a different
+/// situation from either extreme — a policy applied there is live on
+/// part of the cluster and inert on the rest, which is arguably the
+/// most dangerous state of all, and `mode` would have hidden it behind
+/// whichever answer happened to be more common.
+///
+/// A `None` is a node whose controller predates the field. It is
+/// treated as `unknown` rather than ignored: a fleet mid-upgrade should
+/// not be reported as confidently enforcing on the strength of the
+/// nodes that have already been upgraded.
+fn aggregate_policy_enforcement(values: &[Option<String>]) -> String {
+    let mut enforced = false;
+    let mut unenforced = false;
+    let mut unsure = false;
+    for v in values {
+        match v.as_deref() {
+            Some("enforced") => enforced = true,
+            Some("unenforced") => unenforced = true,
+            _ => unsure = true,
+        }
+    }
+    match (enforced, unenforced, unsure) {
+        (true, true, _) => "mixed".to_string(),
+        // An unsure node alongside a definite one still means we cannot
+        // speak for the whole cluster.
+        (true, false, false) => "enforced".to_string(),
+        (false, true, false) => "unenforced".to_string(),
+        _ => "unknown".to_string(),
+    }
 }
 
 /// Cluster IP family from per-node families: any node dual — or a mix
@@ -466,8 +523,9 @@ fn env_signals(pool: &DbPool) -> EnvSignals {
             nf::cni,
             nf::ip_family,
             nf::node_os,
+            nf::policy_enforcement,
         ))
-        .load::<(String, String, String, String, String)>(&mut conn)
+        .load::<(String, String, String, String, String, Option<String>)>(&mut conn)
     {
         if !rows.is_empty() {
             let col = |i: usize| -> Vec<String> {
@@ -486,6 +544,12 @@ fn env_signals(pool: &DbPool) -> EnvSignals {
             out.cni = mode(&col(2));
             out.ip_family = aggregate_ip_family(&col(3));
             out.node_os = mode(&col(4));
+            out.policy_enforcement = aggregate_policy_enforcement(
+                &rows
+                    .iter()
+                    .map(|r| r.5.clone())
+                    .collect::<Vec<Option<String>>>(),
+            );
         }
     }
     if let Ok(n) = pd::pod_details
@@ -740,6 +804,75 @@ mod tests {
         });
     }
 
+    fn enf(xs: &[Option<&str>]) -> String {
+        aggregate_policy_enforcement(
+            &xs.iter()
+                .map(|x| x.map(|s| s.to_string()))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    // Enforcement is aggregated by rule, not by majority, because it is
+    // a safety claim rather than a demographic one. These pin the two
+    // ways a majority vote would have lied.
+
+    #[test]
+    fn a_split_fleet_reports_mixed_not_the_majority() {
+        // The dangerous state: the policy is live on some nodes and
+        // inert on others. `mode` would have reported whichever was
+        // more common and hidden the split entirely.
+        assert_eq!(
+            enf(&[
+                Some("enforced"),
+                Some("enforced"),
+                Some("enforced"),
+                Some("unenforced")
+            ]),
+            "mixed"
+        );
+        assert_eq!(
+            enf(&[Some("unenforced"), Some("unenforced"), Some("enforced")]),
+            "mixed"
+        );
+    }
+
+    #[test]
+    fn one_unsure_node_downgrades_the_whole_answer() {
+        // A fleet mid-upgrade, where old controllers report nothing,
+        // must not be called "enforced" on the strength of the nodes
+        // that happen to have been upgraded already.
+        assert_eq!(enf(&[Some("enforced"), None]), "unknown");
+        assert_eq!(enf(&[Some("enforced"), Some("unknown")]), "unknown");
+        assert_eq!(enf(&[Some("unenforced"), None]), "unknown");
+    }
+
+    #[test]
+    fn a_unanimous_fleet_reports_its_answer() {
+        assert_eq!(enf(&[Some("enforced"), Some("enforced")]), "enforced");
+        assert_eq!(enf(&[Some("unenforced"), Some("unenforced")]), "unenforced");
+    }
+
+    #[test]
+    fn no_nodes_at_all_is_unknown() {
+        assert_eq!(enf(&[]), "unknown");
+        assert_eq!(enf(&[None, None]), "unknown");
+    }
+
+    #[test]
+    fn aws_vpc_cni_survives_the_allowlist_clamp() {
+        // The regression this guards: the clamp silently rewrites any
+        // value not on the list to "unknown", so adding detection in
+        // the controller without adding the name here would have made
+        // it invisible at the API and looked like broken detection.
+        assert_eq!(
+            clamp_enum(
+                "aws-vpc-cni".into(),
+                &["cilium", "calico", "aws-vpc-cni", "unknown"]
+            ),
+            "aws-vpc-cni"
+        );
+    }
+
     #[test]
     fn cluster_environment_serializes_the_documented_shape() {
         // Wire contract for GET /cluster/environment — the UI and
@@ -750,6 +883,7 @@ mod tests {
             provider: "baremetal".into(),
             distro: "talos".into(),
             node_os: "talos".into(),
+            policy_enforcement: "enforced".into(),
             nodes: 3,
         };
         let v: serde_json::Value = serde_json::to_value(&env).unwrap();
@@ -758,7 +892,15 @@ mod tests {
         let keys: Vec<&str> = v.as_object().unwrap().keys().map(|k| k.as_str()).collect();
         assert_eq!(
             keys,
-            ["cni", "distro", "ip_family", "node_os", "nodes", "provider"]
+            [
+                "cni",
+                "distro",
+                "ip_family",
+                "node_os",
+                "nodes",
+                "policy_enforcement",
+                "provider"
+            ]
         );
         assert_eq!(v["cni"], "cilium");
         assert_eq!(v["nodes"], 3);
