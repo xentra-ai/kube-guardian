@@ -30,7 +30,8 @@ original contract; the rest were added in contract v2 and are optional
 | `arch` | `x86_64` | Broker CPU architecture. |
 | `provider` | `aws` | Cloud platform, derived from the node's `providerID` scheme. One of a fixed list (`aws`, `gcp`, `azure`, `digitalocean`, `hetzner`, `openstack`, `vsphere`, `oracle`, `ibm`, `baremetal`, `kind`) or `unknown`. Never an account, project, or region. |
 | `distro` | `k3s` | Kubernetes distribution flavor (`eks`, `gke`, `aks`, `k3s`, `rke2`, `talos`, `openshift`, `kind`, `vanilla`), derived from well-known node labels and version suffixes. |
-| `cni` | `cilium` | CNI plugin, derived from node annotations (`cilium`, `calico`, `flannel`, `weave`, `antrea`, `kindnet`). |
+| `cni` | `cilium` | CNI plugin (`cilium`, `calico`, `flannel`, `weave`, `antrea`, `kindnet`, `aws-vpc-cni`). Derived from node annotations, except AWS VPC CNI which annotates nothing and is identified from its node agent pod. |
+| `policy_enforcement` | `enforced` | Whether NetworkPolicy is actually enforced (`enforced`, `unenforced`, `mixed`, `unknown`). Separate from `cni` because a CNI can be installed with policy support off, in which case a policy applies cleanly and restricts nothing. |
 | `ip_family` | `dual` | Cluster IP family (`ipv4`, `ipv6`, `dual`), derived from node pod CIDRs. |
 | `node_os` | `talos` | Node operating-system family from `nodeInfo.osImage`, coarsened to a fixed list. |
 | `pods_bucket` | `10-99` | Order-of-magnitude bucket of pods observed — never an exact inventory. |

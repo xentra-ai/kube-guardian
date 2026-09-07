@@ -7,7 +7,8 @@ import { ciliumPolicyToYAML } from '../utils/ciliumPolicyGenerator';
 import { EntitiesPeer, HostNetworkWarningBanner, RuleComments } from './HostNetworkNotes';
 import { CILIUM_NAMESPACE_LABEL } from '../types/ciliumPolicy';
 import { useClusterEnvironment } from '../hooks/useClusterEnvironment';
-import { CniMismatchNotice } from './PolicyEditor/CniMismatchNotice';
+import { PolicyAdvisoryNotice } from './PolicyEditor/CniMismatchNotice';
+import { recommendedPolicyType, enforcementAdvisory } from '../utils/cniPolicySupport';
 import { PartialCaptureWarning } from './Seccomp/PartialCaptureWarning';
 import { useWorkloadCapture } from '../hooks/useWorkloadCapture';
 import { SECCOMP_ACTIONS, ARCHITECTURES, SECCOMP_ACTION_DESCRIPTIONS } from '../types/seccompProfile';
@@ -33,16 +34,33 @@ interface NetworkPolicyEditorProps {
   initialPolicyType?: PolicyType;
 }
 
-const NetworkPolicyEditor: React.FC<NetworkPolicyEditorProps> = ({ isOpen, onClose, pod, initialPolicyType = 'network' }) => {
-  const [policyType, setPolicyType] = useState<PolicyType>(initialPolicyType);
+const NetworkPolicyEditor: React.FC<NetworkPolicyEditorProps> = ({ isOpen, onClose, pod, initialPolicyType }) => {
+  const env = useClusterEnvironment();
+  const { cni } = env;
+
+  // Default to the kind this cluster can actually enforce, rather than
+  // always opening on 'network' and warning afterwards. An explicit
+  // initialPolicyType from the caller still wins, and the operator can
+  // switch freely: the YAML may be destined for a different cluster,
+  // which is why export is never blocked on a mismatch.
+  //
+  // Derived, not synced. The environment arrives asynchronously and is
+  // 'unknown' on the first render, so storing the recommendation in
+  // state would latch that first value and never correct itself once
+  // the facts land. Keeping the operator's choice as the only state and
+  // falling back to the recommendation means the default follows the
+  // detected CNI, while an explicit choice wins permanently.
+  const [chosenPolicyType, selectPolicyType] = useState<PolicyType | undefined>(initialPolicyType);
+  const policyType = chosenPolicyType ?? recommendedPolicyType(cni);
+
   const [yamlView, setYamlView] = useState(true); // Default to YAML view
 
-  // Align with the cluster CNI (issue #1413): when the detected CNI is
-  // real and not cilium, badge the Cilium tab and show a notice on it.
-  // 'unknown' (no facts yet, older broker, non-annotating CNI) keeps
-  // the editor pixel-identical to its pre-detection behavior, and the
-  // async fetch never gates rendering.
-  const { cni } = useClusterEnvironment();
+  // What to tell the operator about the kind they are looking at. This
+  // covers both questions: whether the CNI understands this policy kind
+  // at all, and whether it enforces policy — the second of which used
+  // to be missing, so the console could tell someone their policy was
+  // fine while the CNI silently ignored it.
+  const advisory = enforcementAdvisory(policyType, env);
   const cniMismatch = cni !== 'unknown' && cni !== 'cilium' ? cni : null;
   const ciliumWarning = cniMismatch
     ? `Cluster CNI detected as ${cniMismatch} — CiliumNetworkPolicy is likely not applicable here`
@@ -187,7 +205,7 @@ const NetworkPolicyEditor: React.FC<NetworkPolicyEditorProps> = ({ isOpen, onClo
       {/* Header */}
       <PolicyHeader
             policyType={policyType}
-            onPolicyTypeChange={setPolicyType}
+            onPolicyTypeChange={selectPolicyType}
             yamlView={yamlView}
             onYamlViewToggle={() => setYamlView(!yamlView)}
             copiedToClipboard={copiedToClipboard}
@@ -201,7 +219,7 @@ const NetworkPolicyEditor: React.FC<NetworkPolicyEditorProps> = ({ isOpen, onClo
             onSeccompFormatChange={setSeccompFormat}
           />
 
-          {policyType === 'cilium' && cniMismatch && <CniMismatchNotice cni={cniMismatch} />}
+          {advisory && <PolicyAdvisoryNotice advisory={advisory} />}
           {!isLoading && (
             <HostNetworkWarningBanner
               warnings={policyType === 'network' ? policy?.warnings : policyType === 'cilium' ? ciliumPolicy?.warnings : undefined}

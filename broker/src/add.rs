@@ -1440,6 +1440,17 @@ pub async fn add_node_facts(
     if fields.iter().any(|f| f.len() > 253) {
         return Ok(HttpResponse::BadRequest().body("field too long"));
     }
+    // Same guard for the optional enforcement enum. Not in `fields`
+    // above only because it is an Option; the read path clamps it to a
+    // whitelist regardless, but rejecting junk at ingest keeps the
+    // stored row honest.
+    if fact
+        .policy_enforcement
+        .as_ref()
+        .is_some_and(|v| v.len() > 253)
+    {
+        return Ok(HttpResponse::BadRequest().body("field too long"));
+    }
     web::block(move || -> Result<(), DbError> {
         use schema::node_facts::dsl::*;
         let mut conn = pool.get()?;

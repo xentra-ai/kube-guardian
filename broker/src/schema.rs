@@ -138,6 +138,7 @@ diesel::table! {
         ip_family -> Varchar,
         node_os -> Varchar,
         time_stamp -> Timestamp,
+        policy_enforcement -> Nullable<Varchar>,
     }
 }
 

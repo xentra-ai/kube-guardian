@@ -2,7 +2,7 @@ import { test, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import type { AddressInfo } from "node:net";
-import { clusterCni, resetClusterCniCache } from "./backendClient.js";
+import { clusterPolicySupport, resetClusterCniCache } from "./backendClient.js";
 
 // clusterCni backs the CNI-aligned policy generation (issue #1413).
 // The contract under test: cached, and EVERY failure degrades to
@@ -41,17 +41,17 @@ beforeEach(() => {
 
 test("returns the broker's cni and caches the success", async () => {
   responses = [{ status: 200, body: { cni: "calico", nodes: 3 } }];
-  assert.equal(await clusterCni(), "calico");
-  assert.equal(await clusterCni(), "calico"); // served from cache
+  assert.equal((await clusterPolicySupport()).cni, "calico");
+  assert.equal((await clusterPolicySupport()).cni, "calico"); // served from cache
   assert.equal(hits, 1);
 });
 
 test("older broker 404 degrades to unknown, never throws", async () => {
   responses = [{ status: 404 }];
-  assert.equal(await clusterCni(), "unknown");
+  assert.equal((await clusterPolicySupport()).cni, "unknown");
 });
 
 test("malformed body degrades to unknown", async () => {
   responses = [{ status: 200, body: { nodes: 3 } }];
-  assert.equal(await clusterCni(), "unknown");
+  assert.equal((await clusterPolicySupport()).cni, "unknown");
 });

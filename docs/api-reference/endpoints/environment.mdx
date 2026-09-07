@@ -21,6 +21,21 @@ the controller predates fact reporting — and consumers treat it as
 "behave exactly as before". Mixed-CNI clusters resolve to the most
 common per-node value.
 
+`policy_enforcement` is reported separately from `cni` because the two
+answer different questions. Knowing which CNI is installed does not tell
+you whether a NetworkPolicy will take effect: AWS VPC CNI supports
+NetworkPolicy only when explicitly enabled and ships with it off, and
+with it off the CNI accepts the object and silently ignores it, so
+`kubectl apply` succeeds and nothing is restricted. Cilium and Calico can
+also be installed with policy disabled, and flannel never enforces.
+
+Unlike the other fields, `policy_enforcement` is NOT a most-common vote.
+A cluster where some nodes enforce and others do not reports `mixed`,
+because a policy applied there is live on part of the fleet and inert on
+the rest, and a majority vote would hide that. A single node that cannot
+answer downgrades the whole cluster to `unknown` rather than letting the
+already-upgraded nodes speak for it.
+
 ## GET /cluster/environment
 
 Requires bearer auth when `BROKER_AUTH_TOKEN` is set. Always returns
@@ -33,15 +48,17 @@ Requires bearer auth when `BROKER_AUTH_TOKEN` is set. Always returns
   "provider": "baremetal",
   "distro": "talos",
   "node_os": "talos",
+  "policy_enforcement": "enforced",
   "nodes": 3
 }
 ```
 
 | Field | Values |
 | --- | --- |
-| `cni` | `cilium`, `calico`, `flannel`, `weave`, `antrea`, `unknown` |
+| `cni` | `cilium`, `calico`, `flannel`, `weave`, `antrea`, `kindnet`, `aws-vpc-cni`, `unknown` |
 | `ip_family` | `ipv4`, `ipv6`, `dual`, `unknown` |
 | `provider` | `aws`, `gcp`, `azure`, `digitalocean`, `hetzner`, `openstack`, `vsphere`, `oracle`, `ibm`, `baremetal`, `kind`, `unknown` |
 | `distro` | `eks`, `gke`, `aks`, `k3s`, `rke2`, `talos`, `openshift`, `kind`, `vanilla`, `unknown` |
 | `node_os` | `talos`, `bottlerocket`, `flatcar`, `cos`, `ubuntu`, `debian`, `rhel`, `amazonlinux`, `alpine`, `other`, `unknown` |
+| `policy_enforcement` | `enforced`, `unenforced`, `mixed`, `unknown` — whether a NetworkPolicy is actually enforced here |
 | `nodes` | Count of nodes that have reported facts; `0` = none yet |
