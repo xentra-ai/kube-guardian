@@ -9,7 +9,7 @@ vi.mock('../services/api', () => ({
   },
 }));
 
-import { generateNetworkPolicy } from './networkPolicyGenerator';
+import { generateNetworkPolicy, quoteYamlValue } from './networkPolicyGenerator';
 import { generateCiliumNetworkPolicy } from './ciliumPolicyGenerator';
 
 // An observed direction whose every peer is unparseable must stay DENIED, not
@@ -93,5 +93,80 @@ describe('generateCiliumPolicy — unparseable peers must not disable defaultDen
   it('leaves an unobserved direction undefended rather than inventing a rule', async () => {
     const policy = await generateCiliumNetworkPolicy(podWith(badIngress));
     expect(policy.spec.defaultDeny.egress).toBe(false);
+  });
+});
+
+// quoteYamlValue used to test only for unsafe PUNCTUATION, which misses
+// every value YAML reinterprets because of what it resolves to. kubectl
+// converts YAML to JSON through a YAML 1.1 parser and matchLabels is
+// map[string]string, so an unquoted `version: 2` is rejected at apply
+// time with a type error. All the values below are legal Kubernetes
+// label values.
+describe('quoteYamlValue — values YAML 1.1 resolves to a non-string', () => {
+  it.each([
+    ['123', 'plain integer'],
+    ['0', 'zero'],
+    ['007', 'leading-zero octal'],
+    ['0x1f', 'hex'],
+    ['0b1010', 'binary'],
+    ['1.2', 'float'],
+    ['1e5', 'exponent'],
+    ['-1', 'negative'],
+    ['1:30', 'sexagesimal'],
+    ['true', 'boolean'],
+    ['false', 'boolean'],
+    ['yes', 'YAML 1.1 boolean'],
+    ['no', 'YAML 1.1 boolean'],
+    ['on', 'YAML 1.1 boolean'],
+    ['off', 'YAML 1.1 boolean'],
+    ['null', 'null'],
+    ['Null', 'null, capitalised'],
+    ['~', 'null shorthand'],
+    ['', 'empty string'],
+  ])('quotes %s (%s)', (value) => {
+    expect(quoteYamlValue(value)).toBe(`"${value}"`);
+  });
+
+  // The fix must only ever TIGHTEN quoting. These were emitted plain
+  // before and must stay plain, or every golden fixture churns for a
+  // cosmetic reason.
+  it.each([
+    ['web'],
+    ['networking.k8s.io/v1'],
+    ['app.kubernetes.io/name'],
+    ['10.0.0.20/32'],
+    ['v1.2.3'],
+    ['2001:db8::1/128'.replace(/:/g, 'x')], // colons are punctuation-quoted; shape only
+  ])('leaves %s unquoted', (value) => {
+    expect(quoteYamlValue(value)).toBe(value);
+  });
+
+  // Punctuation-quoting is retained, so hyphenated names keep their
+  // existing quoted form.
+  it('still quotes hyphenated names as before', () => {
+    expect(quoteYamlValue('deployment-web')).toBe('"deployment-web"');
+  });
+
+  it('escapes backslashes before quotes', () => {
+    expect(quoteYamlValue('a"b')).toBe('"a\\"b"');
+    expect(quoteYamlValue('a\\b')).toBe('"a\\\\b"');
+  });
+});
+
+// Label KEYS go through the same helper as values (the emitter writes
+// `${quoteYamlValue(key)}: ${quoteYamlValue(value)}`), and `2: web` fails
+// at apply time exactly as `version: 2` does. Nothing pinned that, so a
+// future change that quoted only the value side would pass every other
+// test in this file.
+describe('quoteYamlValue — keys need the same treatment as values', () => {
+  it.each([['123'], ['true'], ['no'], ['1.2'], ['null']])(
+    'quotes %s used as a label key',
+    (key) => {
+      expect(quoteYamlValue(key)).toBe(`"${key}"`);
+    },
+  );
+
+  it('leaves an ordinary label key unquoted', () => {
+    expect(quoteYamlValue('app.kubernetes.io/name')).toBe('app.kubernetes.io/name');
   });
 });

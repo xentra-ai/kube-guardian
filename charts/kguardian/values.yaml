@@ -48,10 +48,21 @@ controller:
     image:
       # -- Init container image repository
       repository: busybox
-      # -- Init container image pull policy
-      pullPolicy: Always
-      # -- Init container image tag
-      tag: latest
+      # -- Init container image pull policy. `IfNotPresent`, not
+      # `Always`: this init container runs on every node, and `Always`
+      # forces a registry manifest request on every pod start even when
+      # the image is already cached locally. Those requests count against
+      # Docker Hub's anonymous pull limit, which is per source IP, so a
+      # NATed cluster shares one bucket across the whole fleet. A
+      # throttled pull leaves the init container in ImagePullBackOff and
+      # the agent never starts on that node, so its pods are never
+      # observed and the generated policy silently omits their rules.
+      pullPolicy: IfNotPresent
+      # -- Init container image tag. Pinned rather than `latest`: every
+      # other image in this chart is pinned, an unpinned tag means
+      # whatever it resolves to at pull time runs on every node, and
+      # `latest` is what forces `pullPolicy: Always` to re-check.
+      tag: "1.37.0"
     # -- Init container security context
     securityContext:
       runAsNonRoot: true
@@ -275,10 +286,11 @@ broker:
     image:
       # -- Broker init container image repository
       repository: busybox
-      # -- Broker init container image pull policy
-      pullPolicy: Always
-      # -- Broker init container image tag
-      tag: latest
+      # -- Broker init container image pull policy. See the controller's
+      # init container for why this is not `Always`.
+      pullPolicy: IfNotPresent
+      # -- Broker init container image tag, pinned rather than `latest`.
+      tag: "1.37.0"
       # -- Overrides the init container image tag using SHA digest
       sha: ""
     # -- Broker init container security context
@@ -696,9 +708,26 @@ database:
     # or pipe to your existing log-aggregation backup pipeline.
     #
     # Best-effort: a failed backup is logged but does NOT block the
-    # upgrade. Set to false to skip entirely (e.g. for ephemeral test
-    # deployments).
-    preUpgradeBackup: true
+    # upgrade.
+    #
+    # OFF BY DEFAULT because of where the dump goes. stdout means the
+    # cluster's log pipeline, and the payload is the whole database:
+    # every observed flow with addresses and ports, plus pod metadata
+    # and per-workload syscall sets — effectively a map of internal
+    # cluster traffic. A log sink is usually readable by a wider group
+    # than the database, is frequently a third-party SaaS, and has its
+    # own retention that outlives the Job. This template already strips
+    # role password hashes (`--no-role-passwords`) on exactly that
+    # reasoning; the same argument applies to the payload, which is why
+    # enabling it should be a deliberate choice rather than a default.
+    #
+    # It is also large: with no retention on `pod_traffic` the dump grows
+    # without bound and is emitted as a single burst on every upgrade.
+    #
+    # Set to true if your log pipeline is an acceptable destination for
+    # that data, or prefer a backup that writes somewhere with access
+    # control comparable to the database itself.
+    preUpgradeBackup: false
 
   container:
     # -- PostgreSQL container port

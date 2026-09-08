@@ -29,4 +29,54 @@ describe('validateSeccompProfile', () => {
       validateSeccompProfile({ defaultAction: 'SCMP_ACT_ERRNO', architectures: ['SCMP_ARCH_X86_64'], syscalls: [] }),
     ).toThrow(/at least one syscall rule/);
   });
+
+  // The rules-array check above counts one, not zero, for the profile that
+  // actually matters: a single rule with an empty `names` list. Verified
+  // against a container runtime — that profile denies every syscall and the
+  // container never starts, because the filter is installed before execve.
+  it('rejects a denying default with an allow rule that names nothing', () => {
+    expect(() => validateSeccompProfile(buildSeccompProfile([], 'x86_64'))).toThrow(
+      /no rule allows any syscall/,
+    );
+  });
+
+  it('rejects a denying default when every allow rule is empty', () => {
+    expect(() =>
+      validateSeccompProfile({
+        defaultAction: 'SCMP_ACT_ERRNO',
+        architectures: ['SCMP_ARCH_X86_64'],
+        syscalls: [
+          { names: [], action: 'SCMP_ACT_ALLOW' },
+          { names: ['ptrace'], action: 'SCMP_ACT_KILL' },
+        ],
+      }),
+    ).toThrow(/no rule allows any syscall/);
+  });
+
+  it('accepts a denying default as soon as one rule allows something', () => {
+    expect(() => validateSeccompProfile(buildSeccompProfile(['read'], 'x86_64'))).not.toThrow();
+  });
+
+  // A permissive default with an empty rule is a no-op, not a trap: the
+  // container still runs. Only a denying default makes an empty allow list
+  // fatal, so the check must not fire here.
+  it('accepts a permissive default with an empty rule', () => {
+    expect(() =>
+      validateSeccompProfile({
+        defaultAction: 'SCMP_ACT_ALLOW',
+        architectures: ['SCMP_ARCH_X86_64'],
+        syscalls: [{ names: [], action: 'SCMP_ACT_ERRNO' }],
+      }),
+    ).not.toThrow();
+  });
+
+  it('accepts an audit-only profile that allows nothing by name', () => {
+    expect(() =>
+      validateSeccompProfile({
+        defaultAction: 'SCMP_ACT_LOG',
+        architectures: ['SCMP_ARCH_X86_64'],
+        syscalls: [{ names: [], action: 'SCMP_ACT_ALLOW' }],
+      }),
+    ).not.toThrow();
+  });
 });

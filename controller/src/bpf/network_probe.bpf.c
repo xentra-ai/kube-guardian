@@ -89,7 +89,50 @@ struct conn_state {
     __u32 event_count;
 };
 
-// LRU map automatically evicts old connections
+// Per-flow-class dedup so each observed flow crosses into userspace once.
+//
+// INVARIANT: an entry here means "userspace HAS this flow". It is
+// written only by mark_connection_seen, and only after a successful
+// bpf_ringbuf_submit — never before. connection_already_seen is a pure
+// lookup and inserts nothing, so there is no state to unwind on a
+// failed publish and no ordering for a future emitter to get wrong.
+//
+// Marking before publishing is what this replaced, and the failure it
+// produced was not a dropped packet but a dropped flow CLASS: conn_key
+// carries no source port, so one entry marked-but-never-delivered
+// silences every later connection matching (netns, saddr, daddr, dport,
+// proto, direction). Nothing recovers it either. This is a common LRU
+// with no TTL and no reaper, so eviction only happens under allocation
+// pressure; a node that never approaches 65536 keys never evicts, and a
+// lookup marks a node referenced, so a recurring suppressed flow keeps
+// refreshing its own entry and is evicted last.
+//
+// helper.h records what that costs in practice: a pod silenced for a
+// single-tuple class like `pod -> kube-dns:53` yields a policy with no
+// DNS egress rule, which breaks the workload the moment it is enforced.
+//
+// netpolicy_drop.bpf.c uses the same publish-then-mark ordering (it sets
+// established = 1 after its submit). Any new emitter here must too.
+//
+// CHOOSING A PATTERN FOR A NEW PROBE. There are two correct shapes in
+// this tree and they are not interchangeable:
+//
+//   1. Publish, then mark (here, and netpolicy_drop). Use this when the
+//      claim cannot be made atomically. Costs a duplicate event when two
+//      CPUs race the same new key, which userspace and the broker both
+//      dedup. Cannot lose a flow, because nothing is marked until it has
+//      been delivered.
+//
+//   2. Claim atomically, then unwind on failure (syscall.bpf.c). Use
+//      this only with BPF_NOEXIST, which is a test-and-set: exactly one
+//      CPU wins the insert, so the delete on a failed reserve unwinds an
+//      entry that invocation definitively owns. Suppresses the duplicate
+//      that (1) accepts.
+//
+// Mixing them is what produced the bug this comment exists for: the old
+// code here marked first but claimed with a non-atomic lookup followed
+// by BPF_ANY, so two CPUs could both believe they had inserted, and the
+// unwind could then delete an entry belonging to the other.
 struct
 {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
@@ -98,29 +141,84 @@ struct
     __type(value, struct conn_state);
 } connections SEC(".maps");
 
-// Helper to check if this is a new connection
-static __always_inline bool is_new_connection(struct conn_key *key)
+// True when this flow class has already been published to userspace.
+//
+// A miss does NOT insert; that is mark_connection_seen's job, and it
+// runs only after bpf_ringbuf_submit, which is what makes "marked but
+// never delivered" unrepresentable rather than merely avoided.
+// netpolicy_drop.bpf.c already had this shape (it sets established = 1
+// after its submit); this is the same property.
+//
+// Not otherwise side-effect free: the hit path still refreshes
+// last_seen and bumps event_count, which is the bookkeeping the old
+// combined helper did in its else branch. "Lookup" here means it does
+// not CLAIM the key, not that it does not write.
+//
+// The ordering matters because the alternative was live: marking first
+// and un-marking on a failed reserve leaves a window where a second CPU
+// sees the mark, drops its own event, and then the first CPU deletes
+// the entry. Marking after publish has no such window.
+static __always_inline bool connection_already_seen(struct conn_key *key)
 {
     struct conn_state *state = bpf_map_lookup_elem(&connections, key);
-    __u64 now = bpf_ktime_get_ns();
+    if (!state)
+        return false;
 
-    if (!state) {
-        // New connection - add to map
-        struct conn_state new_state = {
-            .first_seen = now,
-            .last_seen = now,
-            .event_count = 1,
-        };
-        bpf_map_update_elem(&connections, key, &new_state, BPF_ANY);
-        return true;
-    }
-
-    // Existing connection - update timestamps
-    state->last_seen = now;
+    state->last_seen = bpf_ktime_get_ns();
     state->event_count++;
+    return true;
+}
 
-    // Don't send duplicate event
-    return false;
+// Record that this flow class has been published. Call ONLY after a
+// successful bpf_ringbuf_submit.
+//
+// This ordering trades duplicates for never losing a flow, and the trade
+// is sound because the harms are wildly asymmetric — not because
+// duplicates are free. A lost class is unrecoverable and silently wrong:
+// conn_key has no source port, so one missing entry silences every later
+// connection matching (netns, saddr, daddr, dport, proto, direction),
+// and this is a common LRU with no TTL that never reclaims it on a node
+// below 65536 keys.
+//
+// A duplicate is bounded and recoverable, but be precise about why. For
+// the GENERATED POLICY it is genuinely idempotent: the output is a set
+// of rules, so repeat observations of a flow class collapse into one.
+// Everything before that point is best-effort rather than idempotent:
+//   - pod_traffic has no unique constraint on its content columns (only
+//     `uuid VARCHAR PRIMARY KEY`, and the controller mints a fresh uuid
+//     per event), so the database is no backstop.
+//   - TRAFFIC_CACHE in network.rs is check-then-act across an await
+//     (contains_key at :341, insert at :366), tracked as #1504.
+//   - add.rs dedups per batch and against a pre-commit read, so two
+//     concurrent in-flight POSTs can both miss; its own comment at :135
+//     names the cost, which is a double insert AND a double audit fire
+//     that inflates verdict and flow counts.
+// So a duplicate that slips every layer costs a spare row and one extra
+// evaluator round trip. Bounded, pre-existing, and far cheaper than a
+// permanently silenced flow class.
+//
+// Do NOT upgrade this to "idempotent by construction" or to "the caches
+// dedup it". Both are the kind of claim someone later leans on while
+// removing a layer.
+//
+// Note the window is lookup-miss to mark-visible across all CPUs, so a
+// high-rate flow class can produce several duplicates rather than one.
+// Bounded, sub-microsecond, and absorbed by the same idempotency.
+//
+// One caveat if conn_state ever grows a consumer: when two CPUs both
+// mark, the second write is a fresh struct under BPF_ANY, so first_seen
+// and event_count reset. They are internal to this dedup map today, so
+// nothing observes it, but they are not reliable as flow duration or
+// occurrence counts without changing this to an update-in-place.
+static __always_inline void mark_connection_seen(struct conn_key *key)
+{
+    __u64 now = bpf_ktime_get_ns();
+    struct conn_state new_state = {
+        .first_seen = now,
+        .last_seen = now,
+        .event_count = 1,
+    };
+    bpf_map_update_elem(&connections, key, &new_state, BPF_ANY);
 }
 
 // Context for TCP connect/accept kprobe/kretprobe pairs
@@ -220,14 +318,14 @@ static __always_inline int handle_udp_send(struct sock *sk, struct msghdr *msg, 
     __builtin_memcpy(conn.saddr, saddr, IPV6_ADDR_LEN);
     __builtin_memcpy(conn.daddr, daddr, IPV6_ADDR_LEN);
 
-    if (!is_new_connection(&conn))
-        return 0; // Existing connection, skip duplicate event
+    if (connection_already_seen(&conn))
+        return 0; // Already published for this flow class
 
     // Reserve space in ring buffer
     struct network_event_data *event;
     event = bpf_ringbuf_reserve(&network_events, sizeof(*event), 0);
     if (!event)
-        return 0; // Buffer full, drop event
+        return 0; // Buffer full: nothing marked yet, so the next packet retries
 
     // Fill event data
     event->inum = inum;
@@ -240,6 +338,7 @@ static __always_inline int handle_udp_send(struct sock *sk, struct msghdr *msg, 
 
     // Submit to userspace
     bpf_ringbuf_submit(event, 0);
+    mark_connection_seen(&conn);
 
     return 0;
 }
@@ -340,14 +439,14 @@ int BPF_PROG(trace_tcp_state_change, struct sock *sk, int state)
     __builtin_memcpy(conn.saddr, saddr, IPV6_ADDR_LEN);
     __builtin_memcpy(conn.daddr, daddr, IPV6_ADDR_LEN);
 
-    if (!is_new_connection(&conn))
-        return 0; // Existing connection, skip duplicate event
+    if (connection_already_seen(&conn))
+        return 0; // Already published for this flow class
 
     // Reserve space in ring buffer
     struct network_event_data *tcp_event;
     tcp_event = bpf_ringbuf_reserve(&network_events, sizeof(*tcp_event), 0);
     if (!tcp_event)
-        return 0; // Buffer full, drop event
+        return 0; // Buffer full: nothing marked yet, so the next packet retries
 
     // Fill event data
     tcp_event->inum = inum;
@@ -360,6 +459,7 @@ int BPF_PROG(trace_tcp_state_change, struct sock *sk, int state)
 
     // Submit to userspace
     bpf_ringbuf_submit(tcp_event, 0);
+    mark_connection_seen(&conn);
 
     return 0;
 }
@@ -437,14 +537,14 @@ int BPF_KRETPROBE(tcp_accept_exit, struct sock *new_sk)
     __builtin_memcpy(conn.saddr, saddr, IPV6_ADDR_LEN);
     __builtin_memcpy(conn.daddr, daddr, IPV6_ADDR_LEN);
 
-    if (!is_new_connection(&conn))
-        return 0; // Existing connection, skip duplicate event
+    if (connection_already_seen(&conn))
+        return 0; // Already published for this flow class
 
     // Reserve space in ring buffer
     struct network_event_data *accept_event;
     accept_event = bpf_ringbuf_reserve(&network_events, sizeof(*accept_event), 0);
     if (!accept_event)
-        return 0; // Buffer full, drop event
+        return 0; // Buffer full: nothing marked yet, so the next packet retries
 
     // Fill event data
     accept_event->inum = inum;
@@ -457,6 +557,7 @@ int BPF_KRETPROBE(tcp_accept_exit, struct sock *new_sk)
 
     // Submit to userspace
     bpf_ringbuf_submit(accept_event, 0);
+    mark_connection_seen(&conn);
 
     return 0;
 }

@@ -12,10 +12,7 @@ use tracing::{debug, error};
 use crate::{api_post_call, Error, PodInspect, SyscallData};
 
 pub mod sycallprobe {
-    include!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/src/bpf/syscall.skel.rs"
-    ));
+    include!(concat!(env!("OUT_DIR"), "/syscall.skel.rs"));
 }
 
 type SyscallCache = Cache<String, Arc<Mutex<HashSet<String>>>>;

@@ -147,7 +147,14 @@ func GenerateSeccompProfile(options GenerateOptions, config *Config, profileOpts
 	}
 }
 
-// ValidateProfile checks if the generated profile is valid
+// ValidateProfile checks if the generated profile is valid.
+//
+// Reference implementation: it has no non-test caller in this repo today
+// (the CLI path calls BuildSeccompProfile and writes straight out). It is
+// kept because the frontend and llm-bridge validators are ports of it and
+// the shared G2 fixtures lock all three together, so a change here is how
+// a divergence gets caught. Do not assume the Go path enforces this at
+// runtime.
 func ValidateProfile(profile SeccompProfile) error {
 	if profile.DefaultAction == "" {
 		return fmt.Errorf("default action is required")
@@ -161,7 +168,45 @@ func ValidateProfile(profile SeccompProfile) error {
 		return fmt.Errorf("at least one syscall rule must be specified")
 	}
 
+	// The check above counts RULES. Generators emit exactly one rule even
+	// when they observed no syscalls, so it never fires for the profile
+	// that matters: a rule whose Names list is empty. Under a denying
+	// DefaultAction that permits nothing at all, and the container never
+	// starts, because the filter is installed before execve.
+	//
+	// Only meaningful when the default denies. A permissive default
+	// (ALLOW / LOG) with an empty rule is a no-op, not a trap, and
+	// audit-only profiles legitimately allow nothing by name.
+	if !permissiveAction(profile.DefaultAction) {
+		permits := false
+		for _, rule := range profile.Syscalls {
+			if permissiveAction(rule.Action) && len(rule.Names) > 0 {
+				permits = true
+				break
+			}
+		}
+		if !permits {
+			return fmt.Errorf(
+				"defaultAction is %s and no rule allows any syscall, so every syscall would be denied and the container could not start",
+				profile.DefaultAction,
+			)
+		}
+	}
+
 	return nil
+}
+
+// permissiveAction reports whether an action lets a syscall through.
+// Everything else blocks it: ERRNO returns an errno, the KILL_* family
+// terminates the process, TRAP raises SIGSYS, and TRACE without a
+// listening tracer fails the call, as does NOTIFY with no supervisor
+// attached.
+//
+// Unrecognised actions therefore fail safe: an action added in future
+// makes this reject a profile it does not understand rather than pass
+// it, which is the right default for a validator.
+func permissiveAction(action string) bool {
+	return action == "SCMP_ACT_ALLOW" || action == "SCMP_ACT_LOG"
 }
 
 // Helper function to merge multiple syscall lists

@@ -31,3 +31,8 @@ tilt_modules/
 localbin/
 
 .claude/
+
+# Generated eBPF skeletons — produced into OUT_DIR by build.rs.
+# Scoped rather than a bare `*.skel.rs`, which would silently swallow any
+# future skeleton elsewhere in the monorepo.
+controller/src/bpf/*.skel.rs

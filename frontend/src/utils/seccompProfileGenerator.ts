@@ -36,6 +36,27 @@ export function buildSeccompProfile(syscalls: string[], arch: string): SeccompPr
 }
 
 /**
+ * Actions that let a syscall through. Everything else in `SeccompAction`
+ * blocks it: ERRNO returns an errno, the KILL_* family terminates, TRAP
+ * raises SIGSYS, and TRACE without a listening tracer fails the call.
+ * SCMP_ACT_NOTIFY is handled by the same fall-through and also blocks
+ * with no supervisor attached; naming it here so a reader checking
+ * completeness does not have to already know it exists.
+ *
+ * Unrecognised actions therefore fail SAFE: a future seccomp action
+ * makes this reject a profile it does not understand rather than pass
+ * it, which is the right default for a validator.
+ *
+ * Named to match `PERMISSIVE_ACTIONS` in llm-bridge and `permissiveAction`
+ * in the advisor: this check exists in three places and the point of
+ * fixing it in three places was to stop them drifting.
+ */
+const PERMISSIVE_ACTIONS: ReadonlySet<string> = new Set([
+  'SCMP_ACT_ALLOW',
+  'SCMP_ACT_LOG',
+]);
+
+/**
  * Reject a profile that would be unusable if applied — parity port of the
  * advisor's k8s.ValidateProfile and the llm-bridge assistant's
  * validateSeccompProfile. An unrecognized `arch` yields `architectures: []`;
@@ -54,6 +75,25 @@ export function validateSeccompProfile(profile: SeccompProfile): void {
   }
   if (!profile.syscalls || profile.syscalls.length === 0) {
     throw new Error('seccomp profile is invalid: at least one syscall rule is required');
+  }
+  // The check above counts RULES, and `buildSeccompProfile` always emits
+  // exactly one, so it never fires for the profile that matters: a rule
+  // whose `names` list is empty. With a denying `defaultAction` that
+  // permits nothing at all, which stops the container before its
+  // entrypoint runs rather than restricting it.
+  //
+  // Only meaningful when the default denies. A permissive default
+  // (ALLOW / LOG) with an empty rule is merely a no-op, not a trap.
+  if (!PERMISSIVE_ACTIONS.has(profile.defaultAction)) {
+    const permits = profile.syscalls.some(
+      (rule) =>
+        PERMISSIVE_ACTIONS.has(rule.action) && (rule.names?.length ?? 0) > 0,
+    );
+    if (!permits) {
+      throw new Error(
+        `seccomp profile is invalid: defaultAction is ${profile.defaultAction} and no rule allows any syscall, so every syscall would be denied and the container could not start. Add at least one syscall to an SCMP_ACT_ALLOW rule.`,
+      );
+    }
   }
 }
 
