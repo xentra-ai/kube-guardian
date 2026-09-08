@@ -64,6 +64,32 @@ pub struct PodTraffic {
     /// When the identity was stamped; `None` whenever `peer_kind` is.
     #[serde(default)]
     pub peer_resolved_at: Option<NaiveDateTime>,
+    /// Why this flow was recorded as dropped: `no-policy`,
+    /// `policy-governs` or `unknown`.
+    ///
+    /// The drop probe reports a TCP handshake that retransmitted its SYN
+    /// four times without completing. It cannot see WHY, yet everything
+    /// above it called the result a policy denial — and nothing in
+    /// kguardian read a NetworkPolicy, so it could not have known. In a
+    /// cluster with no policies, every such row is definitionally
+    /// something else.
+    ///
+    /// The broker fills this from the evaluator's `/policy-coverage`
+    /// when a DROP row is ingested. `None` is a row that predates the
+    /// column and reads the same as `unknown`, while staying
+    /// distinguishable from one that was actually classified.
+    /// Positional (Queryable) — stays last, in schema order.
+    #[serde(default)]
+    pub drop_cause: Option<String>,
+    /// SYN retransmissions observed before the flow was reported.
+    ///
+    /// The probe has always captured this and the controller logged it,
+    /// but it was never stored, so the one piece of evidence an
+    /// operator could weigh was discarded. Four retries is about seven
+    /// seconds, which also catches an alive-but-overloaded peer: 4
+    /// versus 40 is the difference between slow and blackholed.
+    #[serde(default)]
+    pub syn_retries: Option<i32>,
 }
 
 #[derive(
@@ -261,4 +287,43 @@ pub struct NodeFact {
 /// doesn't send one; the broker stamps arrival time).
 fn chrono_now() -> NaiveDateTime {
     chrono::Utc::now().naive_utc()
+}
+
+#[cfg(test)]
+mod drop_wire_tests {
+    use super::*;
+
+    // The controller sends `syn_retries` as a u32 and the column is
+    // INTEGER, so the wire crosses a signedness boundary. Real values
+    // are single digits (the probe reports at 4), but pin the shape so
+    // a future widening does not silently start rejecting rows.
+    #[test]
+    fn a_drop_row_from_the_controller_deserialises() {
+        let json = r#"{
+            "uuid":"u1","pod_name":"web","pod_namespace":"prod","pod_ip":"10.0.0.1",
+            "pod_port":"0","ip_protocol":"TCP","traffic_type":"EGRESS",
+            "traffic_in_out_ip":"10.0.0.9","traffic_in_out_port":"443",
+            "decision":"DROP","time_stamp":"2026-09-07T00:00:00","syn_retries":4
+        }"#;
+        let t: PodTraffic = serde_json::from_str(json).expect("controller drop payload must parse");
+        assert_eq!(t.syn_retries, Some(4));
+        // Not classified at ingest: the audit worker fills this in
+        // afterwards, and until it does the row reads as "unknown".
+        assert_eq!(t.drop_cause, None);
+    }
+
+    #[test]
+    fn an_allow_row_without_the_field_still_deserialises() {
+        // Backwards compatibility with a controller that predates the
+        // field, which must keep working against a newer broker.
+        let json = r#"{
+            "uuid":"u2","pod_name":"web","pod_namespace":"prod","pod_ip":"10.0.0.1",
+            "pod_port":"8080","ip_protocol":"TCP","traffic_type":"INGRESS",
+            "traffic_in_out_ip":"10.0.0.9","traffic_in_out_port":"0",
+            "decision":"ALLOW","time_stamp":"2026-09-07T00:00:00"
+        }"#;
+        let t: PodTraffic = serde_json::from_str(json).expect("legacy payload must parse");
+        assert_eq!(t.syn_retries, None);
+        assert_eq!(t.drop_cause, None);
+    }
 }

@@ -1,0 +1,38 @@
+-- Why a flow was recorded as dropped, and the evidence behind it.
+--
+-- `decision = 'DROP'` came from netpolicy_drop.bpf.c, which reports a
+-- flow when a TCP handshake retransmits its SYN four times without
+-- reaching ESTABLISHED. That is an honest observation of silence, but
+-- the probe cannot see WHY the handshake failed, and every layer above
+-- it presented the result as a policy denial: the file name, this
+-- column, the "Network Policy Drop" log line, the `denied-traffic`
+-- finding in the UI.
+--
+-- Nothing in kguardian read a NetworkPolicy object, so it could not
+-- have known. In a cluster with no policies at all, every reported
+-- "policy drop" is definitionally something else — a port nothing
+-- listens on and blackholes, a security group, a route, an overloaded
+-- peer — and an operator sent to audit their policies is sent nowhere.
+--
+-- `drop_cause` carries the classification the evaluator derives from the
+-- policies actually installed:
+--   'no-policy'      no NetworkPolicy governs this pod in this
+--                    direction, so a policy cannot be the cause. The
+--                    useful answer, because it is conclusive.
+--   'policy-governs' a policy does select this pod, so a denial is
+--                    plausible. A lead, not a confirmation.
+--   'unknown'        coverage could not be established (evaluator not
+--                    deployed, RBAC missing, cache not synced). Must
+--                    never be presented as either of the above.
+-- NULL means the row predates this column, which reads the same as
+-- 'unknown' but stays distinguishable from a row that was classified.
+ALTER TABLE pod_traffic ADD COLUMN IF NOT EXISTS drop_cause VARCHAR;
+
+-- SYN retransmissions observed before the flow was reported. The probe
+-- has always captured this and the controller logged it, but it was
+-- never stored — so the one piece of evidence an operator could use to
+-- judge a drop was discarded at the boundary. Four retries is roughly
+-- seven seconds of trying, which also catches a peer that is alive but
+-- overloaded; seeing 4 versus 40 is the difference between "slow" and
+-- "blackholed".
+ALTER TABLE pod_traffic ADD COLUMN IF NOT EXISTS syn_retries INTEGER;

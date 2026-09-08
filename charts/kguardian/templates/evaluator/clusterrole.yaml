@@ -10,6 +10,16 @@ rules:
   - apiGroups: [""]
     resources: [pods, namespaces]
     verbs: [get, list, watch]
+  # Read the NetworkPolicies actually installed in the cluster, to
+  # classify a reported drop by whether one could have caused it. The
+  # drop probe observes a TCP handshake that never completed and cannot
+  # see why; without this the evaluator reports every drop cause as
+  # "unknown", which is honest but unhelpful. Read-only, and its own
+  # informer is deliberately excluded from the startup sync gate so an
+  # evaluator that rolls out ahead of this rule still starts.
+  - apiGroups: ["networking.k8s.io"]
+    resources: [networkpolicies]
+    verbs: [list, watch]
   # Watch the AuditNetworkPolicy CRDs via the dynamic client.
   - apiGroups: [kguardian.dev]
     resources: [auditnetworkpolicies, auditclusternetworkpolicies]

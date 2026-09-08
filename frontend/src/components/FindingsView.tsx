@@ -96,7 +96,7 @@ function podLabel(pod: PodNodeData): string {
 
 /**
  * Triage home. Turns the raw graph into a ranked, human-first "what should I
- * look at" surface — denied flows, sensitive syscalls, and egress fan-out —
+ * look at" surface — blocked connections, sensitive syscalls, and egress fan-out —
  * computed entirely from data already loaded for the namespace, plus a
  * would-deny summary pulled from the audit evaluator. No invented scores: each
  * section is a concrete, explainable signal that links back into the map.
@@ -190,7 +190,7 @@ export function FindingsView({ pods, namespace, onSelectPod, onBuildPolicy, onOp
 
   const stats = [
     { label: 'Workloads', value: workloads.length, icon: ShieldCheck, tone: 'text-hubble-accent' },
-    { label: 'Denied flows', value: totalDrops, icon: ShieldAlert, tone: totalDrops > 0 ? 'text-hubble-error' : 'text-secondary' },
+    { label: 'Blocked connections', value: totalDrops, icon: ShieldAlert, tone: totalDrops > 0 ? 'text-hubble-error' : 'text-secondary' },
     { label: 'Sensitive syscalls', value: syscallFindings.length, icon: Terminal, tone: syscallFindings.length > 0 ? 'text-hubble-warning' : 'text-secondary' },
     { label: 'Egress fan-out', value: fanoutFindings.length, icon: Radar, tone: fanoutFindings.length > 0 ? 'text-hubble-warning' : 'text-secondary' },
   ];
@@ -228,7 +228,7 @@ export function FindingsView({ pods, namespace, onSelectPod, onBuildPolicy, onOp
             <EmptyState
               icon={ShieldCheck}
               title="No standout findings"
-              description="No denied flows, sensitive syscalls, or unusual egress fan-out in this namespace. Keep an eye on the map for changes."
+              description="No blocked connections, sensitive syscalls, or unusual egress fan-out in this namespace. Keep an eye on the map for changes."
             />
           </div>
         ) : (
@@ -268,7 +268,7 @@ export function FindingsView({ pods, namespace, onSelectPod, onBuildPolicy, onOp
 
             {/* Denied traffic */}
             {dropFindings.length > 0 && (
-              <Section icon={ShieldAlert} tone="text-hubble-error" title="Denied traffic" hint="Workloads with packets dropped by network policy">
+              <Section icon={ShieldAlert} tone="text-hubble-error" title="Blocked connections" hint="Outbound connections that never completed. The cause is shown per flow: a policy is only one possibility">
                 <ul className="divide-y divide-hubble-border">
                   {dropFindings.slice(0, 8).map(({ pod, drops }) => (
                     <FindingRow

@@ -75,6 +75,10 @@ diesel::table! {
         peer_workload_kind -> Nullable<Varchar>,
         peer_workload_name -> Nullable<Varchar>,
         peer_resolved_at -> Nullable<Timestamp>,
+        // Drop classification and its evidence. Positional (Queryable),
+        // so these stay last too.
+        drop_cause -> Nullable<Varchar>,
+        syn_retries -> Nullable<Int4>,
     }
 }
 

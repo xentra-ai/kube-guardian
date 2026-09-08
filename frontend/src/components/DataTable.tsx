@@ -2,6 +2,7 @@ import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import type { NetworkTraffic, PodInfo, PodNodeData, ServiceInfo } from '../types';
 import { ArrowRight, Activity, ChevronDown, ChevronRight, Filter, MousePointerClick, Inbox } from 'lucide-react';
 import { EmptyState } from './ui/EmptyState';
+import { describeDrop, isDrop } from '../utils/dropCause';
 import { displaySyscallList } from '../utils/syscalls';
 import { UNATTRIBUTED_PEER_TOOLTIP, buildPeerIndex, isPlaceholderPod, resolvePeer } from '../utils/peerResolution';
 
@@ -647,8 +648,19 @@ const DataTable: React.FC<DataTableProps> = ({ selectedPod, allPodsLookup, servi
                                 : traffic.decision === 'DROP'
                                 ? 'bg-hubble-error/20 text-hubble-error'
                                 : 'bg-hubble-border/30 text-secondary'
-                            }`}>
-                              {traffic.decision}
+                            }`}
+                            /* A DROP row means an outbound handshake never
+                               completed; the probe cannot see why. The
+                               title carries the classification so the
+                               badge stops implying a policy denied it. */
+                            title={
+                              isDrop(traffic.decision)
+                                ? describeDrop(traffic.drop_cause, traffic.syn_retries).detail
+                                : undefined
+                            }>
+                              {isDrop(traffic.decision)
+                                ? describeDrop(traffic.drop_cause, traffic.syn_retries).short
+                                : traffic.decision}
                             </span>
                           )}
                           {!traffic.decision && (

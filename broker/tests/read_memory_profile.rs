@@ -131,6 +131,10 @@ fn representative_row(i: usize) -> PodTraffic {
                 .and_hms_opt(12, 0, 1)
                 .unwrap(),
         ),
+        // An ALLOW row carries no drop classification; the widths below
+        // are what a real response holds for the common case.
+        drop_cause: None,
+        syn_retries: None,
     }
 }
 
