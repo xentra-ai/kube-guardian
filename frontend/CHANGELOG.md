@@ -1,5 +1,22 @@
 # Changelog
 
+## [2.0.0](https://github.com/kguardian-dev/kguardian/compare/frontend/v1.15.0...frontend/v2.0.0) (2026-09-08)
+
+
+### ⚠ BREAKING CHANGES
+
+* database.persistence.preUpgradeBackup now defaults to false. Installs relying on the pre-upgrade pg_dumpall will no longer get one. Set `database.persistence.preUpgradeBackup=true` to restore the previous behaviour, noting that the dump goes to container stdout and therefore into whatever aggregates pod logs.
+
+### Features
+
+* detect AWS VPC CNI and align the policy builder with what the cluster enforces ([#1478](https://github.com/kguardian-dev/kguardian/issues/1478)) ([231fe4a](https://github.com/kguardian-dev/kguardian/commit/231fe4a1b7196bdaa93b3429bc454d6c9c774f1d))
+
+
+### Bug Fixes
+
+* say why a connection was blocked instead of assuming a policy did it ([#1481](https://github.com/kguardian-dev/kguardian/issues/1481)) ([dbdb10c](https://github.com/kguardian-dev/kguardian/commit/dbdb10c212bbdb3219dc21dd0ab6f5fe1c84ccbf))
+* stop losing observed flows, reject unusable seccomp profiles, and correct unsafe chart defaults ([#1503](https://github.com/kguardian-dev/kguardian/issues/1503)) ([4a504ef](https://github.com/kguardian-dev/kguardian/commit/4a504ef3f17b6344d504c6dcb4ffe46028477ffc))
+
 ## [1.15.0](https://github.com/kguardian-dev/kguardian/compare/frontend/v1.14.0...frontend/v1.15.0) (2026-09-03)
 
 
