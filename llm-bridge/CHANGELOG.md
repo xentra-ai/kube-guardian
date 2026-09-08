@@ -1,5 +1,22 @@
 # Changelog
 
+## [1.10.0](https://github.com/kguardian-dev/kguardian/compare/llm-bridge/v1.9.1...llm-bridge/v1.10.0) (2026-09-08)
+
+
+### ⚠ BREAKING CHANGES
+
+* database.persistence.preUpgradeBackup now defaults to false. Installs relying on the pre-upgrade pg_dumpall will no longer get one. Set `database.persistence.preUpgradeBackup=true` to restore the previous behaviour, noting that the dump goes to container stdout and therefore into whatever aggregates pod logs.
+
+### Features
+
+* detect AWS VPC CNI and align the policy builder with what the cluster enforces ([#1478](https://github.com/kguardian-dev/kguardian/issues/1478)) ([231fe4a](https://github.com/kguardian-dev/kguardian/commit/231fe4a1b7196bdaa93b3429bc454d6c9c774f1d))
+
+
+### Bug Fixes
+
+* **deps:** update dependency @anthropic-ai/sdk to ^0.124.0 ([#1471](https://github.com/kguardian-dev/kguardian/issues/1471)) ([7c5b941](https://github.com/kguardian-dev/kguardian/commit/7c5b941ce8f0f1d39647a84a2b2f9e32fb92fe74))
+* stop losing observed flows, reject unusable seccomp profiles, and correct unsafe chart defaults ([#1503](https://github.com/kguardian-dev/kguardian/issues/1503)) ([4a504ef](https://github.com/kguardian-dev/kguardian/commit/4a504ef3f17b6344d504c6dcb4ffe46028477ffc))
+
 ## [1.9.1](https://github.com/kguardian-dev/kguardian/compare/llm-bridge/v1.9.0...llm-bridge/v1.9.1) (2026-09-03)
 
 
