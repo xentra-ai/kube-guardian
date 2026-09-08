@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.1](https://github.com/kguardian-dev/kguardian/compare/evaluator/v0.4.0...evaluator/v0.4.1) (2026-09-08)
+
+
+### Bug Fixes
+
+* say why a connection was blocked instead of assuming a policy did it ([#1481](https://github.com/kguardian-dev/kguardian/issues/1481)) ([dbdb10c](https://github.com/kguardian-dev/kguardian/commit/dbdb10c212bbdb3219dc21dd0ab6f5fe1c84ccbf))
+
 ## [0.4.0](https://github.com/kguardian-dev/kguardian/compare/evaluator/v0.3.5...evaluator/v0.4.0) (2026-09-01)
 
 
