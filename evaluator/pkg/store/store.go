@@ -16,13 +16,16 @@ import (
 	v1alpha1 "github.com/kguardian-dev/kguardian/evaluator/pkg/v1alpha1"
 	"github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/dynamic/dynamicinformer"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
+	networkinglisters "k8s.io/client-go/listers/networking/v1"
 	"k8s.io/client-go/tools/cache"
 )
 
@@ -35,6 +38,15 @@ type Store struct {
 	anpInformer  cache.SharedIndexInformer
 	acnpInformer cache.SharedIndexInformer
 	stopCh       chan struct{}
+
+	// Real networking.k8s.io NetworkPolicies, used to answer whether a
+	// policy could have caused a reported drop. A typed lister rather
+	// than the hand-maintained map the AuditNetworkPolicy informers
+	// need: those are dynamic/unstructured and must be converted on
+	// insert, whereas this one gives namespace-scoped listing for free
+	// and cannot drift from the informer's cache.
+	netpolInformer cache.SharedIndexInformer
+	netpolLister   networkinglisters.NetworkPolicyLister
 
 	policyMu sync.RWMutex
 	// policiesByNamespace caches the typed projection of the dynamic
@@ -74,10 +86,13 @@ func New(cfg *rest.Config, log *logrus.Logger) (*Store, error) {
 	factory := informers.NewSharedInformerFactory(kc, 30*time.Minute)
 	dynFactory := dynamicinformer.NewDynamicSharedInformerFactory(dc, 30*time.Minute)
 
+	netpols := factory.Networking().V1().NetworkPolicies()
 	s := &Store{
 		log:                 log,
 		podInformer:         factory.Core().V1().Pods().Informer(),
 		nsInformer:          factory.Core().V1().Namespaces().Informer(),
+		netpolInformer:      netpols.Informer(),
+		netpolLister:        netpols.Lister(),
 		anpInformer:         dynFactory.ForResource(AuditNetworkPolicyGVR).Informer(),
 		acnpInformer:        dynFactory.ForResource(AuditClusterNetworkPolicyGVR).Informer(),
 		stopCh:              make(chan struct{}),
@@ -116,7 +131,17 @@ func (s *Store) Start(ctx context.Context) error {
 	go s.nsInformer.Run(s.stopCh)
 	go s.anpInformer.Run(s.stopCh)
 	go s.acnpInformer.Run(s.stopCh)
+	go s.netpolInformer.Run(s.stopCh)
 
+	// The NetworkPolicy informer is started but deliberately EXCLUDED
+	// from the blocking sync set. It only enriches the drop signal, and
+	// the chart and image version independently, so an evaluator that
+	// rolled out ahead of the ClusterRole rule granting
+	// networkpolicies would never sync and would otherwise fail to
+	// start — taking audit evaluation down with it for the sake of a
+	// classification hint. Instead it never syncs, PolicyCoverageKnown
+	// stays false, and coverage reports "unknown", which is the honest
+	// answer.
 	if !cache.WaitForCacheSync(ctx.Done(),
 		s.podInformer.HasSynced,
 		s.nsInformer.HasSynced,
@@ -126,6 +151,10 @@ func (s *Store) Start(ctx context.Context) error {
 		return context.Canceled
 	}
 	s.log.Info("informer caches synced (pods, namespaces, auditnetworkpolicies, auditclusternetworkpolicies)")
+	if !s.netpolInformer.HasSynced() {
+		s.log.Warn("networkpolicy cache not synced yet; drop causes report as unknown until it is " +
+			"(missing RBAC on an older chart would keep it that way)")
+	}
 	return nil
 }
 
@@ -336,4 +365,32 @@ func (s *Store) GetNamespaceLabels(name string) map[string]string {
 		return map[string]string{}
 	}
 	return ns.Labels
+}
+
+// PolicyCoverageKnown reports whether the NetworkPolicy cache has
+// synced, and therefore whether a "no policy governs this pod" answer
+// can be trusted.
+//
+// Load-bearing: without it, an evaluator that cannot list
+// networkpolicies would report an empty policy set and every drop would
+// be classified as definitively not policy-caused. That is the same
+// false-confidence failure the drop signal already had, arriving by a
+// new route.
+func (s *Store) PolicyCoverageKnown() bool {
+	return s.netpolInformer.HasSynced()
+}
+
+// NetworkPoliciesInNamespace returns the real NetworkPolicies scoped to
+// one namespace. A NetworkPolicy only ever selects pods in its own
+// namespace, so callers must not widen this.
+func (s *Store) NetworkPoliciesInNamespace(ns string) []*networkingv1.NetworkPolicy {
+	if ns == "" {
+		return nil
+	}
+	list, err := s.netpolLister.NetworkPolicies(ns).List(labels.Everything())
+	if err != nil {
+		s.log.WithError(err).Debug("listing networkpolicies failed; drop cause will be unknown")
+		return nil
+	}
+	return list
 }

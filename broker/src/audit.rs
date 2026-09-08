@@ -29,6 +29,13 @@ enum AuditInsertError {
     Diesel(#[from] diesel::result::Error),
 }
 
+/// Wire format of the evaluator's `GET /policy-coverage` reply.
+#[derive(Debug, serde::Deserialize)]
+struct PolicyCoverage {
+    /// "no-policy", "policy-governs" or "unknown".
+    cause: String,
+}
+
 /// Wire format consumed by `POST /evaluate` — must match
 /// `evaluator/pkg/matcher.Flow` exactly.
 #[derive(Debug, Serialize)]
@@ -356,10 +363,95 @@ impl AuditClient {
     /// caller: the audit dispatcher holds an `in_flight` permit for the duration
     /// of this call, so a large ingest burst can't create unbounded concurrent
     /// /evaluate round-trips. Called only by the in-crate dispatcher.
+    /// Ask the evaluator which policies govern this pod, and record the
+    /// answer on the row.
+    ///
+    /// Best-effort throughout. Every failure path leaves `drop_cause`
+    /// NULL, which readers treat exactly as `unknown` — the honest
+    /// answer when the evaluator is not deployed, lacks RBAC for
+    /// networkpolicies, or has not synced. It must never be allowed to
+    /// fail the ingest that produced the row.
+    async fn classify_drop(&self, pool: &DbPool, traffic: &PodTraffic) {
+        let (Some(ns), Some(name)) = (
+            traffic.pod_namespace.as_deref(),
+            traffic.pod_name.as_deref(),
+        ) else {
+            return;
+        };
+        // The drop probe only observes outbound connects, so the pod
+        // that owns the row is always the originator.
+        let url = format!("{}/policy-coverage", self.base_url.trim_end_matches('/'));
+        let cause = match self
+            .http
+            .get(&url)
+            // Built as query parameters rather than interpolated so a
+            // pod or namespace name is escaped by the client rather
+            // than trusted into a URL.
+            .query(&[("namespace", ns), ("pod", name), ("direction", "Egress")])
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() => match r.json::<PolicyCoverage>().await {
+                Ok(c) => c.cause,
+                Err(e) => {
+                    debug!(error = %e, "policy-coverage body was not JSON; drop cause stays unknown");
+                    return;
+                }
+            },
+            Ok(r) => {
+                // A 404 is an evaluator older than this endpoint, which
+                // is expected during a rollout rather than an incident.
+                debug!(status = %r.status(), "policy-coverage unavailable; drop cause stays unknown");
+                return;
+            }
+            Err(e) => {
+                debug!(error = %e, "policy-coverage unreachable; drop cause stays unknown");
+                return;
+            }
+        };
+
+        let pool = pool.clone();
+        let uuid = traffic.uuid.clone();
+        let cause_for_db = cause.clone();
+        let wrote = actix_web::rt::task::spawn_blocking(
+            move || -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+                use crate::schema::pod_traffic::dsl as pt;
+                let mut conn = pool.get()?;
+                Ok(diesel::update(pt::pod_traffic.filter(pt::uuid.eq(uuid)))
+                    .set(pt::drop_cause.eq(Some(cause_for_db)))
+                    .execute(&mut conn)?)
+            },
+        )
+        .await;
+        match wrote {
+            Ok(Ok(_)) => debug!(cause = %cause, "drop cause recorded"),
+            Ok(Err(e)) => debug!(error = %e, "recording drop cause failed"),
+            Err(e) => debug!(error = %e, "drop cause task panicked"),
+        }
+    }
+
     pub(crate) async fn evaluate_and_persist(&self, pool: DbPool, traffic: PodTraffic) {
         if !self.enabled {
             return;
         }
+
+        // A dropped flow gets classified before anything else. The drop
+        // probe reports a TCP handshake that never completed and cannot
+        // see why, yet the row it produces has always been presented as
+        // a policy denial. Asking the evaluator which policies actually
+        // govern this pod turns that assertion into an answer — and in
+        // a cluster with no policies at all, into a conclusive "not
+        // this".
+        //
+        // Rides the audit queue on purpose: it is already bounded,
+        // already off the ingest hot path, and already capped for
+        // concurrency, so classification cannot back-pressure capture.
+        // Drops are a fraction of a percent of rows, so the added load
+        // is negligible.
+        if traffic.decision.as_deref() == Some("DROP") {
+            self.classify_drop(&pool, &traffic).await;
+        }
+
         let url = format!("{}/evaluate", self.base_url.trim_end_matches('/'));
 
         let flow = match build_flow_for_traffic(&traffic) {

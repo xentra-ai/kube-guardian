@@ -178,6 +178,15 @@ pub struct PodTraffic {
     pub ip_protocol: Option<String>,
     pub decision: Option<String>,
     pub time_stamp: NaiveDateTime,
+    /// SYN retransmissions observed before a dropped flow was reported;
+    /// `None` for an ALLOW row, which has no such evidence.
+    ///
+    /// The drop probe has always captured this, but it stopped at the
+    /// process boundary, so the operator never saw whether a flow
+    /// retried four times or forty — the difference between a peer that
+    /// is merely slow and one whose packets are being discarded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub syn_retries: Option<u32>,
 }
 
 #[derive(Debug, Default, Serialize)]

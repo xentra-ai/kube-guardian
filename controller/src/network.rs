@@ -359,6 +359,9 @@ async fn build_traffic_event(data: &NetworkEventData, pod_data: &PodInspect) -> 
         ip_protocol: Some(protocol.to_string()),
         decision: Some("ALLOW".to_string()),
         time_stamp: Utc::now().naive_utc(),
+        // An observed flow that completed has no retransmission
+        // evidence to carry.
+        syn_retries: None,
     };
 
     debug!("Adding traffic event to batch: {:?}", cache_key);
@@ -445,8 +448,14 @@ async fn build_policy_drop_event(
     let d_port = data.dport;
     let protocol_str = proto_to_string(data.protocol);
 
+    // Says what was observed, not what caused it. The probe sees a TCP
+    // handshake that retransmitted its SYN `syn_retries` times without
+    // reaching ESTABLISHED; it has no visibility into why. Calling this
+    // a "Network Policy Drop" sent operators to audit policies that in
+    // many clusters do not exist. The evaluator classifies the cause
+    // later, from the policies actually installed.
     debug!(
-        "Network Policy Drop: Pod: {}, Namespace: {:?}, Src: {}:{}, Dst: {}:{}, Protocol: {}, SYN Retries: {}",
+        "TCP connect never completed: Pod: {}, Namespace: {:?}, Src: {}:{}, Dst: {}:{}, Protocol: {}, SYN Retries: {}",
         pod_data.status.pod_name,
         pod_data.status.pod_namespace,
         s_ip,
@@ -498,6 +507,13 @@ async fn build_policy_drop_event(
         ip_protocol: Some(protocol_str),
         decision: Some("DROP".to_string()),
         time_stamp: Utc::now().naive_utc(),
+        // The probe has always captured this and the line above has
+        // always logged it, but it stopped at the process boundary, so
+        // the only evidence an operator could weigh never reached them.
+        // Four retries is roughly seven seconds of trying, which also
+        // catches a peer that is alive but overloaded: 4 versus 40 is
+        // the difference between slow and blackholed.
+        syn_retries: Some(data.syn_retries),
     };
 
     // Insert into cache immediately to prevent duplicates in same batch
@@ -820,6 +836,7 @@ mod tests {
             traffic_in_out_port: None,
             decision: None,
             time_stamp: chrono::NaiveDateTime::default(),
+            syn_retries: None,
         }
     }
 

@@ -17,6 +17,8 @@ import (
 	"time"
 
 	"github.com/kguardian-dev/kguardian/evaluator/pkg/matcher"
+	"github.com/kguardian-dev/kguardian/evaluator/pkg/policycoverage"
+	networkingv1 "k8s.io/api/networking/v1"
 	"github.com/kguardian-dev/kguardian/evaluator/pkg/status"
 	v1alpha1 "github.com/kguardian-dev/kguardian/evaluator/pkg/v1alpha1"
 	"github.com/sirupsen/logrus"
@@ -29,6 +31,12 @@ type PolicyLookup interface {
 	matcher.Lookup
 	PoliciesInNamespace(ns string) []*v1alpha1.AuditNetworkPolicy
 	ClusterPolicies() []*v1alpha1.AuditClusterNetworkPolicy
+	// Real networking.k8s.io policies, for classifying a reported drop
+	// by whether one could have caused it. Separate from the
+	// AuditNetworkPolicy accessors above: those are policies the
+	// operator is trialling, these are the ones actually installed.
+	NetworkPoliciesInNamespace(ns string) []*networkingv1.NetworkPolicy
+	PolicyCoverageKnown() bool
 }
 
 // Server is the HTTP entry point.
@@ -56,6 +64,7 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.HandleFunc("/healthz", s.handleHealth)
 	mux.HandleFunc("/readyz", s.handleReady)
 	mux.HandleFunc("/evaluate", s.handleEvaluate)
+	mux.HandleFunc("/policy-coverage", s.handlePolicyCoverage)
 
 	s.srv = &http.Server{
 		Addr:              s.addr,
@@ -184,4 +193,63 @@ func (s *Server) handleEvaluate(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(EvaluateResponse{Results: results})
+}
+
+// PolicyCoverageResponse says whether a real NetworkPolicy could have
+// caused a reported drop for a given pod and direction.
+type PolicyCoverageResponse struct {
+	// Cause is "no-policy", "policy-governs" or "unknown".
+	Cause string `json:"cause"`
+}
+
+// handlePolicyCoverage answers "could a policy have caused this?" for
+// one pod and direction.
+//
+// Separate from /evaluate on purpose. /evaluate asks whether a specific
+// AuditNetworkPolicy would deny a specific flow, which is a per-flow
+// question against policies the operator is trialling. This asks a
+// coarser question against the policies actually installed: does
+// anything govern this pod at all? A "no" is conclusive and is the
+// answer that reclassifies a drop, and it needs none of the port,
+// protocol or peer matching /evaluate does.
+//
+// Never fails on missing coverage. An unsynced or unreadable
+// NetworkPolicy cache returns "unknown" with a 200, because the caller
+// is annotating a stored row rather than making a decision, and a 500
+// here would either lose the row or wedge the broker's ingest path.
+func (s *Server) handlePolicyCoverage(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	q := r.URL.Query()
+	ns := q.Get("namespace")
+	name := q.Get("pod")
+	dir := policycoverage.Direction(q.Get("direction"))
+	if ns == "" || name == "" {
+		http.Error(w, "namespace and pod are required", http.StatusBadRequest)
+		return
+	}
+	if dir != policycoverage.Egress && dir != policycoverage.Ingress {
+		http.Error(w, "direction must be Ingress or Egress", http.StatusBadRequest)
+		return
+	}
+
+	known := s.store.PolicyCoverageKnown()
+	pod := s.store.GetPod(ns, name)
+	// A pod we have never seen is not the same as a pod no policy
+	// governs: without its labels there is nothing to match a selector
+	// against, so the honest answer is that we cannot tell.
+	if pod == nil {
+		known = false
+	}
+	governs := false
+	if known {
+		governs = policycoverage.Governs(s.store.NetworkPoliciesInNamespace(ns), pod, dir)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(PolicyCoverageResponse{
+		Cause: string(policycoverage.Classify(known, governs)),
+	})
 }

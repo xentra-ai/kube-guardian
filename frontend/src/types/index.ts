@@ -71,6 +71,17 @@ export interface NetworkTraffic {
   traffic_in_out_port: string | null;
   decision: string | null; // ALLOW or DROP
   time_stamp: string;
+  /** Why a DROP row was recorded: 'no-policy' | 'policy-governs' |
+   *  'unknown'. Null on an ALLOW row, on a row written before
+   *  classification existed, or when the evaluator could not classify
+   *  it — all of which read as "cause unknown". The drop probe observes
+   *  only that a TCP handshake never completed; it cannot see why, so
+   *  never present a bare DROP as a policy denial. Use
+   *  `describeDrop` from utils/dropCause. */
+  drop_cause?: string | null;
+  /** SYN retransmissions before the flow was reported. The evidence
+   *  behind a drop: 4 retries is a slow peer, 40 is blackholed. */
+  syn_retries?: number | null;
   /** Peer identity stamped by the broker when the row was ingested (or by
    *  its late-resolve pass). Pod IPs are recycled constantly, so this — not
    *  a by-IP lookup at read time — is the authoritative peer. All null on a

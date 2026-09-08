@@ -24,7 +24,17 @@ type fakeLookup struct {
 	nsLabels    map[string]map[string]string
 	policies    map[string][]*v1alpha1.AuditNetworkPolicy
 	clusterPols []*v1alpha1.AuditClusterNetworkPolicy
+	// Real NetworkPolicies, for the drop-cause endpoint. `netpolKnown`
+	// models an unsynced or unreadable cache, which must stay
+	// distinguishable from a synced cache holding nothing.
+	netpols     map[string][]*networkingv1.NetworkPolicy
+	netpolKnown bool
 }
+
+func (f *fakeLookup) NetworkPoliciesInNamespace(ns string) []*networkingv1.NetworkPolicy {
+	return f.netpols[ns]
+}
+func (f *fakeLookup) PolicyCoverageKnown() bool { return f.netpolKnown }
 
 func (f *fakeLookup) GetPod(ns, name string) *corev1.Pod {
 	return f.pods[ns+"/"+name]
@@ -358,4 +368,121 @@ func tcpPort(p int32) networkingv1.NetworkPolicyPort {
 	tcp := corev1.ProtocolTCP
 	port := intstr.FromInt32(p)
 	return networkingv1.NetworkPolicyPort{Protocol: &tcp, Port: &port}
+}
+
+// --- policy coverage -------------------------------------------------
+//
+// The endpoint behind the drop-cause reclassification. kguardian used to
+// label every incomplete TCP handshake a policy drop without reading a
+// single NetworkPolicy, so in a cluster with none, every reported
+// "policy drop" was definitionally something else.
+
+func coverageServer(f *fakeLookup) *Server {
+	return New(":0", f, nil, logrus.New())
+}
+
+func coverageGet(t *testing.T, srv *Server, q string) (int, string) {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, "/policy-coverage?"+q, nil)
+	rec := httptest.NewRecorder()
+	srv.handlePolicyCoverage(rec, req)
+	return rec.Code, rec.Body.String()
+}
+
+func webPod() *corev1.Pod {
+	return &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Namespace: "prod", Name: "web", Labels: map[string]string{"app": "web"},
+	}}
+}
+
+func TestPolicyCoverageNoPolicyIsConclusive(t *testing.T) {
+	f := &fakeLookup{
+		pods:        map[string]*corev1.Pod{"prod/web": webPod()},
+		netpolKnown: true,
+	}
+	code, body := coverageGet(t, coverageServer(f), "namespace=prod&pod=web&direction=Egress")
+	if code != http.StatusOK {
+		t.Fatalf("want 200, got %d: %s", code, body)
+	}
+	if !strings.Contains(body, `"cause":"no-policy"`) {
+		t.Errorf("a synced cache with no policies must be conclusive, got %s", body)
+	}
+}
+
+func TestPolicyCoverageGoverningPolicyIsReported(t *testing.T) {
+	f := &fakeLookup{
+		pods:        map[string]*corev1.Pod{"prod/web": webPod()},
+		netpolKnown: true,
+		netpols: map[string][]*networkingv1.NetworkPolicy{"prod": {{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "prod", Name: "np"},
+			Spec: networkingv1.NetworkPolicySpec{
+				PodSelector: metav1.LabelSelector{MatchLabels: map[string]string{"app": "web"}},
+				PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeEgress},
+			},
+		}}},
+	}
+	_, body := coverageGet(t, coverageServer(f), "namespace=prod&pod=web&direction=Egress")
+	if !strings.Contains(body, `"cause":"policy-governs"`) {
+		t.Errorf("want policy-governs, got %s", body)
+	}
+}
+
+func TestPolicyCoverageUnsyncedCacheIsUnknownNotNoPolicy(t *testing.T) {
+	// The failure this guards is the original bug arriving by a new
+	// route: an evaluator that cannot list networkpolicies would see an
+	// empty set and declare every drop definitively not policy-caused.
+	f := &fakeLookup{
+		pods:        map[string]*corev1.Pod{"prod/web": webPod()},
+		netpolKnown: false,
+	}
+	_, body := coverageGet(t, coverageServer(f), "namespace=prod&pod=web&direction=Egress")
+	if !strings.Contains(body, `"cause":"unknown"`) {
+		t.Errorf("an unsynced cache must be unknown, got %s", body)
+	}
+}
+
+func TestPolicyCoverageUnseenPodIsUnknown(t *testing.T) {
+	// No pod means no labels, so there is nothing to match a selector
+	// against. That is ignorance, not absence of policy.
+	f := &fakeLookup{netpolKnown: true}
+	_, body := coverageGet(t, coverageServer(f), "namespace=prod&pod=ghost&direction=Egress")
+	if !strings.Contains(body, `"cause":"unknown"`) {
+		t.Errorf("an unknown pod must be unknown, got %s", body)
+	}
+}
+
+func TestPolicyCoverageRejectsBadInput(t *testing.T) {
+	f := &fakeLookup{netpolKnown: true}
+	srv := coverageServer(f)
+	for _, q := range []string{
+		"pod=web&direction=Egress",              // no namespace
+		"namespace=prod&direction=Egress",       // no pod
+		"namespace=prod&pod=web",                // no direction
+		"namespace=prod&pod=web&direction=Both", // not a direction
+	} {
+		if code, _ := coverageGet(t, srv, q); code != http.StatusBadRequest {
+			t.Errorf("query %q: want 400, got %d", q, code)
+		}
+	}
+}
+
+func TestPolicyCoverageRejectsNonGet(t *testing.T) {
+	f := &fakeLookup{netpolKnown: true}
+	req := httptest.NewRequest(http.MethodPost, "/policy-coverage?namespace=prod&pod=web&direction=Egress", nil)
+	rec := httptest.NewRecorder()
+	coverageServer(f).handlePolicyCoverage(rec, req)
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Errorf("want 405, got %d", rec.Code)
+	}
+}
+
+func TestPolicyCoverageNeverFailsWhenCoverageIsMissing(t *testing.T) {
+	// The caller is annotating a stored row, not making a decision. A
+	// 500 here would either lose the row or wedge the broker's ingest
+	// path, so missing coverage must still be a 200.
+	f := &fakeLookup{netpolKnown: false}
+	code, _ := coverageGet(t, coverageServer(f), "namespace=prod&pod=ghost&direction=Ingress")
+	if code != http.StatusOK {
+		t.Errorf("want 200 even with no coverage, got %d", code)
+	}
 }
