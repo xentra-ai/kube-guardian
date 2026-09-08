@@ -1,6 +1,6 @@
 # Changelog
 
-## [2.0.0](https://github.com/kguardian-dev/kguardian/compare/controller/v1.12.1...controller/v2.0.0) (2026-09-08)
+## [1.13.0](https://github.com/kguardian-dev/kguardian/compare/controller/v1.12.1...controller/v1.13.0) (2026-09-08)
 
 
 ### ⚠ BREAKING CHANGES
