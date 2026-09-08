@@ -62,7 +62,7 @@ controller:
       # other image in this chart is pinned, an unpinned tag means
       # whatever it resolves to at pull time runs on every node, and
       # `latest` is what forces `pullPolicy: Always` to re-check.
-      tag: "1.37.0"
+      tag: "1.38.0"
     # -- Init container security context
     securityContext:
       runAsNonRoot: true
@@ -290,7 +290,7 @@ broker:
       # init container for why this is not `Always`.
       pullPolicy: IfNotPresent
       # -- Broker init container image tag, pinned rather than `latest`.
-      tag: "1.37.0"
+      tag: "1.38.0"
       # -- Overrides the init container image tag using SHA digest
       sha: ""
     # -- Broker init container security context
