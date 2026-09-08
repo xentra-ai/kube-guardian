@@ -1,5 +1,16 @@
 # Changelog
 
+## [1.9.0](https://github.com/kguardian-dev/kguardian/compare/advisor/v1.8.2...advisor/v1.9.0) (2026-09-08)
+
+
+### ⚠ BREAKING CHANGES
+
+* database.persistence.preUpgradeBackup now defaults to false. Installs relying on the pre-upgrade pg_dumpall will no longer get one. Set `database.persistence.preUpgradeBackup=true` to restore the previous behaviour, noting that the dump goes to container stdout and therefore into whatever aggregates pod logs.
+
+### Bug Fixes
+
+* stop losing observed flows, reject unusable seccomp profiles, and correct unsafe chart defaults ([#1503](https://github.com/kguardian-dev/kguardian/issues/1503)) ([4a504ef](https://github.com/kguardian-dev/kguardian/commit/4a504ef3f17b6344d504c6dcb4ffe46028477ffc))
+
 ## [1.8.2](https://github.com/kguardian-dev/kguardian/compare/advisor/v1.8.1...advisor/v1.8.2) (2026-09-03)
 
 
