@@ -1,6 +1,6 @@
 # Changelog
 
-## [2.0.0](https://github.com/kguardian-dev/kguardian/compare/frontend/v1.15.0...frontend/v2.0.0) (2026-09-08)
+## [1.16.0](https://github.com/kguardian-dev/kguardian/compare/frontend/v1.15.0...frontend/v1.16.0) (2026-09-08)
 
 
 ### ⚠ BREAKING CHANGES
