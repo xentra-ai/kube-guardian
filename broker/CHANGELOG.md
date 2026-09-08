@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.16.0](https://github.com/kguardian-dev/kguardian/compare/broker/v1.15.1...broker/v1.16.0) (2026-09-08)
+
+
+### Features
+
+* detect AWS VPC CNI and align the policy builder with what the cluster enforces ([#1478](https://github.com/kguardian-dev/kguardian/issues/1478)) ([231fe4a](https://github.com/kguardian-dev/kguardian/commit/231fe4a1b7196bdaa93b3429bc454d6c9c774f1d))
+
+
+### Bug Fixes
+
+* say why a connection was blocked instead of assuming a policy did it ([#1481](https://github.com/kguardian-dev/kguardian/issues/1481)) ([dbdb10c](https://github.com/kguardian-dev/kguardian/commit/dbdb10c212bbdb3219dc21dd0ab6f5fe1c84ccbf))
+* stop silently dropping observed flows and bound broker reads ([#1473](https://github.com/kguardian-dev/kguardian/issues/1473)) ([00d8f00](https://github.com/kguardian-dev/kguardian/commit/00d8f004a28bc6c449ea9befaa356e023047581f))
+
 ## [1.15.1](https://github.com/kguardian-dev/kguardian/compare/broker/v1.15.0...broker/v1.15.1) (2026-09-03)
 
 
