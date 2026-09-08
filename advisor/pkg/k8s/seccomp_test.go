@@ -163,3 +163,35 @@ func TestMergeSyscalls_HandlesEmptyInputs(t *testing.T) {
 	sort.Strings(got)
 	assert.Equal(t, []string{"read"}, got)
 }
+
+// The rules-array check counts one, not zero, for the profile that matters:
+// a single rule with an empty Names list. Under a denying DefaultAction that
+// denies every syscall, so the container never starts — the filter is
+// installed before execve. Parity with the frontend and llm-bridge
+// validators, which had the identical gap.
+func TestValidateProfileRejectsDenyingDefaultThatAllowsNothing(t *testing.T) {
+	err := ValidateProfile(SeccompProfile{
+		DefaultAction: "SCMP_ACT_ERRNO",
+		Architectures: []string{"SCMP_ARCH_X86_64"},
+		Syscalls:      []Rule{{Names: []string{}, Action: "SCMP_ACT_ALLOW"}},
+	})
+	assert.ErrorContains(t, err, "no rule allows any syscall")
+}
+
+func TestValidateProfileAcceptsDenyingDefaultWithAnAllowedSyscall(t *testing.T) {
+	assert.NoError(t, ValidateProfile(SeccompProfile{
+		DefaultAction: "SCMP_ACT_ERRNO",
+		Architectures: []string{"SCMP_ARCH_X86_64"},
+		Syscalls:      []Rule{{Names: []string{"read"}, Action: "SCMP_ACT_ALLOW"}},
+	}))
+}
+
+// A permissive default with an empty rule is a no-op rather than a trap, so
+// the new check must not fire on audit-only profiles.
+func TestValidateProfileAcceptsAuditOnlyProfile(t *testing.T) {
+	assert.NoError(t, ValidateProfile(SeccompProfile{
+		DefaultAction: "SCMP_ACT_LOG",
+		Architectures: []string{"SCMP_ARCH_X86_64"},
+		Syscalls:      []Rule{{Names: []string{}, Action: "SCMP_ACT_ALLOW"}},
+	}))
+}

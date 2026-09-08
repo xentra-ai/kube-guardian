@@ -9,26 +9,26 @@ const TCP_PROBE_SRC: &str = "src/bpf/network_probe.bpf.c";
 const PACKET_DROP_SRC: &str = "src/bpf/netpolicy_drop.bpf.c";
 
 fn main() {
-    let out = PathBuf::from(
-        env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR must be set in build script"),
-    )
-    .join("src")
-    .join("bpf")
-    .join("syscall.skel.rs");
+    // Generated skeletons go to OUT_DIR, never into the source tree.
+    //
+    // They used to be written to src/bpf/ and committed. Their content
+    // is architecture-dependent (the vmlinux include path below is
+    // selected by CARGO_CFG_TARGET_ARCH), so whichever machine built
+    // last owned ~25k lines of the diff, and a one-line change to a
+    // .bpf.c rewrote all three files. That buried real changes and made
+    // the tracked copies disagree with what any given build produces.
+    //
+    // Nothing consumed the committed copies: every build regenerates
+    // them before compiling, so they were never an input, a fallback,
+    // or a checked artifact. Cargo's contract is that a build script
+    // confines its writes to OUT_DIR, and the include! sites in
+    // network.rs / syscall.rs read them from there.
+    let out_dir =
+        PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR must be set in build script"));
 
-    let pkt_drop_out = PathBuf::from(
-        env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR must be set in build script"),
-    )
-    .join("src")
-    .join("bpf")
-    .join("netpolicy_drop.skel.rs");
-
-    let tcp_probe_out = PathBuf::from(
-        env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR must be set in build script"),
-    )
-    .join("src")
-    .join("bpf")
-    .join("network_probe.skel.rs");
+    let out = out_dir.join("syscall.skel.rs");
+    let pkt_drop_out = out_dir.join("netpolicy_drop.skel.rs");
+    let tcp_probe_out = out_dir.join("network_probe.skel.rs");
 
     let arch = env::var("CARGO_CFG_TARGET_ARCH")
         .expect("CARGO_CFG_TARGET_ARCH must be set in build script");

@@ -42,3 +42,46 @@ test("validateSeccompProfile: mirrors advisor ValidateProfile conditions", () =>
     /at least one syscall rule/,
   );
 });
+
+// The rules-array check counts one, not zero, for the profile that matters:
+// a single rule with an empty `names` list. Under a denying defaultAction
+// that permits nothing at all, and the container never starts, because the
+// filter is installed before execve. Reachable straight from a broker
+// response of `{ syscalls: "", arch: "x86_64" }`, and an MCP tool's output
+// may be applied without a person reading it.
+test("rejects a denying default that allows no syscall by name", () => {
+  assert.throws(
+    () => validateSeccompProfile({
+      defaultAction: "SCMP_ACT_ERRNO",
+      architectures: ["SCMP_ARCH_X86_64"],
+      syscalls: [{ names: [], action: "SCMP_ACT_ALLOW" }],
+    }),
+    /no rule allows any syscall/,
+  );
+});
+
+test("rejects it via the broker-response path too", () => {
+  assert.throws(
+    () => seccompFromBrokerSyscalls({ syscalls: "", arch: "x86_64" }),
+    /no rule allows any syscall/,
+  );
+});
+
+test("accepts a denying default once one rule allows something", () => {
+  assert.doesNotThrow(() =>
+    seccompFromBrokerSyscalls({ syscalls: "read,write", arch: "x86_64" }),
+  );
+});
+
+// A permissive default with an empty rule is a no-op rather than a trap, so
+// the check must not fire: audit-only profiles legitimately allow nothing by
+// name and still let the workload run.
+test("accepts a permissive default with an empty rule", () => {
+  assert.doesNotThrow(() =>
+    validateSeccompProfile({
+      defaultAction: "SCMP_ACT_LOG",
+      architectures: ["SCMP_ARCH_X86_64"],
+      syscalls: [{ names: [], action: "SCMP_ACT_ALLOW" }],
+    }),
+  );
+});

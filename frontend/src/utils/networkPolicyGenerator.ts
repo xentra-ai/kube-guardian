@@ -396,14 +396,75 @@ export async function generateNetworkPolicy(pod: PodNodeData): Promise<NetworkPo
 }
 
 // YAML special characters that require quoting a value
+/** Characters that force quoting. Retained from the original rule. */
 const YAML_SPECIAL_RE = /[:#'"{}[\],&*?|<>=!%@`\n\r-]/;
 
+/**
+ * Values YAML 1.1 resolves to a non-string even though they contain no
+ * punctuation. kubectl converts YAML to JSON through a YAML 1.1 parser,
+ * and `matchLabels` is `map[string]string`, so an unquoted one is a type
+ * error at apply time. All are legal Kubernetes label values.
+ */
+const YAML11_KEYWORDS = new Set([
+  'y', 'yes', 'n', 'no', 'true', 'false', 'on', 'off', 'null', '~',
+]);
+
+// Deliberately absent: `.inf`, `-.inf` and `.nan`, which YAML 1.1 also
+// resolves to floats. Every form starts with a dot or a sign, and
+// Kubernetes requires a label key or value to begin and end
+// alphanumeric, so none of them is reachable through this function.
+// Recorded so the next reader does not have to re-derive it.
+
+/**
+ * Every form YAML 1.1 resolves as a number: decimal, binary, octal
+ * (both `0o` and bare-leading-zero), hex, float, exponent, and the
+ * sexagesimal `1:30` form. Underscores are digit separators in YAML 1.1.
+ *
+ * A closed set is why this one can be matched positively rather than
+ * guessed at: unlike "all YAML special syntax", the numeric grammar is
+ * finite and specified. An IP or CIDR like `10.0.0.20/32` matches none
+ * of it — two dots and a slash — so it stays unquoted as before.
+ */
+const YAML11_NUMERIC_RE =
+  /^[-+]?(0b[01_]+|0o[0-7_]+|0[0-7_]+|0x[0-9a-fA-F_]+|[0-9][0-9_]*(\.[0-9_]*)?([eE][-+]?[0-9]+)?|\.[0-9_]+([eE][-+]?[0-9]+)?|[0-9][0-9_]*(:[0-5]?[0-9])+(\.[0-9_]*)?)$/;
+
+/**
+ * A value safe to emit as a plain (unquoted) YAML scalar.
+ *
+ * Only the type resolvers are its business: the caller has already
+ * applied the punctuation rule, and this answers the separate question
+ * of whether YAML would read the text as something other than a string.
+ *
+ * Both halves are positive matches against closed, specified sets — the
+ * YAML 1.1 numeric grammar and its boolean/null keywords — rather than
+ * an attempt to enumerate everything YAML can reinterpret. That is the
+ * mistake the original punctuation-only rule made, and it missed every
+ * resolver: `2`, `1.2`, `0x1f` and `1e5` became numbers, `true`, `no`
+ * and `null` became booleans and null. Eleven escapes on the first pass.
+ */
+function isSafePlainScalar(value: string): boolean {
+  if (value === '') return false;
+  // A backslash is literal in a plain scalar, so this is legal
+  // unquoted — but quoting is the predictable direction and no
+  // Kubernetes label value contains one, so nothing is lost.
+  if (value.includes('\\')) return false;
+  if (YAML11_NUMERIC_RE.test(value)) return false;
+  return !YAML11_KEYWORDS.has(value.toLowerCase());
+}
+
 export function quoteYamlValue(value: string): string {
-  if (YAML_SPECIAL_RE.test(value)) {
-    // Use double quotes with internal double-quotes escaped
-    return `"${value.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+  // Both checks, and deliberately additive rather than a replacement.
+  // The punctuation test is what already quotes hyphenated names like
+  // `deployment-web`, and the allowlist alone would permit those —
+  // loosening quoting is an output change, and this fix should only
+  // ever tighten it. So: quote if the old rule said to, and also quote
+  // anything the allowlist does not vouch for.
+  if (!YAML_SPECIAL_RE.test(value) && isSafePlainScalar(value)) {
+    return value;
   }
-  return value;
+  // Double quotes with backslashes escaped before quotes — the other
+  // order would double the backslashes the second pass adds.
+  return `"${value.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
 }
 
 export function policyToYAML(policy: NetworkPolicy): string {

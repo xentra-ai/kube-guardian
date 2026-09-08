@@ -27,17 +27,11 @@ lazy_static::lazy_static! {
 }
 
 pub mod network_probe {
-    include!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/src/bpf/network_probe.skel.rs"
-    ));
+    include!(concat!(env!("OUT_DIR"), "/network_probe.skel.rs"));
 }
 
 pub mod netpolicy_drop {
-    include!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/src/bpf/netpolicy_drop.skel.rs"
-    ));
+    include!(concat!(env!("OUT_DIR"), "/netpolicy_drop.skel.rs"));
 }
 
 #[derive(Hash, Eq, PartialEq, Clone, Debug)]
@@ -876,5 +870,177 @@ mod tests {
         let dropped = cap_batch(&mut batch, 0);
         assert_eq!(dropped, 2);
         assert!(batch.is_empty());
+    }
+
+    /// The network probe must never mark a flow as reported before it
+    /// has actually been published.
+    ///
+    /// A source-level assertion because the property lives in C that no
+    /// Rust test can execute, and because losing it is silent: the probe
+    /// keeps working, the suite stays green, and the only symptom is a
+    /// flow class that stops being reported. `conn_key` carries no source
+    /// port, so one entry marked-but-never-delivered silences every later
+    /// connection matching (netns, saddr, daddr, dport, proto, direction),
+    /// and `connections` is a common LRU with no TTL, so nothing reclaims
+    /// it on a node that never approaches 65536 keys.
+    ///
+    /// Checks the ordering rather than the presence of a repair, because
+    /// publish-then-mark makes the bug unrepresentable where
+    /// mark-then-unwind only makes it avoidable.
+    ///
+    /// Limits worth knowing, because this is a tripwire and should look
+    /// like one:
+    ///
+    /// - It matches source text, so a macro or a helper renamed in only
+    ///   one place defeats it.
+    /// - All four tokens match CALL syntax (a trailing paren), so writing
+    ///   any of them with a paren in prose breaks the count. That fails
+    ///   loudly rather than silently, which is the acceptable direction.
+    /// - It reads the file as one token stream, so it assumes emitters do
+    ///   not interleave.
+    /// - It checks that each emitter deduplicates at all, not that it
+    ///   deduplicates on the right key: a `connection_already_seen` call
+    ///   against the wrong conn_key satisfies it.
+    ///
+    /// Above all it pins SOURCE SHAPE, not behaviour. Four tokens in the
+    /// right order is not evidence the verifier accepts the program or
+    /// that the map behaves under concurrent CPUs. Verifying that needs
+    /// `bpf_prog_test_run` against a mocked map, or a vmtest-style job in
+    /// CI; it is a different tool, not a stricter regex here.
+    #[test]
+    fn network_probe_marks_the_dedup_entry_only_after_publishing() {
+        let src = include_str!("bpf/network_probe.bpf.c");
+
+        // The lookup half must not insert. If it does, the emitters are
+        // marking before publishing again whatever the call sites say.
+        let seen_fn = src
+            .split("static __always_inline bool connection_already_seen")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}").next())
+            .expect("connection_already_seen not found - was it renamed?");
+        assert!(
+            !seen_fn.contains("bpf_map_update_elem"),
+            "connection_already_seen inserts into `connections`. It must be a \
+             pure lookup: marking is mark_connection_seen's job, and it runs \
+             only after bpf_ringbuf_submit."
+        );
+
+        // Interleaving, not per-site lookback. An earlier version compared
+        // each mark against the nearest preceding reserve and submit found
+        // anywhere in the file, which passes trivially from the second
+        // emitter onward: the tokens it finds belong to the PREVIOUS
+        // emitter, which is correctly ordered, so a mark-before-reserve at
+        // sites two or three went undetected. Verified by regressing each
+        // site in turn.
+        //
+        // The dedup check is part of the stream on purpose. Without it the
+        // assertion passes when `connection_already_seen` is deleted
+        // outright: ordering is still check-less reserve, submit, mark, and
+        // the emitter republishes on every packet forever. Verified by
+        // removing it from one emitter and watching this test stay green.
+        let mut tokens: Vec<(usize, &str)> = Vec::new();
+        for (i, _) in src.match_indices("connection_already_seen(&") {
+            tokens.push((i, "check"));
+        }
+        for (i, _) in src.match_indices("bpf_ringbuf_reserve(") {
+            tokens.push((i, "reserve"));
+        }
+        for (i, _) in src.match_indices("bpf_ringbuf_submit(") {
+            tokens.push((i, "submit"));
+        }
+        for (i, _) in src.match_indices("mark_connection_seen(&") {
+            tokens.push((i, "mark"));
+        }
+        tokens.sort_by_key(|(i, _)| *i);
+
+        assert!(
+            !tokens.is_empty(),
+            "no emitter tokens found in network_probe.bpf.c - did it move?"
+        );
+
+        let expected = ["check", "reserve", "submit", "mark"];
+        assert_eq!(
+            tokens.len() % expected.len(),
+            0,
+            "expected check/reserve/submit/mark in fours, found {} tokens: {:?}. \
+             If a new emitter legitimately does not dedup, update this test \
+             rather than adding a mark it does not need.",
+            tokens.len(),
+            tokens.iter().map(|(_, t)| *t).collect::<Vec<_>>()
+        );
+
+        for (n, chunk) in tokens.chunks(expected.len()).enumerate() {
+            let got: Vec<&str> = chunk.iter().map(|(_, t)| *t).collect();
+            assert_eq!(
+                got, expected,
+                "emitter {n} is not check -> reserve -> submit -> mark. \
+                 mark_connection_seen must run only after a successful \
+                 bpf_ringbuf_submit: marking before the reserve leaves the \
+                 flow class marked while userspace never received it, and \
+                 nothing reclaims it. A missing `check` means that emitter \
+                 has stopped deduplicating and will republish every packet. \
+                 See the invariant above `connections`."
+            );
+        }
+    }
+
+    /// The drop probe carries the same publish-then-mark ordering, and
+    /// nothing pinned it.
+    ///
+    /// Of the three probes holding this invariant, two now fail loudly
+    /// when it is broken and this one used to fail silently, which is
+    /// precisely the failure mode the invariant exists to prevent: the
+    /// probe keeps working, the suite stays green, and a flow class
+    /// quietly stops being reported.
+    ///
+    /// Narrower than the network-probe test because this file has one
+    /// reserve site: it asserts the mark that ends the reported path
+    /// (`established = 1`) follows the submit rather than preceding it.
+    #[test]
+    fn netpolicy_drop_marks_only_after_publishing() {
+        let src = include_str!("bpf/netpolicy_drop.bpf.c");
+
+        let reserve = src
+            .find("bpf_ringbuf_reserve(")
+            .expect("no reserve in netpolicy_drop.bpf.c - did the file move?");
+        let submit = src[reserve..]
+            .find("bpf_ringbuf_submit(")
+            .map(|i| reserve + i)
+            .expect("reserve with no matching submit");
+        let mark = src[reserve..]
+            .find("established = 1")
+            .map(|i| reserve + i)
+            .expect("no `established = 1` after the reserve - was the mark renamed?");
+
+        assert!(
+            mark > submit,
+            "netpolicy_drop marks the connection established before publishing \
+             it. On a failed bpf_ringbuf_reserve that records the drop as \
+             reported while userspace never received it, and the retransmit \
+             path will not retry. Mark after the submit, as network_probe does."
+        );
+    }
+
+    /// The syscall probe carries the same invariant by the other route:
+    /// it marks first and deletes on a failed reserve. Guarded here
+    /// because the two probes solve this differently and only one of them
+    /// had a test.
+    #[test]
+    fn syscall_probe_unmarks_when_the_reserve_fails() {
+        let src = include_str!("bpf/syscall.bpf.c");
+        let i = src
+            .find("bpf_ringbuf_reserve(")
+            .expect("no bpf_ringbuf_reserve in syscall.bpf.c - did the file move?");
+        let window = &src[i..];
+        let end = window
+            .find("bpf_ringbuf_submit(")
+            .unwrap_or(window.len().min(1200));
+        assert!(
+            window[..end].contains("bpf_map_delete_elem"),
+            "the syscall probe does not delete its dedup entry when the \
+             ring-buffer reserve fails, so a syscall would be recorded as \
+             reported while userspace never received it - a hole in the \
+             generated seccomp profile caused by a busy moment."
+        );
     }
 }

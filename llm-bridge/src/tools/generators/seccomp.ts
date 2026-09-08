@@ -29,6 +29,18 @@ export function buildSeccompProfile(syscalls: string[], arch: string): SeccompPr
   };
 }
 
+/**
+ * Actions that let a syscall through; everything else blocks it, including
+ * SCMP_ACT_NOTIFY, which returns ENOSYS with no supervisor attached.
+ * Unrecognised actions fail safe: an action added in future makes this
+ * reject a profile rather than pass one it does not understand.
+ *
+ * Comparison is exact, so a lowercased action is a false rejection
+ * rather than a false acceptance. That is the safe direction, but see
+ * the error text below: the message names the symptom.
+ */
+const PERMISSIVE_ACTIONS: ReadonlySet<string> = new Set(["SCMP_ACT_ALLOW", "SCMP_ACT_LOG"]);
+
 /** Reject a profile that would be unusable if applied — a faithful port of the
  *  advisor's k8s.ValidateProfile (pkg/k8s/seccomp.go), which the retired
  *  advisor serve handler ran after building. Without it an unrecognized `arch`
@@ -47,6 +59,28 @@ export function validateSeccompProfile(profile: SeccompProfile): void {
   }
   if (profile.syscalls.length === 0) {
     throw new Error("seccomp profile is invalid: at least one syscall rule is required");
+  }
+  // Counts RULES, and buildSeccompProfile always emits exactly one, so the
+  // check above never fires for the profile that matters: a rule whose
+  // `names` list is empty. Under a denying defaultAction that permits
+  // nothing, which stops the container before its entrypoint runs.
+  //
+  // Reached directly from a broker response here: `{ syscalls: "", arch:
+  // "x86_64" }` yields names: [] with a recognised architecture. That
+  // makes it worse than the editor case, because an MCP tool's output may
+  // be applied by an agent without a person reading the YAML.
+  //
+  // Only meaningful when the default denies; a permissive default with an
+  // empty rule is a no-op.
+  if (!PERMISSIVE_ACTIONS.has(profile.defaultAction)) {
+    const permits = profile.syscalls.some(
+      (rule) => PERMISSIVE_ACTIONS.has(rule.action) && (rule.names?.length ?? 0) > 0,
+    );
+    if (!permits) {
+      throw new Error(
+        `seccomp profile is invalid: defaultAction is ${profile.defaultAction} and no rule allows any syscall, so every syscall would be denied and the container could not start. Action names are matched exactly, so check for a case or spelling mismatch before adding syscalls.`,
+      );
+    }
   }
 }
 
