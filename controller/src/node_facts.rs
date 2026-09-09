@@ -59,8 +59,17 @@ pub struct CniAgentFacts {
 
 /// Map a `spec.providerID` scheme to the telemetry provider enum.
 /// The scheme is the part before "://" — `aws://…`, `gce://…`, etc.
-/// No providerID at all is how bare-metal (and Talos-on-metal) nodes
-/// present.
+///
+/// `baremetal` here means "self-managed, no cloud controller integration"
+/// rather than literally physical hardware: no providerID at all (bare
+/// metal and Talos-on-metal) maps here, and so does the `k3s://` scheme.
+/// K3s only stamps `k3s://<host>` when its embedded cloud-controller is
+/// active, i.e. the operator wired in no real cloud CCM; the moment a
+/// cloud CCM is configured the providerID becomes `aws://`/`gce://`/…
+/// and is detected above. So a `k3s://` node is self-managed infra with
+/// no cloud integration, whatever the box underneath — the same bucket
+/// as no-providerID. `distro=k3s` carries the "it's k3s" signal
+/// separately.
 fn provider_from_id(provider_id: Option<&str>) -> &'static str {
     let Some(id) = provider_id.filter(|s| !s.trim().is_empty()) else {
         return "baremetal";
@@ -76,6 +85,10 @@ fn provider_from_id(provider_id: Option<&str>) -> &'static str {
         "oci" => "oracle",
         "ibm" | "ibmpowervs" => "ibm",
         "kind" => "kind",
+        // K3s's embedded cloud-controller stamps `k3s://<host>` only when
+        // no real cloud CCM is configured — self-managed infra, same
+        // bucket as a node with no providerID at all.
+        "k3s" => "baremetal",
         _ => "unknown",
     }
 }
@@ -661,7 +674,11 @@ mod tests {
     }
 
     #[test]
-    fn k3s_suffix_beats_vanilla_and_calico_annotation_wins() {
+    fn k3s_provider_id_is_self_managed_baremetal() {
+        // K3s's embedded cloud-controller stamps `k3s://<host>`; with no
+        // real cloud CCM that is self-managed infra, so provider folds
+        // into `baremetal` (not `unknown`). `distro=k3s` still carries
+        // the flavor, and the calico annotation still wins the CNI.
         let n = node(
             Some("k3s://node"),
             &[],
@@ -678,7 +695,7 @@ mod tests {
                 f.cni.as_str(),
                 f.node_os.as_str()
             ),
-            ("unknown", "k3s", "calico", "ubuntu")
+            ("baremetal", "k3s", "calico", "ubuntu")
         );
     }
 
