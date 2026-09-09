@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.16.1](https://github.com/kguardian-dev/kguardian/compare/broker/v1.16.0...broker/v1.16.1) (2026-09-09)
+
+
+### Bug Fixes
+
+* **broker:** stop the seccomp profile list allocating per syscall name ([1cae69b](https://github.com/kguardian-dev/kguardian/commit/1cae69bba1d5170c6d06f7249861c874955a6a94))
+* **broker:** stop the seccomp profile list reading syscall blobs at all ([ce516b0](https://github.com/kguardian-dev/kguardian/commit/ce516b004244a09d2bdc5d6a87d12ec0a51f8d9d))
+* **broker:** stop the seccomp profile list reading syscall blobs at all ([5af98b6](https://github.com/kguardian-dev/kguardian/commit/5af98b64c2d0e7a50010b9121bd314430e17bf64))
+* stop the seccomp profile list allocating per-name, and admit it to the read budget ([f03903f](https://github.com/kguardian-dev/kguardian/commit/f03903f3a106fe3faafecbbac37f2b7fae7f68fe))
+
 ## [1.16.0](https://github.com/kguardian-dev/kguardian/compare/broker/v1.15.1...broker/v1.16.0) (2026-09-08)
 
 
