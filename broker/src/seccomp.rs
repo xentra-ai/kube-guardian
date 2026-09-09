@@ -44,8 +44,8 @@
 //! the CR. One file per CR on a node: `kguardian/<namespace>/<cr>.json`.
 
 use crate::read_budget::{
-    cost_kib, ReadBudget, ASSUMED_MAX_WORKLOADS, SECCOMP_DETAIL_ROWS_CHARGED,
-    SECCOMP_WORKLOAD_COST_BYTES,
+    cost_kib, ReadBudget, SCAN_THRESHOLD_DEN, SCAN_THRESHOLD_NUM, SECCOMP_BLOB_COST_BYTES,
+    SECCOMP_DETAIL_ROWS_CHARGED, SECCOMP_WORKLOAD_COST_BYTES,
 };
 use crate::schema;
 use actix_web::{get, post, web, HttpResponse, Responder};
@@ -499,6 +499,10 @@ fn capture_index(
 
 /// One row of `workload_syscalls`, as stored. `hash` fingerprints the
 /// observed `(syscalls, arches)` rendered with `SCMP_ACT_LOG`.
+///
+/// Carries the `syscalls` blob, so it is read only by the per-workload
+/// endpoints. The list endpoint reads [`WorkloadMeta`] instead — see the
+/// note there for why that distinction is load-bearing.
 #[derive(Debug, Queryable, Selectable)]
 #[diesel(table_name = schema::workload_syscalls)]
 struct WorkloadSyscallsRow {
@@ -509,6 +513,58 @@ struct WorkloadSyscallsRow {
     arches: String,
     hash: String,
     updated_at: chrono::NaiveDateTime,
+}
+
+/// A `workload_syscalls` row WITHOUT the `syscalls` blob.
+///
+/// This is the shape the profile list reads, and the reason it exists is
+/// the OOMKill in #1514: the list returns one summary per workload and the
+/// only thing it derives from the syscall set is its cardinality, but it
+/// was selecting every blob to get there. On the dev cluster that is 1696
+/// blobs carrying 113,995 syscall names crossing libpq and becoming Rust
+/// `String`s on every 15s UI poll.
+///
+/// `syscall_count` is stored by `recompute_workload`, so the count comes
+/// back as a column instead of being derived. `Option` because rows written
+/// before that column existed have NULL; the list path fetches the blob for
+/// exactly those and counts them the old way, so the number is unchanged
+/// while they backfill.
+#[derive(Debug, Queryable, Selectable, Clone)]
+#[diesel(table_name = schema::workload_syscalls)]
+struct WorkloadMeta {
+    pod_namespace: String,
+    workload_kind: String,
+    workload_name: String,
+    arches: String,
+    hash: String,
+    updated_at: chrono::NaiveDateTime,
+    syscall_count: Option<i32>,
+}
+
+impl WorkloadMeta {
+    fn key(&self) -> WorkloadKey {
+        (
+            self.pod_namespace.clone(),
+            self.workload_kind.clone(),
+            self.workload_name.clone(),
+        )
+    }
+}
+
+impl From<&WorkloadSyscallsRow> for WorkloadMeta {
+    fn from(r: &WorkloadSyscallsRow) -> Self {
+        WorkloadMeta {
+            pod_namespace: r.pod_namespace.clone(),
+            workload_kind: r.workload_kind.clone(),
+            workload_name: r.workload_name.clone(),
+            arches: r.arches.clone(),
+            hash: r.hash.clone(),
+            updated_at: r.updated_at,
+            // The detail path has the blob in hand, so the count is derived
+            // from it rather than trusted from the column.
+            syscall_count: None,
+        }
+    }
 }
 
 /// The `(namespace, kind, name)` workloads that own any of `pod_names`.
@@ -563,15 +619,22 @@ pub fn recompute_workload(
 
     // Seed from the existing aggregate so the union is monotonic across
     // time even as individual pods come and go.
-    let existing: Option<(String, String, String)> = ws::workload_syscalls
+    // `syscall_count` is selected too, so the unchanged-check below can tell
+    // "nothing changed and the count is stored" from "nothing changed but the
+    // count is still NULL". Without it a row whose blob never changes again
+    // keeps NULL forever and the read path keeps fetching its blob to count
+    // it, which is what this column exists to avoid. Reachable during a
+    // rolling deploy: the migration runs on the new pod's startup while an old
+    // pod is still serving and inserting rows without the column.
+    let existing: Option<(String, String, String, Option<i32>)> = ws::workload_syscalls
         .find((namespace, kind, name))
-        .select((ws::syscalls, ws::arches, ws::hash))
+        .select((ws::syscalls, ws::arches, ws::hash, ws::syscall_count))
         .first(conn)
         .optional()?;
 
     let mut syscall_set = BTreeSet::new();
     let mut arch_set = BTreeSet::new();
-    if let Some((s, a, _)) = &existing {
+    if let Some((s, a, _, _)) = &existing {
         syscall_set.extend(split_set(s));
         arch_set.extend(split_set(a));
     }
@@ -592,14 +655,27 @@ pub fn recompute_workload(
     let arches_joined = join_set(&arch_set);
     let new_hash = fingerprint(&syscall_set, &arch_set, DEFAULT_SECCOMP_ACTION);
 
-    if existing
-        .as_ref()
-        .is_some_and(|(s, a, h)| s == &syscalls_joined && a == &arches_joined && h == &new_hash)
-    {
-        return Ok(()); // unchanged — leave updated_at alone
+    if existing.as_ref().is_some_and(|(s, a, h, count)| {
+        s == &syscalls_joined && a == &arches_joined && h == &new_hash && count.is_some()
+    }) {
+        return Ok(()); // unchanged and counted — leave updated_at alone
     }
 
+    // Deliberate consequence of the `count.is_some()` term above: a row that
+    // is unchanged but uncounted now falls through to the upsert, which bumps
+    // `updated_at` on content that did not change. That contradicts the
+    // early return's intent, so it is worth naming rather than leaving to be
+    // rediscovered. It is one-time per row, it surfaces only as the summary's
+    // `updatedAt`, and no consumer branches on that value. Healing the count
+    // is worth more than the timestamp's precision, because a NULL count
+    // sends every profile-list call back to reading that row's blob.
+
     let now = chrono::Utc::now().naive_utc();
+    // Stored, not recomputed on read. `syscall_set` is the same set that
+    // produces `syscalls_joined`, so this is exact by construction rather
+    // than by two implementations agreeing — which is the property that
+    // matters, since `syscallCount` is user-visible in the UI.
+    let count = syscall_set.len() as i32;
     diesel::insert_into(ws::workload_syscalls)
         .values((
             ws::pod_namespace.eq(namespace),
@@ -609,6 +685,7 @@ pub fn recompute_workload(
             ws::arches.eq(&arches_joined),
             ws::hash.eq(&new_hash),
             ws::updated_at.eq(now),
+            ws::syscall_count.eq(Some(count)),
         ))
         .on_conflict((ws::pod_namespace, ws::workload_kind, ws::workload_name))
         .do_update()
@@ -617,6 +694,7 @@ pub fn recompute_workload(
             ws::arches.eq(&arches_joined),
             ws::hash.eq(&new_hash),
             ws::updated_at.eq(now),
+            ws::syscall_count.eq(Some(count)),
         ))
         .execute(conn)?;
 
@@ -971,13 +1049,27 @@ impl CrBlock {
 /// Observed row + the sets it decodes to, its capture summary, and the
 /// mirrored CRs that reference it.
 struct Observed {
-    row: WorkloadSyscallsRow,
-    /// The syscall names. Empty on the list path for a workload with no
-    /// mirrored CR, where nothing reads them — use [`Observed::syscall_count`]
-    /// for the cardinality, which is correct in both cases.
-    syscalls: BTreeSet<String>,
-    /// Cardinality of the observed set, always populated. Kept separate
-    /// because `syscalls` is not materialised on the list path.
+    meta: WorkloadMeta,
+    /// The syscall names, or `None` when they were never read out of the
+    /// database.
+    ///
+    /// `None` and `Some(empty)` are different facts and this type keeps them
+    /// apart (#1515). Before it was an `Option`, both were the empty set, and
+    /// the distinction lived in a doc comment: the next field added to
+    /// [`ProfileSummary`] that read the names would have got an empty set for
+    /// every workload without a CR, been silently wrong, and passed any test
+    /// written with a CR present.
+    ///
+    /// The failure that makes this worth a type rather than a convention is
+    /// `CrBlock::build`, which diffs these names against the CR's allowed
+    /// set. With an empty `observed`, `drift` reports `missing: []` and
+    /// `extra: [everything]` — and `missing` is the half that lists what gets
+    /// BLOCKED when the CR is enforced. So the silent failure reads as
+    /// "nothing will break" for a workload where everything is about to.
+    syscalls: Option<BTreeSet<String>>,
+    /// Cardinality of the observed set. Always populated, because the list
+    /// path gets it from the stored `syscall_count` column without reading
+    /// the blob.
     syscall_count: usize,
     arches: BTreeSet<String>,
     capture: CaptureSummary,
@@ -985,57 +1077,86 @@ struct Observed {
 }
 
 impl Observed {
+    /// The materialised syscall names, for a caller that requires them.
+    ///
+    /// Only [`Observed::build_for_summary`] can produce an `Observed` without
+    /// names, and no list-path caller reaches the render or export paths. So
+    /// this is a contract check at the boundary, not a condition expected to
+    /// fire — but it returns an error rather than panicking or substituting
+    /// an empty set, because an empty set here silently changes what a
+    /// generated profile allows.
+    fn require_names(&self) -> Result<&BTreeSet<String>, DbError> {
+        self.syscalls.as_ref().ok_or_else(|| {
+            format!(
+                "syscall names were not read for {}/{}/{}; refusing to render a \
+                 profile from an unmaterialised set",
+                self.meta.pod_namespace, self.meta.workload_kind, self.meta.workload_name
+            )
+            .into()
+        })
+    }
+
     /// Materialises the syscall names. Every caller that renders a profile
     /// document, exports, or diffs against a CR needs this.
     fn build(row: WorkloadSyscallsRow, captures: &CaptureIndex, crs: &CrIndex) -> Self {
-        Self::build_inner(row, captures, crs, true)
-    }
-
-    /// List-path build: skips the `BTreeSet<String>` of syscall names when
-    /// nothing will read them.
-    ///
-    /// [`ProfileSummary`] touches `syscalls` in exactly two places —
-    /// `syscall_count` (a length) and `CrBlock::build` (drift, only when the
-    /// workload has a mirrored CR). So a workload with no CR needs the count
-    /// and never the names, which is every workload on the dev cluster. The
-    /// names are still materialised when a CR exists, so drift detection is
-    /// bit-for-bit unchanged.
-    fn build_for_summary(row: WorkloadSyscallsRow, captures: &CaptureIndex, crs: &CrIndex) -> Self {
-        let key = (
-            row.pod_namespace.clone(),
-            row.workload_kind.clone(),
-            row.workload_name.clone(),
-        );
-        let needs_names = !crs.for_workload(&key).is_empty();
-        Self::build_inner(row, captures, crs, needs_names)
-    }
-
-    fn build_inner(
-        row: WorkloadSyscallsRow,
-        captures: &CaptureIndex,
-        crs: &CrIndex,
-        with_names: bool,
-    ) -> Self {
-        let key = (
-            row.pod_namespace.clone(),
-            row.workload_kind.clone(),
-            row.workload_name.clone(),
-        );
-        let (syscalls, syscall_count) = if with_names {
-            let set = split_set(&row.syscalls);
-            let n = set.len();
-            (set, n)
-        } else {
-            (BTreeSet::new(), count_set(&row.syscalls))
-        };
-        let arches = split_set(&row.arches);
+        let meta = WorkloadMeta::from(&row);
+        let key = meta.key();
+        let syscalls = split_set(&row.syscalls);
+        let syscall_count = syscalls.len();
         Observed {
             capture: captures.summary_for(&key),
             crs: crs.for_workload(&key).to_vec(),
-            row,
-            syscalls,
+            arches: split_set(&row.arches),
+            meta,
+            syscalls: Some(syscalls),
             syscall_count,
-            arches,
+        }
+    }
+
+    /// List-path build. The blob is never read for a workload that does not
+    /// need it, so `names` is `None` for almost every workload.
+    ///
+    /// `names` must be `Some` when the workload has a mirrored CR, because
+    /// `CrBlock::build` diffs them. The caller
+    /// ([`workload_summaries`]) is what guarantees that: it fetches blobs
+    /// for exactly the CR-referenced workloads plus any row whose stored
+    /// `syscall_count` is NULL.
+    fn build_for_summary(
+        meta: WorkloadMeta,
+        names: Option<BTreeSet<String>>,
+        captures: &CaptureIndex,
+        crs: &CrIndex,
+    ) -> Self {
+        let key = meta.key();
+        let crs_for = crs.for_workload(&key).to_vec();
+
+        // A CR without names would make drift detection report an empty
+        // `missing` set, which reads as "nothing will break". Assert the
+        // caller's contract rather than trusting it silently.
+        debug_assert!(
+            crs_for.is_empty() || names.is_some(),
+            "workload {key:?} has a mirrored CR but its syscall names were not fetched; \
+             drift detection would report an empty `missing` set"
+        );
+
+        // Prefer the stored count; fall back to counting the blob for rows
+        // written before the column existed.
+        let syscall_count = match (meta.syscall_count, &names) {
+            (Some(n), _) if n >= 0 => n as usize,
+            (_, Some(set)) => set.len(),
+            // Neither a stored count nor a blob. Unreachable via
+            // `workload_summaries`, which fetches the blob for exactly the
+            // NULL-count rows; 0 is the honest answer if it ever happens.
+            _ => 0,
+        };
+
+        Observed {
+            capture: captures.summary_for(&key),
+            crs: crs_for,
+            arches: split_set(&meta.arches),
+            meta,
+            syscalls: names,
+            syscall_count,
         }
     }
 }
@@ -1068,12 +1189,37 @@ struct ProfileSummary {
 
 impl ProfileSummary {
     fn build(obs: &Observed, index: &DistributionIndex) -> Self {
-        let r = &obs.row;
+        let r = &obs.meta;
         let suggested = suggested_cr_name(&r.workload_kind, &r.workload_name);
+        // Drift needs the real names. `zip` rather than an unwrap: if the
+        // names were not fetched for a workload that has a CR, emit no `cr`
+        // block at all instead of one whose `missing` list is empty because it
+        // diffed against nothing.
+        //
+        // The decisive argument is what the controller does with each. With
+        // the block absent, seccomp_distributor takes its `None` arm and
+        // writes Drift status "Unknown"/"NoObservations" - a state it already
+        // models, and the right one for "could not compute". With an empty
+        // observed set it would instead see missing: [] and extra: [every
+        // allowed name], conclude not-in-sync, and write a Drift condition of
+        // status "True" naming zero syscalls, which also flaps the transition
+        // time. Self-contradicting in the object an operator reads.
+        //
+        // The cost of omitting it, since this is a trade rather than a free
+        // win: with `cr` None the `path` below falls back to
+        // `suggested_cr_name`, so `recommendedSnippet` points at the suggested
+        // file rather than the deployed CR's. Copying it would reference a
+        // file no node has. Acceptable in a branch that should be
+        // unreachable, and `crCount` still reports the CR so the omission is
+        // visible rather than looking like there is no CR at all.
+        //
+        // The debug_assert in `build_for_summary` catches the same condition
+        // in tests.
         let cr = obs
             .crs
             .first()
-            .map(|c| CrBlock::build(c, &obs.syscalls, index));
+            .zip(obs.syscalls.as_ref())
+            .map(|(c, names)| CrBlock::build(c, names, index));
         let path = cr
             .as_ref()
             .map(|c| c.localhost_profile.clone())
@@ -1106,21 +1252,170 @@ impl ProfileSummary {
 /// Every workload's observed row with its capture summary and CRs,
 /// ordered. Batch-loads each side table so the list endpoint stays
 /// O(rows + contributors + crs), not a query per row.
-fn all_observed(conn: &mut PgConnection) -> Result<Vec<Observed>, DbError> {
+/// Every workload's summary, without reading the syscall blobs.
+///
+/// This is the read path that OOMKilled the broker (#1514). It used to
+/// `SELECT *`, which meant every workload's `syscalls` blob crossed libpq
+/// and became a Rust `String` per name, on every 15s UI poll, to produce one
+/// integer per workload.
+///
+/// Now the bulk query selects metadata plus the stored `syscall_count` and
+/// no blob at all, and blobs are fetched in one follow-up query for exactly
+/// the workloads that still need them:
+///
+///   - workloads with a mirrored CR, because `CrBlock::build` diffs the real
+///     names to report drift, and
+///   - rows whose `syscall_count` is NULL, i.e. written before that column
+///     existed, which are counted from the blob exactly as before and
+///     disappear as `recompute_workload` backfills them.
+///
+/// On a cluster with no CRs and a backfilled table that second query selects
+/// nothing. On one where every workload has a CR it degrades to the old
+/// behaviour, which is the honest bound: drift detection genuinely needs the
+/// names, so the cost is inherent to the feature rather than to this path.
+fn workload_summaries(conn: &mut PgConnection) -> Result<Vec<Observed>, DbError> {
     use schema::workload_syscalls::dsl as ws;
-    let rows: Vec<WorkloadSyscallsRow> = ws::workload_syscalls
-        .select(WorkloadSyscallsRow::as_select())
+
+    let metas: Vec<WorkloadMeta> = ws::workload_syscalls
+        .select(WorkloadMeta::as_select())
         .order((
             ws::pod_namespace.asc(),
             ws::workload_kind.asc(),
             ws::workload_name.asc(),
         ))
         .load(conn)?;
+
     let captures = capture_index(conn, None)?;
     let crs = cr_index(conn, None)?;
-    Ok(rows
+
+    // Which workloads still need their blob read.
+    let need: Vec<&WorkloadMeta> = metas
+        .iter()
+        .filter(|m| m.syscall_count.is_none() || !crs.for_workload(&m.key()).is_empty())
+        .collect();
+
+    // Names, only for workloads whose drift will be computed.
+    let mut blobs: HashMap<WorkloadKey, BTreeSet<String>> = HashMap::new();
+    // Counts, for legacy rows that have no stored count and no CR. Counting
+    // without materialising the names keeps the #1515 invariant intact: a
+    // workload with no CR never gets a name set it does not need.
+    let mut counts: HashMap<WorkloadKey, usize> = HashMap::new();
+    if !need.is_empty() {
+        // Exact triples, not three independent `eq_any` filters.
+        //
+        // Three `eq_any`s describe a cross product: every row where
+        // `ns in N and kind in K and name in M`, for the distinct values drawn
+        // from `need`. Over-fetch is then roughly |N| x |K| x |M| / |need|,
+        // which is quadratic in |need| and WORST when `need` is a diagonal:
+        // one distinct namespace and one distinct name per entry.
+        //
+        // That is the likely early-adoption shape, not an exotic one. A
+        // hundred teams each mirroring one workload in their own namespace
+        // gives |N| = |M| = 100, so the filter matches up to 10,000 rows,
+        // each carrying its blob, to serve 100. At the observed density
+        // (~67 names per workload) that is megabytes of blob per call, which
+        // is the cost this function exists to remove. Near-total adoption is
+        // the SAFE end: N and M cover everything, so the product collapses
+        // onto the rows actually wanted.
+        //
+        // So build an OR of AND-groups, which is exact and index-friendly,
+        // chunked so the query text stays bounded on a large cluster.
+        //
+        // The fallback to an unfiltered scan is RELATIVE to the table, not an
+        // absolute row count, and the ratio is derived rather than picked. An
+        // unfiltered scan reads every blob, costing 9,318 B (the measured
+        // blob-bearing figure) + 944 B (measured JSON) = 10,262 B/workload,
+        // while the permit charged `SECCOMP_WORKLOAD_COST_BYTES + f *
+        // SECCOMP_BLOB_COST_BYTES` for `need = f * all`. Break-even is
+        // `4,096 + 12,288f >= 10,262`, i.e. f >= 0.502.
+        //
+        // The ratio lives in SCAN_THRESHOLD_NUM/DEN so this condition and the
+        // test that checks it cannot drift apart. Do NOT "simplify" it to 1/2:
+        // that is what a rounded `9.1 + 0.94 ~= 10 KiB` derivation suggests,
+        // it is 22 B/workload short of covering the scan, and
+        // `the_unfiltered_scan_threshold_is_covered_by_what_was_charged` fails
+        // on it.
+        //
+        // An absolute cutoff would let the scan read the whole table while the
+        // charge billed only the CR-referenced rows, which is the same
+        // fail-open this function's own charge was fixed to avoid: at 513
+        // needed rows in a 20,000-workload table it under-charges ~2.3x.
+        //
+        // The cost accepted below the threshold is round trips rather than
+        // memory: `need / OR_CHUNK` queries, about 116 at 59,000 needed rows.
+        // That is the one place this path can get slow rather than fat, and it
+        // is correct, because the scan genuinely is not paid for there.
+        const OR_CHUNK: usize = 512;
+
+        let wanted: std::collections::HashSet<WorkloadKey> = need.iter().map(|m| m.key()).collect();
+        let scan_is_paid_for = need.len() * SCAN_THRESHOLD_DEN >= metas.len() * SCAN_THRESHOLD_NUM;
+
+        let mut rows: Vec<(String, String, String, String)> = Vec::new();
+        if scan_is_paid_for {
+            rows = ws::workload_syscalls
+                .select((
+                    ws::pod_namespace,
+                    ws::workload_kind,
+                    ws::workload_name,
+                    ws::syscalls,
+                ))
+                .load(conn)?;
+        } else {
+            for chunk in need.chunks(OR_CHUNK) {
+                let (first, rest) = chunk.split_first().expect("chunks are non-empty");
+                let mut q = ws::workload_syscalls.into_boxed().filter(
+                    ws::pod_namespace
+                        .eq(first.pod_namespace.clone())
+                        .and(ws::workload_kind.eq(first.workload_kind.clone()))
+                        .and(ws::workload_name.eq(first.workload_name.clone())),
+                );
+                for m in rest {
+                    q = q.or_filter(
+                        ws::pod_namespace
+                            .eq(m.pod_namespace.clone())
+                            .and(ws::workload_kind.eq(m.workload_kind.clone()))
+                            .and(ws::workload_name.eq(m.workload_name.clone())),
+                    );
+                }
+                rows.extend(
+                    q.select((
+                        ws::pod_namespace,
+                        ws::workload_kind,
+                        ws::workload_name,
+                        ws::syscalls,
+                    ))
+                    .load::<(String, String, String, String)>(conn)?,
+                );
+            }
+        }
+
+        for (ns, kind, name, blob) in rows {
+            let key = (ns, kind, name);
+            if !wanted.contains(&key) {
+                continue;
+            }
+            if crs.for_workload(&key).is_empty() {
+                // No CR, so this row is here only because its stored count is
+                // NULL. It needs a number, not names.
+                counts.insert(key, count_set(&blob));
+            } else {
+                blobs.insert(key, split_set(&blob));
+            }
+        }
+    }
+
+    Ok(metas
         .into_iter()
-        .map(|row| Observed::build_for_summary(row, &captures, &crs))
+        .map(|mut m| {
+            let key = m.key();
+            let names = blobs.remove(&key);
+            if m.syscall_count.is_none() {
+                if let Some(n) = counts.remove(&key) {
+                    m.syscall_count = Some(n as i32);
+                }
+            }
+            Observed::build_for_summary(m, names, &captures, &crs)
+        })
         .collect())
 }
 
@@ -1141,9 +1436,14 @@ fn one_observed(
 }
 
 /// Render the observed set as a profile document (audit action).
-fn render(obs: &Observed) -> SeccompProfile {
+///
+/// Takes `names` rather than reading `obs.syscalls`, so the `Option` is
+/// resolved once by the caller. Every caller is a per-workload endpoint
+/// reaching its `Observed` through `one_observed`, which always materialises
+/// the names; the list path, which does not, has no route here.
+fn render(obs: &Observed, names: &BTreeSet<String>) -> SeccompProfile {
     build_profile(
-        &join_set(&obs.syscalls),
+        &join_set(names),
         &join_set(&obs.arches),
         DEFAULT_SECCOMP_ACTION,
     )
@@ -1192,25 +1492,67 @@ pub async fn list_seccomp_profiles(
     // configuration that killed the broker this permit would never have been
     // contended.
     //
-    // What attacks the measured growth is `count_set` +
-    // `Observed::build_for_summary` below, which stop this path allocating a
-    // String per syscall name (113,995 of them cluster-wide) purely to emit
-    // an integer. The permit is a guardrail for a future caller with no
-    // in-flight guard, and it closes the structural gap that every read in
-    // get.rs is admitted while every read here was not. Charged the way
-    // `/pod/info` is, because it has no caller-supplied limit and must not
-    // truncate.
-    let _permit = match budget
-        .acquire(cost_kib(ASSUMED_MAX_WORKLOADS, SECCOMP_WORKLOAD_COST_BYTES))
-        .await
-    {
+    // What attacks the measured growth is `workload_summaries` below, which
+    // no longer reads the syscall blobs at all: the count comes from a stored
+    // column, and blobs are fetched only for workloads whose drift is
+    // actually computed. The permit is a guardrail for a future caller with
+    // no in-flight guard, and it closes the structural gap that every read in
+    // get.rs is admitted while every read here was not.
+    //
+    // Charged from the REAL counts on BOTH axes, not a flat assumption.
+    //
+    // The previous `ASSUMED_MAX_WORKLOADS` reservation under-charged above
+    // its assumed count, so it failed open on exactly the clusters big enough
+    // to need it. Charging `COUNT(*)` fixes that axis, but on its own it just
+    // moves the same failure one axis over: `SECCOMP_WORKLOAD_COST_BYTES` is
+    // derived for a workload whose blob is NOT read, and
+    // `workload_summaries` still reads the blob for every CR-referenced
+    // workload. Charging the no-blob rate for those under-bills them 2-4x,
+    // and it does so on the axis this product is trying to grow, since the
+    // whole feature exists to get operators committing SeccompProfile CRs.
+    //
+    // So: two cheap counts, and a charge that tracks what the handler will
+    // actually do. `SECCOMP_BLOB_COST_BYTES` is the surcharge for a workload
+    // whose names are materialised.
+    //
+    // Both counts run before the permit, so a request that is ultimately shed
+    // still costs two round trips, and the counts can go stale against the
+    // load below. Both are accepted: the alternative is charging after doing
+    // the work, which is not a bound.
+    let count_pool = pool.clone();
+    let (workloads, with_crs): (i64, i64) = web::block(move || -> Result<_, DbError> {
+        use schema::seccomp_crs::dsl as c;
+        use schema::workload_syscalls::dsl as ws;
+        let mut conn = count_pool.get()?;
+        // Not asserted to be index-only: Postgres uses an index-only path for
+        // an unqualified COUNT(*) only when the visibility map allows it. At a
+        // few thousand rows the distinction does not matter.
+        let all: i64 = ws::workload_syscalls.count().get_result(&mut conn)?;
+        let crs: i64 = c::seccomp_crs
+            .filter(c::workload_kind.is_not_null())
+            .filter(c::workload_name.is_not_null())
+            .count()
+            .get_result(&mut conn)?;
+        Ok((all, crs))
+    })
+    .await?
+    .map_err(actix_web::error::ErrorInternalServerError)?;
+
+    // More CRs than workloads is possible (several CRs can reference one
+    // workload), and over-charging there is harmless; charging for blobs that
+    // will not be read is not the failure mode that matters.
+    let blob_bearing = with_crs.min(workloads);
+    let charge = cost_kib(workloads, SECCOMP_WORKLOAD_COST_BYTES)
+        .saturating_add(cost_kib(blob_bearing, SECCOMP_BLOB_COST_BYTES));
+
+    let _permit = match budget.acquire(charge).await {
         Ok(p) => p,
         Err(shed) => return Ok(shed.into_response()),
     };
 
     let out: Vec<ProfileSummary> = web::block(move || -> Result<_, DbError> {
         let mut conn = pool.get()?;
-        let all = all_observed(&mut conn)?;
+        let all = workload_summaries(&mut conn)?;
         let index = distribution_index(&mut conn)?;
         Ok(all
             .iter()
@@ -1267,7 +1609,7 @@ pub async fn get_seccomp_profile(
         match one_observed(&mut conn, &namespace, &kind, &name)? {
             Some(obs) => {
                 let index = distribution_index(&mut conn)?;
-                let profile = render(&obs);
+                let profile = render(&obs, obs.require_names()?);
                 Ok(Some((ProfileSummary::build(&obs, &index), profile)))
             }
             None => Ok(None),
@@ -1301,7 +1643,10 @@ pub async fn get_seccomp_profile_file(
     .map_err(actix_web::error::ErrorInternalServerError)?;
 
     Ok(match obs {
-        Some(o) if o.row.hash == hash => HttpResponse::Ok().json(render(&o)),
+        Some(o) if o.meta.hash == hash => match o.require_names() {
+            Ok(names) => HttpResponse::Ok().json(render(&o, names)),
+            Err(e) => return Err(actix_web::error::ErrorInternalServerError(e.to_string())),
+        },
         Some(_) => HttpResponse::NotFound().body("stale hash; re-read /seccomp/profiles"),
         None => HttpResponse::NotFound().body("no seccomp profile for that workload"),
     })
@@ -1492,9 +1837,13 @@ fn validate_export(opts: ExportOptions) -> Result<ExportPlan, actix_web::Error> 
 
 /// Build the CR document plus the comment header (YAML only) for an
 /// observed workload.
-fn export_document(obs: &Observed, plan: &ExportPlan) -> (ExportDoc, Vec<String>) {
-    let r = &obs.row;
-    let mut names = obs.syscalls.clone();
+fn export_document(
+    obs: &Observed,
+    observed_names: &BTreeSet<String>,
+    plan: &ExportPlan,
+) -> (ExportDoc, Vec<String>) {
+    let r = &obs.meta;
+    let mut names = observed_names.clone();
     names.extend(plan.add.iter().cloned());
     for x in &plan.remove {
         names.remove(x);
@@ -1561,7 +1910,7 @@ fn export_document(obs: &Observed, plan: &ExportPlan) -> (ExportDoc, Vec<String>
         ),
         format!(
             "observed syscalls: {} ({})",
-            obs.syscalls.len(),
+            obs.syscall_count,
             if obs.arches.is_empty() {
                 "no architectures recorded".to_string()
             } else {
@@ -1763,7 +2112,10 @@ async fn export_impl(
             .body(msg));
     }
 
-    let (doc, header) = export_document(&obs, &plan);
+    let observed_names = obs
+        .require_names()
+        .map_err(|e| actix_web::error::ErrorInternalServerError(e.to_string()))?;
+    let (doc, header) = export_document(&obs, observed_names, &plan);
     Ok(if plan.json {
         capture_headers(HttpResponse::Ok(), c).json(doc)
     } else {
@@ -2229,85 +2581,115 @@ mod tests {
         }
     }
 
-    /// The list path must report the same `syscallCount` whether or not the
-    /// names were materialised. This is the substitution the OOM fix rests
-    /// on: if these two ever diverge, the UI silently misreports every
-    /// workload's syscall count.
-    #[test]
-    fn summary_build_reports_the_same_count_as_the_full_build() {
-        let mk = || WorkloadSyscallsRow {
+    fn meta_fixture(count: Option<i32>) -> WorkloadMeta {
+        WorkloadMeta {
             pod_namespace: "prod".into(),
             workload_kind: "Deployment".into(),
             workload_name: "web".into(),
-            syscalls: ",openat,, read , write ,openat,".into(),
             arches: "SCMP_ARCH_X86_64".into(),
             hash: "abc123".into(),
             updated_at: chrono::NaiveDateTime::default(),
-        };
-        let captures = CaptureIndex {
+            syscall_count: count,
+        }
+    }
+
+    fn no_captures() -> CaptureIndex {
+        CaptureIndex {
             pods: HashMap::new(),
-        };
-        let crs = CrIndex::from_rows(Vec::new());
+        }
+    }
 
-        let full = Observed::build(mk(), &captures, &crs);
-        let summary = Observed::build_for_summary(mk(), &captures, &crs);
+    /// The common case after #1514: a workload with no mirrored CR reports its
+    /// count from the stored column and never has its names read at all.
+    ///
+    /// This is what stops the list endpoint pulling every workload's syscall
+    /// blob out of the database. If `syscalls` is ever `Some` here, the blob
+    /// is being read again and the OOM regression is back.
+    #[test]
+    fn summary_uses_the_stored_count_and_reads_no_names_without_a_cr() {
+        let obs = Observed::build_for_summary(
+            meta_fixture(Some(67)),
+            None,
+            &no_captures(),
+            &CrIndex::from_rows(Vec::new()),
+        );
 
-        assert_eq!(full.syscall_count, 3, "openat/read/write, deduped");
-        assert_eq!(summary.syscall_count, full.syscall_count);
-        // The whole point: the names are not allocated on the summary path
-        // for a workload with no CR, while the count is still right.
-        assert!(full.syscalls.contains("openat"));
+        assert_eq!(obs.syscall_count, 67, "count must come from the column");
         assert!(
-            summary.syscalls.is_empty(),
-            "no CR for this workload, so the names must not be materialised"
+            obs.syscalls.is_none(),
+            "no CR for this workload, so the names must never be read"
         );
     }
 
-    /// The invariant the whole optimisation rests on, and the one the test
-    /// above does NOT cover: when a workload HAS a mirrored CR, the summary
-    /// path must materialise the names, because `CrBlock::build` diffs them.
+    /// Legacy rows written before `syscall_count` existed have NULL, and the
+    /// read path counts them from the blob so the reported number does not
+    /// change while they backfill.
+    #[test]
+    fn summary_falls_back_to_counting_the_blob_when_the_column_is_null() {
+        let mut meta = meta_fixture(None);
+        // What `workload_summaries` does for a NULL-count row with no CR: it
+        // counts the blob without materialising names.
+        meta.syscall_count = Some(count_set(",openat,, read , write ,openat,") as i32);
+
+        let obs = Observed::build_for_summary(
+            meta,
+            None,
+            &no_captures(),
+            &CrIndex::from_rows(Vec::new()),
+        );
+
+        assert_eq!(obs.syscall_count, 3, "openat/read/write, deduped");
+        assert!(
+            obs.syscalls.is_none(),
+            "counting a legacy row must not materialise its names either"
+        );
+    }
+
+    /// The invariant the optimisation rests on: when a workload HAS a mirrored
+    /// CR, the summary path is handed the names, because `CrBlock::build`
+    /// diffs them.
     ///
-    /// The failure mode if this ever regresses is silent in the dangerous
-    /// direction. `drift(observed, allowed)` with an empty `observed` yields
-    /// `missing: []` and `extra: [everything]`. `missing` is the
-    /// security-relevant half — it is what gets BLOCKED when the CR is
-    /// enforced — so a broken gate would report "nothing will break" for a
+    /// The failure mode if this regresses is silent in the dangerous
+    /// direction. `drift(observed, allowed)` with an empty or absent
+    /// `observed` yields `missing: []` and `extra: [everything]`. `missing` is
+    /// the security-relevant half, the syscalls that get BLOCKED when the CR
+    /// is enforced, so a broken gate reports "nothing will break" for a
     /// workload where everything is about to.
     #[test]
-    fn summary_build_materialises_names_when_the_workload_has_a_cr() {
-        let mk = || WorkloadSyscallsRow {
-            pod_namespace: "prod".into(),
-            workload_kind: "Deployment".into(),
-            workload_name: "web".into(),
-            syscalls: "openat,read,write".into(),
-            arches: "SCMP_ARCH_X86_64".into(),
-            hash: "abc123".into(),
-            updated_at: chrono::NaiveDateTime::default(),
-        };
-        let captures = CaptureIndex {
-            pods: HashMap::new(),
-        };
-        // cr_row's CR allows exactly "read,write"; the observed set below adds
-        // `openat`, so `openat` is the syscall the CR would block.
+    fn summary_with_a_cr_reports_the_same_drift_as_the_full_build() {
+        // cr_row's CR allows exactly "read,write"; the observed set adds
+        // `openat`, so `openat` is what enforcing the CR would block.
         let crs = CrIndex::from_rows(vec![cr_row(
             "web-profile",
             Some(("Deployment", "web")),
             "h1",
             100,
         )]);
+        let names = split_set("openat,read,write");
 
-        let summary = Observed::build_for_summary(mk(), &captures, &crs);
-        let full = Observed::build(mk(), &captures, &crs);
-
-        assert!(
-            !summary.syscalls.is_empty(),
-            "a workload WITH a CR must have its names materialised, or drift \
-             detection silently reports an empty `missing` set"
+        let summary = Observed::build_for_summary(
+            meta_fixture(Some(3)),
+            Some(names.clone()),
+            &no_captures(),
+            &crs,
         );
-        assert_eq!(summary.syscalls, full.syscalls);
+        let full = Observed::build(
+            WorkloadSyscallsRow {
+                pod_namespace: "prod".into(),
+                workload_kind: "Deployment".into(),
+                workload_name: "web".into(),
+                syscalls: "openat,read,write".into(),
+                arches: "SCMP_ARCH_X86_64".into(),
+                hash: "abc123".into(),
+                updated_at: chrono::NaiveDateTime::default(),
+            },
+            &no_captures(),
+            &crs,
+        );
+
+        assert_eq!(summary.syscalls.as_ref(), Some(&names));
         assert_eq!(summary.syscall_count, full.syscall_count);
 
-        // And the rendered drift must be identical between the two paths.
         let idx = empty_index();
         let a = serde_json::to_value(ProfileSummary::build(&summary, &idx)).unwrap();
         let b = serde_json::to_value(ProfileSummary::build(&full, &idx)).unwrap();
@@ -2316,8 +2698,48 @@ mod tests {
             a["cr"]["drift"]["missing"],
             serde_json::json!(["openat"]),
             "the CR allows read+write while openat was observed, so openat is \
-             what enforcing the CR would block — this is the field that must \
-             never be empty by accident"
+             what enforcing the CR would block. This is the field that must \
+             never be empty by accident."
+        );
+    }
+
+    /// If the names are ever missing for a workload that has a CR, emit no
+    /// `cr` block at all rather than one whose `missing` list is empty because
+    /// it diffed against nothing.
+    ///
+    /// An absent block is visibly incomplete. An empty `missing` reads as
+    /// "enforcing this CR breaks nothing", which is the failure that made
+    /// #1515 worth a type rather than a convention.
+    #[test]
+    fn a_cr_without_names_emits_no_drift_rather_than_an_empty_one() {
+        let crs = CrIndex::from_rows(vec![cr_row(
+            "web-profile",
+            Some(("Deployment", "web")),
+            "h1",
+            100,
+        )]);
+        // Deliberately violating the caller contract that build_for_summary's
+        // debug_assert guards, to pin what the release build does.
+        let obs = Observed {
+            meta: meta_fixture(Some(3)),
+            syscalls: None,
+            syscall_count: 3,
+            arches: split_set("SCMP_ARCH_X86_64"),
+            capture: capture_summary(&pods(&[("web-1", Some("full"))])),
+            crs: crs
+                .for_workload(&("prod".into(), "Deployment".into(), "web".into()))
+                .to_vec(),
+        };
+
+        let v = serde_json::to_value(ProfileSummary::build(&obs, &empty_index())).unwrap();
+        assert!(
+            v["cr"].is_null(),
+            "no names means no drift can be computed, so no cr block"
+        );
+        assert_eq!(
+            v["crCount"], 1,
+            "the CR is still counted, so the omission is visible rather than \
+             looking like there is no CR at all"
         );
     }
 
@@ -2687,22 +3109,22 @@ mod tests {
     }
 
     fn observed_fixture(syscalls: &str, arches: &str, crs: Vec<CrRow>) -> Observed {
-        let row = WorkloadSyscallsRow {
-            pod_namespace: "prod".into(),
-            workload_kind: "Deployment".into(),
-            workload_name: "web".into(),
-            syscalls: syscalls.into(),
-            arches: arches.into(),
-            hash: "1c7725691d885dec".into(),
-            updated_at: chrono::NaiveDateTime::default(),
-        };
+        let names = split_set(syscalls);
         Observed {
-            syscalls: split_set(syscalls),
-            syscall_count: split_set(syscalls).len(),
+            syscall_count: names.len(),
+            syscalls: Some(names),
             arches: split_set(arches),
             capture: capture_summary(&pods(&[("web-1", Some("full"))])),
             crs,
-            row,
+            meta: WorkloadMeta {
+                pod_namespace: "prod".into(),
+                workload_kind: "Deployment".into(),
+                workload_name: "web".into(),
+                arches: arches.into(),
+                hash: "1c7725691d885dec".into(),
+                updated_at: chrono::NaiveDateTime::default(),
+                syscall_count: None,
+            },
         }
     }
 
@@ -2886,7 +3308,11 @@ mod tests {
     #[test]
     fn export_yaml_golden_complete_capture() {
         let obs = observed_fixture("read,write,accept4", "x86_64", Vec::new());
-        let (doc, header) = export_document(&obs, &plan(serde_json::json!({})));
+        let (doc, header) = export_document(
+            &obs,
+            obs.require_names().unwrap(),
+            &plan(serde_json::json!({})),
+        );
         let yaml = render_yaml(&doc, &header);
         let want = "\
 # kguardian SeccompProfile export
@@ -2927,7 +3353,7 @@ spec:
             "name": "web-audit", "defaultAction": "SCMP_ACT_ERRNO",
             "add": ["mmap"], "remove": ["write"]
         }));
-        let (doc, header) = export_document(&obs, &p);
+        let (doc, header) = export_document(&obs, obs.require_names().unwrap(), &p);
         let yaml = render_yaml(&doc, &header);
         let want = "\
 # kguardian SeccompProfile export
@@ -2965,7 +3391,11 @@ spec:
     fn export_yaml_no_contributors_warning_and_empty_syscalls() {
         let mut obs = observed_fixture("", "x86_64", Vec::new());
         obs.capture = capture_summary(&[]);
-        let (doc, header) = export_document(&obs, &plan(serde_json::json!({})));
+        let (doc, header) = export_document(
+            &obs,
+            obs.require_names().unwrap(),
+            &plan(serde_json::json!({})),
+        );
         let yaml = render_yaml(&doc, &header);
         assert!(
             yaml.contains("# WARNING: partial capture (no pod has contributed syscalls yet)"),
@@ -2977,7 +3407,11 @@ spec:
     #[test]
     fn export_json_is_the_same_document_without_comments() {
         let obs = observed_fixture("read", "aarch64", Vec::new());
-        let (doc, _) = export_document(&obs, &plan(serde_json::json!({"format": "json"})));
+        let (doc, _) = export_document(
+            &obs,
+            obs.require_names().unwrap(),
+            &plan(serde_json::json!({"format": "json"})),
+        );
         let v = serde_json::to_value(&doc).unwrap();
         assert_eq!(
             v,
@@ -3118,7 +3552,11 @@ spec:
         // dropped by `kubectl apply` and by GitOps rendering, so the
         // provenance has to live in the object to survive the trip.
         let mut obs = observed_fixture("read", "x86_64", Vec::new());
-        let (doc, _) = export_document(&obs, &plan(serde_json::json!({})));
+        let (doc, _) = export_document(
+            &obs,
+            obs.require_names().unwrap(),
+            &plan(serde_json::json!({})),
+        );
         assert_eq!(
             doc.metadata.annotations.get(CAPTURE_LEVEL_ANNOTATION),
             Some(&"full".to_string())
@@ -3136,7 +3574,11 @@ spec:
             .contains_key(CAPTURE_WARNING_ANNOTATION));
 
         obs.capture = partial();
-        let (doc, _) = export_document(&obs, &plan(serde_json::json!({})));
+        let (doc, _) = export_document(
+            &obs,
+            obs.require_names().unwrap(),
+            &plan(serde_json::json!({})),
+        );
         assert_eq!(
             doc.metadata.annotations.get(CAPTURE_COMPLETE_ANNOTATION),
             Some(&"false".to_string())
