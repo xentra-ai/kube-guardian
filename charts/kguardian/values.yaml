@@ -278,8 +278,9 @@ broker:
     repository: ghcr.io/kguardian-dev/kguardian/broker
     # -- Broker image pull policy
     pullPolicy: IfNotPresent
-    # -- Broker version tag (auto-updated by release-please)
-    tag: "1.16.0"
+    # -- Broker version tag. Bump by hand on each broker release: release-please
+    # updates broker/VERSION, not this file.
+    tag: "1.16.1"
     # -- Overrides the image tag using SHA digest
     sha: ""
   initContainer:

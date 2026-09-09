@@ -104,7 +104,7 @@ The following table lists the configurable parameters of the kguardian chart and
 | broker.image.pullPolicy | string | `"IfNotPresent"` | Broker image pull policy |
 | broker.image.repository | string | `"ghcr.io/kguardian-dev/kguardian/broker"` | Broker container image repository |
 | broker.image.sha | string | `""` | Overrides the image tag using SHA digest |
-| broker.image.tag | string | `"1.16.0"` | Broker version tag (auto-updated by release-please) |
+| broker.image.tag | string | `"1.16.1"` | Broker version tag. Bump by hand on each broker release: release-please updates broker/VERSION, not this file. |
 | broker.imagePullSecrets | list | `[]` | List of image pull secrets for private registries |
 | broker.initContainer.image.pullPolicy | string | `"IfNotPresent"` | Broker init container image pull policy. See the controller's init container for why this is not `Always`. |
 | broker.initContainer.image.repository | string | `"busybox"` | Broker init container image repository |
