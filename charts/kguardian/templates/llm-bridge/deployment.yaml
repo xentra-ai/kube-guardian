@@ -7,9 +7,11 @@ metadata:
   labels:
     {{- include "kguardian.labels" . | nindent 4 }}
 spec:
-  {{- if not .Values.llmBridge.autoscaling.enabled }}
-  replicas: {{ .Values.llmBridge.replicaCount }}
+  {{- /* Not implemented — see the comment in broker/deployment.yaml. */ -}}
+  {{- if .Values.llmBridge.autoscaling.enabled }}
+  {{- fail "llmBridge.autoscaling.enabled=true is not supported: this chart ships no HorizontalPodAutoscaler, so enabling it removes spec.replicas and lets the replica count default to 1. Set llmBridge.autoscaling.enabled=false and use llmBridge.replicaCount." }}
   {{- end }}
+  replicas: {{ .Values.llmBridge.replicaCount }}
   selector:
     matchLabels:
       app.kubernetes.io/name: {{ .Values.llmBridge.service.name }}

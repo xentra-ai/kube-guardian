@@ -164,6 +164,94 @@ pub const MAX_PODS_PER_NODE: i64 = 128;
 /// (~16 KiB) so the blob is covered rather than the row count.
 pub const SYSCALL_ROWS_CHARGED: i64 = 4;
 
+/// Peak in-flight heap per workload for `GET /seccomp/profiles`, in bytes.
+///
+/// READ THIS BEFORE TRUSTING THE NUMBER: it describes the list path as it
+/// behaved BEFORE the `Observed::build_for_summary` change in this same
+/// commit, and the post-change cost has not been measured. Deploying the
+/// binary is the only way to measure it, and that had not happened when this
+/// was written. So this is a deliberately retained upper bound, not a
+/// description of the shipped path — which is a weaker claim than
+/// [`TRAFFIC_ROW_COST_BYTES`] makes, and the difference is stated rather
+/// than papered over.
+///
+/// What WAS measured, against the running dev cluster on 2026-09-08 — four
+/// sequential unbatched calls, `kubectl top` on the broker pod between each,
+/// 25s apart, 1696 workload summaries per response (1.57 MB of JSON):
+///
+///   baseline 352 MiB -> 366 -> 381 -> 396 -> 411     (+14, +15, +15, +15)
+///
+/// Linear, with nothing reclaimed between calls. Two things follow, and the
+/// second one is why this constant does not carry the weight it looks like
+/// it carries:
+///
+///   - ~15 MiB retained per call over 1696 workloads is ~9.1 KiB/workload.
+///     16 KiB sits ~1.8x above that, covering the transient peak `kubectl
+///     top` cannot see at its ~15s sampling cadence.
+///   - Sequential calls ACCUMULATE. A budget bounds concurrent in-flight
+///     cost; it does not bound monotonic retention across calls made one at
+///     a time, which is what the UI's 15s poll actually produces. So this
+///     reservation is NOT what fixes the OOMKill — see the note above
+///     `list_seccomp_profiles`. It closes a structural gap (this module was
+///     referenced only from `get.rs`, so every seccomp read was admitted
+///     unconditionally) and bounds the concurrent case. The retention itself
+///     is tracked separately and is not fixed here.
+///
+/// A workload's cost is dominated by its `workload_syscalls.syscalls` blob —
+/// a comma-joined list averaging 67 names on the dev cluster, 113,995 names
+/// cluster-wide. The summary emits only `syscallCount`, so those names are no
+/// longer allocated on the list path, but the charge stays sized for the blob:
+/// the row is still read out of libpq in full, and a workload with a mirrored
+/// CR does still materialise the set for drift detection.
+///
+/// Re-derive from a fresh set of readings against a deployed build; do not
+/// adjust it to make a reservation fit.
+pub const SECCOMP_WORKLOAD_COST_BYTES: u64 = 16_384;
+
+/// Assumed worst-case workload count for `GET /seccomp/profiles`.
+///
+/// Same reservation shape as [`ASSUMED_MAX_PODS`], and the same reason it
+/// cannot be computed from a caller-supplied limit: the endpoint returns one
+/// summary per workload ever observed and must not truncate, because the UI
+/// lists it and a short list reads as "this workload has no profile" rather
+/// than as an error.
+///
+/// 4000 is 2.4x the dev cluster's 1696 workloads. `workload_syscalls` is
+/// keyed by (namespace, kind, name), so its ROW COUNT is bounded by distinct
+/// workloads rather than by pod churn or telemetry volume — that half of the
+/// [`ASSUMED_MAX_PODS`] argument transfers.
+///
+/// The other half does not, and it is the reason this constant is weaker
+/// than its neighbour. A `pod_details` row is bounded in width; a
+/// `workload_syscalls` row is not. `recompute_workload` unions each new
+/// observation into `syscalls` and never prunes, so the per-workload cost
+/// grows monotonically over a cluster's life even if no workload is ever
+/// added. A flat `rows x bytes-per-row` reservation therefore decays in
+/// accuracy in two independent directions at once, and past this bound the
+/// two errors compound.
+///
+/// The better shape is to charge from a cheap aggregate — `SELECT count(*),
+/// sum(length(syscalls)) FROM workload_syscalls` before the acquire — which
+/// is exact, index-bounded, and would delete this constant. That is the
+/// change worth making next here; it is not in this commit because the
+/// commit's purpose is the allocation fix and it should not also carry a
+/// query-shape change to the same handler.
+pub const ASSUMED_MAX_WORKLOADS: i64 = 4_000;
+
+/// Workload-equivalents charged for the per-workload seccomp endpoints.
+///
+/// `one_observed` reads a single `workload_syscalls` row, but the same
+/// handlers also call `distribution_index`, which loads every
+/// `seccomp_node_status.paths` JSON blob — one per node, so tens of rows on
+/// the clusters this runs on rather than thousands. 64 workload-equivalents
+/// (64 x 16 KiB = 1 MiB) is an ESTIMATE, not a measurement — unlike
+/// [`SECCOMP_WORKLOAD_COST_BYTES`], nothing was profiled here. The dev
+/// cluster has 44 nodes and `seccomp_node_status.paths` is a JSON blob of
+/// unstated size per node, so "tens of rows" is reasoned from the row count
+/// rather than from bytes. It covers that comfortably while staying small enough that the UI
+/// opening a profile never contends with the list poll.
+pub const SECCOMP_DETAIL_ROWS_CHARGED: i64 = 64;
+
 /// Default total read budget, in MiB.
 ///
 /// Sized from the incident: the container limit is 1 GiB (confirmed against
@@ -709,6 +797,50 @@ mod tests {
             worst_case_mb < 656,
             "worst-case concurrent read heap {worst_case_mb} MiB must fit \
              the 656 MiB of measured headroom"
+        );
+    }
+
+    /// The seccomp list reservation is the one that OOMKilled the broker, so
+    /// its sizing needs the same guard the traffic read has: big enough to
+    /// bind, small enough that a normal UI poll is not competing with the
+    /// whole budget.
+    #[test]
+    fn seccomp_list_reservation_binds_without_monopolising_the_budget() {
+        let seccomp_kib = cost_kib(ASSUMED_MAX_WORKLOADS, SECCOMP_WORKLOAD_COST_BYTES);
+        let budget_kib = DEFAULT_READ_MEMORY_BUDGET_MB * 1024;
+        let concurrent = budget_kib / seccomp_kib;
+
+        // A RANGE, not an equality. The requirement is "binds well before the
+        // 64 actix workers, without monopolising the budget" — not one exact
+        // number. An equality here would fail the moment anyone follows the
+        // instruction three lines above SECCOMP_WORKLOAD_COST_BYTES to
+        // re-derive it against a deployed build, i.e. this test would break
+        // when a maintainer does the right thing.
+        assert!(
+            (2..=8).contains(&concurrent),
+            "expected 2-8 concurrent seccomp list reads, got {concurrent}: \
+             below 2 a single UI poll monopolises the budget, above 8 it no \
+             longer binds meaningfully before the worker count does"
+        );
+
+        // But one call must not eat the whole budget, or a single UI poll
+        // would shed every concurrent traffic read and the fix would trade
+        // one outage for another.
+        let hard_cap_read_kib = cost_kib(20_000, TRAFFIC_ROW_COST_BYTES);
+        assert!(
+            seccomp_kib + hard_cap_read_kib <= budget_kib,
+            "one seccomp list read ({seccomp_kib} KiB) plus one hard-cap traffic \
+             read ({hard_cap_read_kib} KiB) must both fit the {budget_kib} KiB budget"
+        );
+
+        // And the reservation must actually exceed what was measured on the
+        // dev cluster (1696 workloads), or it would under-charge the very
+        // call that caused the incident.
+        let measured_kib = cost_kib(1_696, SECCOMP_WORKLOAD_COST_BYTES);
+        assert!(
+            seccomp_kib > measured_kib,
+            "the flat reservation {seccomp_kib} KiB must cover the observed \
+             1696-workload cluster ({measured_kib} KiB)"
         );
     }
 
