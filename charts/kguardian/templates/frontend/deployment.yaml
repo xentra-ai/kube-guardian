@@ -6,9 +6,11 @@ metadata:
   labels:
     {{- include "kguardian.labels" . | nindent 4 }}
 spec:
-  {{- if not .Values.frontend.autoscaling.enabled }}
-  replicas: {{ .Values.frontend.replicaCount }}
+  {{- /* Not implemented — see the comment in broker/deployment.yaml. */ -}}
+  {{- if .Values.frontend.autoscaling.enabled }}
+  {{- fail "frontend.autoscaling.enabled=true is not supported: this chart ships no HorizontalPodAutoscaler, so enabling it removes spec.replicas and lets the replica count default to 1. Set frontend.autoscaling.enabled=false and use frontend.replicaCount." }}
   {{- end }}
+  replicas: {{ .Values.frontend.replicaCount }}
   selector:
     matchLabels:
       app.kubernetes.io/name: {{ .Values.frontend.service.name }}

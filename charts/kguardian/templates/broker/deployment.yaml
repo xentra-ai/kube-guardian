@@ -6,9 +6,29 @@ metadata:
   labels:
     {{- include "kguardian.labels" . | nindent 4 }}
 spec:
-  {{- if not .Values.broker.autoscaling.enabled }}
-  replicas: {{ .Values.broker.replicaCount }}
+  {{- /*
+    autoscaling.enabled is not implemented. The chart ships no HPA template
+    for any component (no HorizontalPodAutoscaler anywhere under templates/),
+    so setting it does not autoscale — it deletes `replicas` from this
+    Deployment and nothing takes ownership of the field, which means the
+    API server defaults it to 1 and a Helm upgrade of an existing release
+    scales it DOWN to a single pod.
+
+    It also silently disarms the singleton-PDB guardrail next door in
+    pdb.yaml: that check reads `.Values.broker.replicaCount`, not the
+    effective replica count, so with replicaCount=3 and autoscaling on it
+    sees 3, renders `minAvailable: 1` against the one pod that actually
+    exists, and every voluntary eviction is refused — the exact drain
+    deadlock the guardrail was written to prevent.
+
+    Failing loudly rather than honouring it, which is what the evaluator
+    already does for its own reason. Implementing real HPAs is a feature,
+    and not every component can take one (the controller is a DaemonSet).
+  */ -}}
+  {{- if .Values.broker.autoscaling.enabled }}
+  {{- fail "broker.autoscaling.enabled=true is not supported: this chart ships no HorizontalPodAutoscaler, so enabling it removes spec.replicas, lets the replica count default to 1, and disarms the PDB singleton guard (causing kubectl drain to stall). Set broker.autoscaling.enabled=false and use broker.replicaCount." }}
   {{- end }}
+  replicas: {{ .Values.broker.replicaCount }}
   selector:
     matchLabels:
       app.kubernetes.io/name: {{ .Values.broker.service.name }}
