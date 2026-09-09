@@ -43,6 +43,10 @@
 //! The observed union is never edited here; an "override" is an edit to
 //! the CR. One file per CR on a node: `kguardian/<namespace>/<cr>.json`.
 
+use crate::read_budget::{
+    cost_kib, ReadBudget, ASSUMED_MAX_WORKLOADS, SECCOMP_DETAIL_ROWS_CHARGED,
+    SECCOMP_WORKLOAD_COST_BYTES,
+};
 use crate::schema;
 use actix_web::{get, post, web, HttpResponse, Responder};
 use diesel::prelude::*;
@@ -204,6 +208,32 @@ fn split_set(joined: &str) -> BTreeSet<String> {
         .filter(|s| !s.is_empty())
         .map(String::from)
         .collect()
+}
+
+/// Cardinality of what [`split_set`] would return, without allocating it.
+///
+/// The list endpoint emits `syscallCount` and nothing else derived from the
+/// names, and on a cluster with no mirrored CRs (1696 of 1696 workloads on
+/// the dev cluster) that count is the *only* consumer. Building the
+/// `BTreeSet<String>` to call `.len()` on it allocated one `String` per
+/// syscall name per workload — 113,995 of them cluster-wide, on every 15s
+/// UI poll — which is the allocation churn behind the OOMKill this pairs
+/// with the read budget to fix.
+///
+/// Must agree with `split_set(joined).len()` for every input; the property
+/// test `count_set_agrees_with_split_set` pins that.
+fn count_set(joined: &str) -> usize {
+    // Borrowed slices into `joined`, sorted and deduped in one buffer: a
+    // single allocation for the whole field, against one per name for the
+    // `BTreeSet<String>` this replaces on the list path.
+    let mut toks: Vec<&str> = joined
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    toks.sort_unstable();
+    toks.dedup();
+    toks.len()
 }
 
 fn join_set(set: &BTreeSet<String>) -> String {
@@ -942,26 +972,69 @@ impl CrBlock {
 /// mirrored CRs that reference it.
 struct Observed {
     row: WorkloadSyscallsRow,
+    /// The syscall names. Empty on the list path for a workload with no
+    /// mirrored CR, where nothing reads them — use [`Observed::syscall_count`]
+    /// for the cardinality, which is correct in both cases.
     syscalls: BTreeSet<String>,
+    /// Cardinality of the observed set, always populated. Kept separate
+    /// because `syscalls` is not materialised on the list path.
+    syscall_count: usize,
     arches: BTreeSet<String>,
     capture: CaptureSummary,
     crs: Vec<CrRow>,
 }
 
 impl Observed {
+    /// Materialises the syscall names. Every caller that renders a profile
+    /// document, exports, or diffs against a CR needs this.
     fn build(row: WorkloadSyscallsRow, captures: &CaptureIndex, crs: &CrIndex) -> Self {
+        Self::build_inner(row, captures, crs, true)
+    }
+
+    /// List-path build: skips the `BTreeSet<String>` of syscall names when
+    /// nothing will read them.
+    ///
+    /// [`ProfileSummary`] touches `syscalls` in exactly two places —
+    /// `syscall_count` (a length) and `CrBlock::build` (drift, only when the
+    /// workload has a mirrored CR). So a workload with no CR needs the count
+    /// and never the names, which is every workload on the dev cluster. The
+    /// names are still materialised when a CR exists, so drift detection is
+    /// bit-for-bit unchanged.
+    fn build_for_summary(row: WorkloadSyscallsRow, captures: &CaptureIndex, crs: &CrIndex) -> Self {
         let key = (
             row.pod_namespace.clone(),
             row.workload_kind.clone(),
             row.workload_name.clone(),
         );
-        let syscalls = split_set(&row.syscalls);
+        let needs_names = !crs.for_workload(&key).is_empty();
+        Self::build_inner(row, captures, crs, needs_names)
+    }
+
+    fn build_inner(
+        row: WorkloadSyscallsRow,
+        captures: &CaptureIndex,
+        crs: &CrIndex,
+        with_names: bool,
+    ) -> Self {
+        let key = (
+            row.pod_namespace.clone(),
+            row.workload_kind.clone(),
+            row.workload_name.clone(),
+        );
+        let (syscalls, syscall_count) = if with_names {
+            let set = split_set(&row.syscalls);
+            let n = set.len();
+            (set, n)
+        } else {
+            (BTreeSet::new(), count_set(&row.syscalls))
+        };
         let arches = split_set(&row.arches);
         Observed {
             capture: captures.summary_for(&key),
             crs: crs.for_workload(&key).to_vec(),
             row,
             syscalls,
+            syscall_count,
             arches,
         }
     }
@@ -1010,7 +1083,7 @@ impl ProfileSummary {
             kind: r.workload_kind.clone(),
             name: r.workload_name.clone(),
             hash: r.hash.clone(),
-            syscall_count: obs.syscalls.len(),
+            syscall_count: obs.syscall_count,
             architectures: obs
                 .arches
                 .iter()
@@ -1047,7 +1120,7 @@ fn all_observed(conn: &mut PgConnection) -> Result<Vec<Observed>, DbError> {
     let crs = cr_index(conn, None)?;
     Ok(rows
         .into_iter()
-        .map(|row| Observed::build(row, &captures, &crs))
+        .map(|row| Observed::build_for_summary(row, &captures, &crs))
         .collect())
 }
 
@@ -1084,6 +1157,7 @@ fn render(obs: &Observed) -> SeccompProfile {
 pub async fn list_seccomp_profiles(
     req: actix_web::HttpRequest,
     pool: web::Data<DbPool>,
+    budget: web::Data<ReadBudget>,
 ) -> actix_web::Result<impl Responder> {
     // The v1 `?state=published` filter is gone. Fail loudly rather than
     // return everything: a distributor that predates CR-driven
@@ -1094,6 +1168,46 @@ pub async fn list_seccomp_profiles(
         ));
     }
     info!("list seccomp profiles");
+
+    // A whole-result-set read that took no permit — the only one in the
+    // broker that did not. This endpoint OOMKilled the broker in the dev
+    // cluster: the UI polls it every 15s (frontend useSeccompProfiles) and
+    // the container died at steady ingest with zero `/pod/traffic` reads in
+    // its log, so the budget that already existed never engaged.
+    //
+    // BUT THE PERMIT IS NOT WHAT FIXES THAT, and it should not be read as
+    // the remedy. Measured on the dev cluster, four SEQUENTIAL calls 25s
+    // apart moved RSS 352 -> 366 -> 381 -> 396 -> 411 MiB: ~15 MiB per call,
+    // linear, nothing reclaimed in between. A permit is released when the
+    // handler returns, so retention that outlives the response is invisible
+    // to the budget — it holds no permit and `available_kib` counts it free.
+    // A semaphore cannot bound a quantity that persists after the request
+    // completes.
+    //
+    // Nor would it have fired here. Both callers are self-limiting to one
+    // in-flight request each: `useSeccompProfiles` holds an `inflight` ref
+    // and returns early while a call is outstanding, and the seccomp
+    // distributor ticks a single reconciler loop every 30s. Steady state is
+    // 2 concurrent against a reservation that admits 4, so in the exact
+    // configuration that killed the broker this permit would never have been
+    // contended.
+    //
+    // What attacks the measured growth is `count_set` +
+    // `Observed::build_for_summary` below, which stop this path allocating a
+    // String per syscall name (113,995 of them cluster-wide) purely to emit
+    // an integer. The permit is a guardrail for a future caller with no
+    // in-flight guard, and it closes the structural gap that every read in
+    // get.rs is admitted while every read here was not. Charged the way
+    // `/pod/info` is, because it has no caller-supplied limit and must not
+    // truncate.
+    let _permit = match budget
+        .acquire(cost_kib(ASSUMED_MAX_WORKLOADS, SECCOMP_WORKLOAD_COST_BYTES))
+        .await
+    {
+        Ok(p) => p,
+        Err(shed) => return Ok(shed.into_response()),
+    };
+
     let out: Vec<ProfileSummary> = web::block(move || -> Result<_, DbError> {
         let mut conn = pool.get()?;
         let all = all_observed(&mut conn)?;
@@ -1127,10 +1241,26 @@ struct ProfileDetail {
 #[get("/seccomp/profiles/{namespace}/{kind}/{name}")]
 pub async fn get_seccomp_profile(
     pool: web::Data<DbPool>,
+    budget: web::Data<ReadBudget>,
     path: web::Path<(String, String, String)>,
 ) -> actix_web::Result<impl Responder> {
     let (namespace, kind, name) = path.into_inner();
     info!(%namespace, %kind, %name, "get seccomp profile");
+
+    // One workload, but `distribution_index` below is still a whole-table read
+    // of `seccomp_node_status` (one JSON `paths` blob per node). Bounded by
+    // node count rather than workload count, so it is charged as a small
+    // multiple of one workload rather than the list endpoint's reservation.
+    let _permit = match budget
+        .acquire(cost_kib(
+            SECCOMP_DETAIL_ROWS_CHARGED,
+            SECCOMP_WORKLOAD_COST_BYTES,
+        ))
+        .await
+    {
+        Ok(p) => p,
+        Err(shed) => return Ok(shed.into_response()),
+    };
 
     let result = web::block(move || -> Result<_, DbError> {
         let mut conn = pool.get()?;
@@ -2071,6 +2201,126 @@ mod tests {
         assert!(split_set("").is_empty());
     }
 
+    /// `count_set` exists so the list path can report `syscallCount` without
+    /// allocating a `String` per syscall name. It is only safe to substitute
+    /// if it agrees with `split_set(..).len()` on every input, including the
+    /// messy ones the field is known to carry (leading, trailing and doubled
+    /// commas, surrounding whitespace, and repeats).
+    #[test]
+    fn count_set_agrees_with_split_set() {
+        for input in [
+            "",
+            ",",
+            ",,,",
+            "read",
+            " read ",
+            "read,write",
+            ",read,, write ,read,",
+            "read,read,read",
+            "a,b,c,d,e,f,g",
+            " , a , a , b , ",
+            "openat,close,read,write,mmap,mprotect,futex,epoll_wait",
+        ] {
+            assert_eq!(
+                count_set(input),
+                split_set(input).len(),
+                "count_set disagreed with split_set on {input:?}"
+            );
+        }
+    }
+
+    /// The list path must report the same `syscallCount` whether or not the
+    /// names were materialised. This is the substitution the OOM fix rests
+    /// on: if these two ever diverge, the UI silently misreports every
+    /// workload's syscall count.
+    #[test]
+    fn summary_build_reports_the_same_count_as_the_full_build() {
+        let mk = || WorkloadSyscallsRow {
+            pod_namespace: "prod".into(),
+            workload_kind: "Deployment".into(),
+            workload_name: "web".into(),
+            syscalls: ",openat,, read , write ,openat,".into(),
+            arches: "SCMP_ARCH_X86_64".into(),
+            hash: "abc123".into(),
+            updated_at: chrono::NaiveDateTime::default(),
+        };
+        let captures = CaptureIndex {
+            pods: HashMap::new(),
+        };
+        let crs = CrIndex::from_rows(Vec::new());
+
+        let full = Observed::build(mk(), &captures, &crs);
+        let summary = Observed::build_for_summary(mk(), &captures, &crs);
+
+        assert_eq!(full.syscall_count, 3, "openat/read/write, deduped");
+        assert_eq!(summary.syscall_count, full.syscall_count);
+        // The whole point: the names are not allocated on the summary path
+        // for a workload with no CR, while the count is still right.
+        assert!(full.syscalls.contains("openat"));
+        assert!(
+            summary.syscalls.is_empty(),
+            "no CR for this workload, so the names must not be materialised"
+        );
+    }
+
+    /// The invariant the whole optimisation rests on, and the one the test
+    /// above does NOT cover: when a workload HAS a mirrored CR, the summary
+    /// path must materialise the names, because `CrBlock::build` diffs them.
+    ///
+    /// The failure mode if this ever regresses is silent in the dangerous
+    /// direction. `drift(observed, allowed)` with an empty `observed` yields
+    /// `missing: []` and `extra: [everything]`. `missing` is the
+    /// security-relevant half — it is what gets BLOCKED when the CR is
+    /// enforced — so a broken gate would report "nothing will break" for a
+    /// workload where everything is about to.
+    #[test]
+    fn summary_build_materialises_names_when_the_workload_has_a_cr() {
+        let mk = || WorkloadSyscallsRow {
+            pod_namespace: "prod".into(),
+            workload_kind: "Deployment".into(),
+            workload_name: "web".into(),
+            syscalls: "openat,read,write".into(),
+            arches: "SCMP_ARCH_X86_64".into(),
+            hash: "abc123".into(),
+            updated_at: chrono::NaiveDateTime::default(),
+        };
+        let captures = CaptureIndex {
+            pods: HashMap::new(),
+        };
+        // cr_row's CR allows exactly "read,write"; the observed set below adds
+        // `openat`, so `openat` is the syscall the CR would block.
+        let crs = CrIndex::from_rows(vec![cr_row(
+            "web-profile",
+            Some(("Deployment", "web")),
+            "h1",
+            100,
+        )]);
+
+        let summary = Observed::build_for_summary(mk(), &captures, &crs);
+        let full = Observed::build(mk(), &captures, &crs);
+
+        assert!(
+            !summary.syscalls.is_empty(),
+            "a workload WITH a CR must have its names materialised, or drift \
+             detection silently reports an empty `missing` set"
+        );
+        assert_eq!(summary.syscalls, full.syscalls);
+        assert_eq!(summary.syscall_count, full.syscall_count);
+
+        // And the rendered drift must be identical between the two paths.
+        let idx = empty_index();
+        let a = serde_json::to_value(ProfileSummary::build(&summary, &idx)).unwrap();
+        let b = serde_json::to_value(ProfileSummary::build(&full, &idx)).unwrap();
+        assert_eq!(a["cr"]["drift"], b["cr"]["drift"]);
+        assert_eq!(
+            a["cr"]["drift"]["missing"],
+            serde_json::json!(["openat"]),
+            "the CR allows read+write while openat was observed, so openat is \
+             what enforcing the CR would block — this is the field that must \
+             never be empty by accident"
+        );
+    }
+
     #[test]
     fn validated_action_accepts_crd_enum_and_rejects_garbage() {
         for ok in [
@@ -2448,6 +2698,7 @@ mod tests {
         };
         Observed {
             syscalls: split_set(syscalls),
+            syscall_count: split_set(syscalls).len(),
             arches: split_set(arches),
             capture: capture_summary(&pods(&[("web-1", Some("full"))])),
             crs,
@@ -2947,6 +3198,13 @@ spec:
         let app = test::init_service(
             App::new()
                 .app_data(web::Data::new(dummy_pool()))
+                // The seccomp read handlers take a ReadBudget extractor, so
+                // without this every route 500s on a missing app_data before
+                // the handler body runs, masking the status each case asserts.
+                .app_data(web::Data::new(ReadBudget::with_budget_kib(
+                    64 * 1024,
+                    std::time::Duration::from_millis(0),
+                )))
                 .service(list_seccomp_profiles)
                 .service(get_seccomp_profile)
                 .service(get_seccomp_profile_file)

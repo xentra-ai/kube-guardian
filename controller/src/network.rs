@@ -444,6 +444,21 @@ async fn build_policy_drop_event(
 ) -> Option<PodTraffic> {
     let s_ip = wire_addr_to_ip(data.saddr);
     let d_ip = wire_addr_to_ip(data.daddr);
+    // Deliberately 0, not `data.sport`, even though the probe captures the
+    // real source port and this looks like an oversight. It feeds the dedup
+    // cache key below, and every connect attempt draws a fresh ephemeral
+    // source port: keying on it would make each retry of the same blocked
+    // flow a distinct key, so the dedup would never hit, every failed
+    // connect would take a slot in the 10,000-entry TRAFFIC_CACHE shared
+    // with the ALLOW path, and each would evict a live ALLOW entry. The
+    // ALLOW EGRESS arms zero pod_port for the same reason.
+    //
+    // It also reaches `pod_port` on the emitted row, where the broker's TCP
+    // dedup (add.rs get_row) includes pod_port — so a real port there would
+    // additionally defeat dedup at the DB and insert a row per attempt.
+    //
+    // Reviewed 2026-09 and kept: if you want the port for forensics, add a
+    // separate field, do not thread it through here.
     let s_port = 0;
     let d_port = data.dport;
     let protocol_str = proto_to_string(data.protocol);
