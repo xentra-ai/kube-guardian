@@ -166,77 +166,96 @@ pub const SYSCALL_ROWS_CHARGED: i64 = 4;
 
 /// Peak in-flight heap per workload for `GET /seccomp/profiles`, in bytes.
 ///
-/// READ THIS BEFORE TRUSTING THE NUMBER: it describes the list path as it
-/// behaved BEFORE the `Observed::build_for_summary` change in this same
-/// commit, and the post-change cost has not been measured. Deploying the
-/// binary is the only way to measure it, and that had not happened when this
-/// was written. So this is a deliberately retained upper bound, not a
-/// description of the shipped path — which is a weaker claim than
-/// [`TRAFFIC_ROW_COST_BYTES`] makes, and the difference is stated rather
-/// than papered over.
+/// Peak in-flight heap per workload for `GET /seccomp/profiles`, in bytes.
 ///
-/// What WAS measured, against the running dev cluster on 2026-09-08 — four
-/// sequential unbatched calls, `kubectl top` on the broker pod between each,
-/// 25s apart, 1696 workload summaries per response (1.57 MB of JSON):
+/// NOT measured on the path it now describes, and the honest reason is that
+/// only a deployed build can measure it. What follows is the derivation, so
+/// it can be re-derived rather than re-guessed.
 ///
-///   baseline 352 MiB -> 366 -> 381 -> 396 -> 411     (+14, +15, +15, +15)
+/// The figure this replaces was 16 KiB, measured on the dev cluster before
+/// the list endpoint stopped reading syscall blobs. Four sequential calls
+/// moved RSS 352 -> 366 -> 381 -> 396 -> 411 MiB, and a twenty-call run went
+/// 415 -> 643 MiB at ~11.4 MiB/call with no plateau: ~9.1 KiB retained per
+/// workload, rounded up to 16 KiB to cover a transient peak `kubectl top`
+/// cannot see at its ~15s sampling cadence.
 ///
-/// Linear, with nothing reclaimed between calls. Two things follow, and the
-/// second one is why this constant does not carry the weight it looks like
-/// it carries:
+/// That cost was dominated by the `workload_syscalls.syscalls` blob, a
+/// comma-joined list averaging 67 names on the dev cluster and 113,995 names
+/// cluster-wide, crossing libpq and becoming a `String` per name. The list
+/// path no longer reads it: `syscall_count` is a stored column, and blobs are
+/// fetched only for workloads whose drift is actually computed.
 ///
-///   - ~15 MiB retained per call over 1696 workloads is ~9.1 KiB/workload.
-///     16 KiB sits ~1.8x above that, covering the transient peak `kubectl
-///     top` cannot see at its ~15s sampling cadence.
-///   - Sequential calls ACCUMULATE. A budget bounds concurrent in-flight
-///     cost; it does not bound monotonic retention across calls made one at
-///     a time, which is what the UI's 15s poll actually produces. So this
-///     reservation is NOT what fixes the OOMKill — see the note above
-///     `list_seccomp_profiles`. It closes a structural gap (this module was
-///     referenced only from `get.rs`, so every seccomp read was admitted
-///     unconditionally) and bounds the concurrent case. The retention itself
-///     is tracked separately and is not fixed here.
+/// What remains per workload is a `WorkloadMeta` (six short strings), a
+/// `ProfileSummary`, and its JSON. The JSON half IS measured: a 1696-workload
+/// response is 1.57 MB, so 944 JSON B/workload. 4 KiB is ~4.3x that, which is
+/// the same shape of allowance [`POD_DETAIL_ROW_COST_BYTES`] makes for a
+/// structurally similar row, and that row carries `serde_json::Value` trees
+/// this one does not.
 ///
-/// A workload's cost is dominated by its `workload_syscalls.syscalls` blob —
-/// a comma-joined list averaging 67 names on the dev cluster, 113,995 names
-/// cluster-wide. The summary emits only `syscallCount`, so those names are no
-/// longer allocated on the list path, but the charge stays sized for the blob:
-/// the row is still read out of libpq in full, and a workload with a mirrored
-/// CR does still materialise the set for drift detection.
+/// Sized so the guardrail keeps binding rather than degrading. The
+/// reservation is charged from the real workload count, so leaving the old
+/// 16 KiB in place would have charged 265 MiB on a 17000-workload cluster,
+/// exceeding the whole 256 MiB budget and clamping every list read to run
+/// alone. Over-charging per workload is not free once the count is exact: it
+/// converts into serialised reads on a large cluster.
 ///
-/// Re-derive from a fresh set of readings against a deployed build; do not
-/// adjust it to make a reservation fit.
-pub const SECCOMP_WORKLOAD_COST_BYTES: u64 = 16_384;
+/// One term this does NOT scale with, named because it scales on a different
+/// axis. `workload_summaries` also calls `capture_index(conn, None)`, a full
+/// `pod_syscalls` x `pod_details` join, and that is per-POD while this charge
+/// is per-WORKLOAD. It selects five short columns and no blob, so call it
+/// ~300 B/row against [`ASSUMED_MAX_PODS`]-bounded tables; the charge stops
+/// covering it at roughly 14 pods per workload. The dev cluster runs 2,265
+/// pods against 1,696 workloads, a ratio of 1.3, so there is about an order
+/// of magnitude of margin. A cluster with few workloads and very many pods
+/// each is the shape that would erode it.
+///
+/// Re-derive from a ladder against a deployed build (#1514). Do not adjust it
+/// in either direction to make a reservation fit.
+pub const SECCOMP_WORKLOAD_COST_BYTES: u64 = 4_096;
 
-/// Assumed worst-case workload count for `GET /seccomp/profiles`.
+/// Needed-fraction at which `workload_summaries` stops building an exact
+/// predicate and reads the whole table instead, as NUM/DEN.
 ///
-/// Same reservation shape as [`ASSUMED_MAX_PODS`], and the same reason it
-/// cannot be computed from a caller-supplied limit: the endpoint returns one
-/// summary per workload ever observed and must not truncate, because the UI
-/// lists it and a short list reads as "this workload has no profile" rather
-/// than as an error.
+/// Shared with the query rather than written out at both sites, so that
+/// moving the threshold fails
+/// `the_unfiltered_scan_threshold_is_covered_by_what_was_charged` instead of
+/// leaving it green while the scan reads rows nobody was billed for. Two
+/// hand-agreeing literals is the property that was removed from
+/// `syscall_count` by storing it, applied one level up.
 ///
-/// 4000 is 2.4x the dev cluster's 1696 workloads. `workload_syscalls` is
-/// keyed by (namespace, kind, name), so its ROW COUNT is bounded by distinct
-/// workloads rather than by pod churn or telemetry volume — that half of the
-/// [`ASSUMED_MAX_PODS`] argument transfers.
+/// Derived, not chosen. An unfiltered scan reads every blob, costing
+/// 9,318 B (the measured blob-bearing figure) + 944 B (measured JSON) =
+/// 10,262 B/workload, while the permit charged
+/// `SECCOMP_WORKLOAD_COST_BYTES + f * SECCOMP_BLOB_COST_BYTES`. Break-even is
+/// `4,096 + 12,288f >= 10,262`, i.e. f >= 0.502. 3/5 is that with margin
+/// (11,468 vs 10,262) rather than sitting on the boundary; 1/2 is NOT
+/// sufficient, and the test fails on it by 22 B/workload.
+pub const SCAN_THRESHOLD_NUM: usize = 3;
+/// Denominator of [`SCAN_THRESHOLD_NUM`].
+pub const SCAN_THRESHOLD_DEN: usize = 5;
+
+/// Surcharge for a workload whose syscall names ARE materialised, in bytes.
 ///
-/// The other half does not, and it is the reason this constant is weaker
-/// than its neighbour. A `pod_details` row is bounded in width; a
-/// `workload_syscalls` row is not. `recompute_workload` unions each new
-/// observation into `syscalls` and never prunes, so the per-workload cost
-/// grows monotonically over a cluster's life even if no workload is ever
-/// added. A flat `rows x bytes-per-row` reservation therefore decays in
-/// accuracy in two independent directions at once, and past this bound the
-/// two errors compound.
+/// [`SECCOMP_WORKLOAD_COST_BYTES`] is derived for a workload whose blob is
+/// not read, which is the common case after the list path stopped selecting
+/// blobs. But `workload_summaries` still reads the blob for every workload
+/// with a mirrored SeccompProfile CR, because drift detection diffs the real
+/// names. Charging the no-blob rate for those under-bills them.
 ///
-/// The better shape is to charge from a cheap aggregate — `SELECT count(*),
-/// sum(length(syscalls)) FROM workload_syscalls` before the acquire — which
-/// is exact, index-bounded, and would delete this constant. That is the
-/// change worth making next here; it is not in this commit because the
-/// commit's purpose is the allocation fix and it should not also carry a
-/// query-shape change to the same handler.
-pub const ASSUMED_MAX_WORKLOADS: i64 = 4_000;
+/// That matters more than it looks. Charging `COUNT(*)` alone fixes the
+/// axis the deleted `ASSUMED_MAX_WORKLOADS` failed open on, and then
+/// reintroduces the identical failure one axis over: the under-charge would
+/// grow with CR adoption, which is the quantity this whole feature exists to
+/// increase. A guardrail that degrades as the product succeeds is the same
+/// defect in a new coat.
+///
+/// 12 KiB is the difference between the pre-change measurement and the
+/// post-change estimate: ~9.1 KiB/workload was measured while the blob was
+/// read, rounded to 16 KiB to cover the transient peak `kubectl top` cannot
+/// see, and 4 KiB of that survives without the blob. So a CR-bearing
+/// workload is charged 4 + 12 = 16 KiB, exactly what the whole path cost
+/// before, and a workload without a CR is charged 4.
+pub const SECCOMP_BLOB_COST_BYTES: u64 = 12_288;
 
 /// Workload-equivalents charged for the per-workload seccomp endpoints.
 ///
@@ -804,43 +823,117 @@ mod tests {
     /// its sizing needs the same guard the traffic read has: big enough to
     /// bind, small enough that a normal UI poll is not competing with the
     /// whole budget.
+    ///
+    /// The list endpoint charges the REAL counts on both axes: one unit per
+    /// workload, plus a blob surcharge per CR-referenced workload. Flat
+    /// reservations were removed because they under-charged above their
+    /// assumed count, i.e. they failed open on exactly the clusters big
+    /// enough to need a guardrail.
     #[test]
     fn seccomp_list_reservation_binds_without_monopolising_the_budget() {
-        let seccomp_kib = cost_kib(ASSUMED_MAX_WORKLOADS, SECCOMP_WORKLOAD_COST_BYTES);
         let budget_kib = DEFAULT_READ_MEMORY_BUDGET_MB * 1024;
-        let concurrent = budget_kib / seccomp_kib;
-
-        // A RANGE, not an equality. The requirement is "binds well before the
-        // 64 actix workers, without monopolising the budget" — not one exact
-        // number. An equality here would fail the moment anyone follows the
-        // instruction three lines above SECCOMP_WORKLOAD_COST_BYTES to
-        // re-derive it against a deployed build, i.e. this test would break
-        // when a maintainer does the right thing.
-        assert!(
-            (2..=8).contains(&concurrent),
-            "expected 2-8 concurrent seccomp list reads, got {concurrent}: \
-             below 2 a single UI poll monopolises the budget, above 8 it no \
-             longer binds meaningfully before the worker count does"
-        );
-
-        // But one call must not eat the whole budget, or a single UI poll
-        // would shed every concurrent traffic read and the fix would trade
-        // one outage for another.
         let hard_cap_read_kib = cost_kib(20_000, TRAFFIC_ROW_COST_BYTES);
+        let charge = |workloads: i64, with_crs: i64| {
+            cost_kib(workloads, SECCOMP_WORKLOAD_COST_BYTES)
+                + cost_kib(with_crs.min(workloads), SECCOMP_BLOB_COST_BYTES)
+        };
+
+        // Observed dev-cluster size, with the observed zero CRs.
+        let at_1696 = charge(1_696, 0);
+        let concurrent = budget_kib / at_1696;
+        // Both bounds name a property rather than a value. Below 2 a single UI
+        // poll monopolises the budget; at or above 64 the budget admits more
+        // concurrent reads than there are actix workers, which means it never
+        // binds and the guardrail is inert.
+        //
+        // Expect the upper bound to fire eventually: the per-workload cost has
+        // gone 16 KiB -> 4 KiB as the path got cheaper, and another large
+        // reduction crosses it. When it does, it is reporting that the
+        // guardrail stopped binding, not that the test is stale. Re-check
+        // whether a budget is still the right mechanism before widening it.
         assert!(
-            seccomp_kib + hard_cap_read_kib <= budget_kib,
-            "one seccomp list read ({seccomp_kib} KiB) plus one hard-cap traffic \
-             read ({hard_cap_read_kib} KiB) must both fit the {budget_kib} KiB budget"
+            (2..64).contains(&concurrent),
+            "expected the observed cluster size to admit at least 2 concurrent \
+             list reads and to bind before the 64 actix workers, got {concurrent}"
+        );
+        assert!(
+            at_1696 + hard_cap_read_kib <= budget_kib,
+            "one list read at the observed size ({at_1696} KiB) plus one \
+             hard-cap traffic read ({hard_cap_read_kib} KiB) must both fit the \
+             {budget_kib} KiB budget"
         );
 
-        // And the reservation must actually exceed what was measured on the
-        // dev cluster (1696 workloads), or it would under-charge the very
-        // call that caused the incident.
-        let measured_kib = cost_kib(1_696, SECCOMP_WORKLOAD_COST_BYTES);
+        // FULL CR ADOPTION at the same cluster size. This is the product's
+        // goal state, and the axis a workload-only charge would fail open on:
+        // every workload's blob is read for drift, so every one must be
+        // charged for it.
+        let all_crs = charge(1_696, 1_696);
         assert!(
-            seccomp_kib > measured_kib,
-            "the flat reservation {seccomp_kib} KiB must cover the observed \
-             1696-workload cluster ({measured_kib} KiB)"
+            all_crs > at_1696 * 3,
+            "a fully-adopted cluster reads every blob, so it must be charged \
+             substantially more than one that reads none: {all_crs} vs {at_1696}"
+        );
+        assert!(
+            all_crs <= budget_kib,
+            "full CR adoption at the observed size charges {all_crs} KiB, which \
+             exceeds the {budget_kib} KiB budget and would serialise every read"
+        );
+
+        // Charging the real counts is what makes the guardrail bind harder as
+        // a cluster grows, instead of failing open.
+        assert!(
+            charge(17_000, 0) > at_1696,
+            "a bigger cluster must be charged more"
+        );
+        assert!(
+            charge(1_696, 1_696) > charge(1_696, 0),
+            "adopting CRs must be charged more, or the guardrail degrades as \
+             the feature succeeds"
+        );
+    }
+
+    /// `workload_summaries` falls back to an unfiltered scan once the set it
+    /// needs reaches 60% of the table, and that ratio is DERIVED from the two
+    /// constants below rather than chosen. This pins the derivation so the
+    /// threshold cannot silently stop being paid for if either moves.
+    ///
+    /// It earned its place immediately: the first version used 50%, which is
+    /// what a rounded `9.1 + 0.94 ~= 10 KiB` derivation gives, and this test
+    /// failed by 22 B/workload against the unrounded figures.
+    ///
+    /// An unfiltered scan reads every blob, costing about
+    /// `all * (blob + json)`. The permit charged `all * (workload + f * blob)`
+    /// for a needed fraction f. The scan is paid for when the charge covers
+    /// it. At the threshold that must hold; below it the query must stay
+    /// exact, or the scan reads rows nobody was billed for.
+    #[test]
+    fn the_unfiltered_scan_threshold_is_covered_by_what_was_charged() {
+        // Measured blob-bearing cost, the figure SECCOMP_BLOB_COST_BYTES is
+        // the surcharge for. 944 JSON B/workload is the measured wire size.
+        const ACTUAL_BLOB_READ_BYTES: u64 = 9_318; // ~9.1 KiB retained
+        const ACTUAL_JSON_BYTES: u64 = 944;
+        let scan_cost_per_workload = ACTUAL_BLOB_READ_BYTES + ACTUAL_JSON_BYTES;
+
+        // At the threshold, 60% of workloads carry the blob surcharge.
+        let charged_at_threshold = SECCOMP_WORKLOAD_COST_BYTES
+            + (SECCOMP_BLOB_COST_BYTES * SCAN_THRESHOLD_NUM as u64) / SCAN_THRESHOLD_DEN as u64;
+        assert!(
+            charged_at_threshold >= scan_cost_per_workload,
+            "at the {SCAN_THRESHOLD_NUM}/{SCAN_THRESHOLD_DEN} threshold the charge \
+             is {charged_at_threshold} B/workload but an unfiltered scan costs \
+             {scan_cost_per_workload} B/workload, so the scan reads rows nobody \
+             was billed for. Either lower SCAN_THRESHOLD_NUM/DEN or raise \
+             SECCOMP_BLOB_COST_BYTES."
+        );
+
+        // And it must NOT be paid for at a much smaller fraction, or the
+        // threshold is pointlessly conservative and the exact query never runs.
+        let charged_at_tenth = SECCOMP_WORKLOAD_COST_BYTES + SECCOMP_BLOB_COST_BYTES / 10;
+        assert!(
+            charged_at_tenth < scan_cost_per_workload,
+            "a 10% needed fraction should not cover a whole-table scan; if it \
+             does, the threshold could be lowered and the exact OR is doing \
+             work for nothing"
         );
     }
 

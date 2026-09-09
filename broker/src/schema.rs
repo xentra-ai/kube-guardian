@@ -160,6 +160,12 @@ diesel::table! {
         arches -> Text,
         hash -> Varchar,
         updated_at -> Timestamp,
+        // Cardinality of `syscalls`, written by recompute_workload so the
+        // profile list never has to read the blob to report a count. NULL
+        // on rows written before the column existed; the read path counts
+        // those from the blob until the next recompute backfills them.
+        // Last in the block because Queryable is positional.
+        syscall_count -> Nullable<Integer>,
     }
 }
 
