@@ -1,6 +1,6 @@
 import React from 'react';
 import { X, Copy, Download, Shield, Lock, Network, AlertTriangle } from 'lucide-react';
-import type { PolicyType, SeccompExportFormat } from '../../hooks/policyEditor';
+import type { NetworkExportFormat, PolicyType, SeccompExportFormat } from '../../hooks/policyEditor';
 
 interface PolicyHeaderProps {
   policyType: PolicyType;
@@ -19,7 +19,15 @@ interface PolicyHeaderProps {
   /** Seccomp export format (kguardian CR by default). */
   seccompFormat?: SeccompExportFormat;
   onSeccompFormatChange?: (format: SeccompExportFormat) => void;
+  /** Network export format (plain NetworkPolicy by default); names the title. */
+  networkFormat?: NetworkExportFormat;
 }
+
+const NETWORK_FORMAT_TITLE: Record<NetworkExportFormat, string> = {
+  audit: 'Audit Network Policy Builder',
+  network: 'Network Policy Builder',
+  cilium: 'Cilium Policy Builder',
+};
 
 const SECCOMP_FORMAT_LABEL: Record<SeccompExportFormat, string> = {
   kguardian: 'kguardian CR',
@@ -40,8 +48,14 @@ export const PolicyHeader: React.FC<PolicyHeaderProps> = ({
   podNamespace,
   ciliumWarning,
   seccompFormat = 'kguardian',
+  networkFormat = 'network',
 }) => {
   const seccompLabel = SECCOMP_FORMAT_LABEL[seccompFormat];
+  // Cilium is a FORMAT of the network tab (picked next to Audit and
+  // NetworkPolicy in the YAML view, like the seccomp formats), not a tab of
+  // its own, so the tab strip is Network / Seccomp.
+  const networkTab = policyType === 'network' || policyType === 'cilium';
+  const networkTitle = NETWORK_FORMAT_TITLE[policyType === 'cilium' ? 'cilium' : networkFormat];
   return (
     <div className="flex items-center justify-between px-6 py-4 border-b border-hubble-border">
       <div className="flex items-center gap-3">
@@ -56,7 +70,7 @@ export const PolicyHeader: React.FC<PolicyHeaderProps> = ({
         </div>
         <div>
           <h2 className="text-lg font-semibold text-primary">
-            {policyType === 'network' ? 'Network Policy Builder' : policyType === 'cilium' ? 'Cilium Policy Builder' : 'Seccomp Profile Builder'}
+            {networkTab ? networkTitle : 'Seccomp Profile Builder'}
           </h2>
           <p className="text-xs text-tertiary">
             {podName} • {podNamespace}
@@ -65,35 +79,28 @@ export const PolicyHeader: React.FC<PolicyHeaderProps> = ({
       </div>
       <div className="flex items-center gap-2">
         {/* Policy Type Selector */}
-        <div className="flex bg-hubble-dark rounded-lg p-1 mr-2">
+        <div className="flex bg-hubble-dark rounded-lg p-1 mr-2" role="tablist" aria-label="Policy type">
           <button
-            onClick={() => onPolicyTypeChange('network')}
+            role="tab"
+            aria-selected={networkTab}
+            onClick={() => onPolicyTypeChange(policyType === 'cilium' ? 'cilium' : 'network')}
             className={`px-3 py-1.5 text-xs rounded transition-all flex items-center gap-1 ${
-              policyType === 'network'
+              networkTab
                 ? 'bg-hubble-accent text-white'
                 : 'text-secondary hover:text-primary'
             }`}
           >
             <Shield className="w-3 h-3" />
             Network Policy
-          </button>
-          <button
-            onClick={() => onPolicyTypeChange('cilium')}
-            className={`px-3 py-1.5 text-xs rounded transition-all flex items-center gap-1 ${
-              policyType === 'cilium'
-                ? 'bg-hubble-accent text-white'
-                : 'text-secondary hover:text-primary'
-            }`}
-          >
-            <Network className="w-3 h-3" />
-            Cilium Policy
-            {ciliumWarning && (
+            {policyType === 'cilium' && ciliumWarning && (
               <span title={ciliumWarning} aria-label={ciliumWarning}>
                 <AlertTriangle className="w-3 h-3 text-hubble-warning" />
               </span>
             )}
           </button>
           <button
+            role="tab"
+            aria-selected={policyType === 'seccomp'}
             onClick={() => onPolicyTypeChange('seccomp')}
             className={`px-3 py-1.5 text-xs rounded transition-all flex items-center gap-1 ${
               policyType === 'seccomp'

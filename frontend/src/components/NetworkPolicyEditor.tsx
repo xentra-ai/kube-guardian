@@ -2,8 +2,6 @@ import React, { useState } from 'react';
 import { Plus, Trash2, X, ChevronDown, ChevronRight, AlertCircle, RefreshCw } from 'lucide-react';
 import type { PodNodeData } from '../types';
 import type { SeccompAction } from '../types/seccompProfile';
-import { policyToYAML } from '../utils/networkPolicyGenerator';
-import { ciliumPolicyToYAML } from '../utils/ciliumPolicyGenerator';
 import { EntitiesPeer, HostNetworkWarningBanner, RuleComments } from './HostNetworkNotes';
 import { CILIUM_NAMESPACE_LABEL } from '../types/ciliumPolicy';
 import { useClusterEnvironment } from '../hooks/useClusterEnvironment';
@@ -21,6 +19,9 @@ import {
   useSyscallAutocomplete,
   usePolicyExport,
   SECCOMP_EXPORT_FORMATS,
+  NETWORK_EXPORT_FORMATS,
+  policyTypeForNetworkFormat,
+  type NetworkExportFormat,
   type PolicyType,
   type SeccompExportFormat,
 } from '../hooks/policyEditor';
@@ -150,6 +151,16 @@ const NetworkPolicyEditor: React.FC<NetworkPolicyEditorProps> = ({ isOpen, onClo
   // generated from a filtered tier is incomplete and will block the app.
   const seccompCapture = useWorkloadCapture(pod, isOpen && policyType === 'seccomp');
   const [seccompFormat, setSeccompFormat] = useState<SeccompExportFormat>('kguardian');
+  // Network export format. Cilium is a policy TYPE internally (its own
+  // generator and visual editor) but a FORMAT to the operator, picked next to
+  // Audit and NetworkPolicy exactly like the seccomp formats; `audit` keeps
+  // the NetworkPolicy generator and only swaps the header lines on export.
+  const [auditMode, setAuditMode] = useState(false);
+  const networkFormat: NetworkExportFormat = policyType === 'cilium' ? 'cilium' : auditMode ? 'audit' : 'network';
+  const selectNetworkFormat = (format: NetworkExportFormat) => {
+    setAuditMode(format === 'audit');
+    selectPolicyType(policyTypeForNetworkFormat(format));
+  };
   // The kguardian CR exports audit-first (SCMP_ACT_LOG) regardless of the
   // generator's ERRNO default; only an action the operator explicitly picks in
   // the visual editor overrides that.
@@ -180,6 +191,7 @@ const NetworkPolicyEditor: React.FC<NetworkPolicyEditorProps> = ({ isOpen, onClo
     podNamespace: pod?.pod.pod_namespace || 'default',
     yamlView,
     seccompFormat,
+    networkFormat,
     pod,
     capture: seccompCapture,
     crDefaultAction: seccompActionTouched && seccompProfile ? seccompProfile.defaultAction : undefined,
@@ -217,6 +229,7 @@ const NetworkPolicyEditor: React.FC<NetworkPolicyEditorProps> = ({ isOpen, onClo
             ciliumWarning={ciliumWarning}
             seccompFormat={seccompFormat}
             onSeccompFormatChange={setSeccompFormat}
+            networkFormat={networkFormat}
           />
 
           {advisory && <PolicyAdvisoryNotice advisory={advisory} />}
@@ -249,6 +262,35 @@ const NetworkPolicyEditor: React.FC<NetworkPolicyEditorProps> = ({ isOpen, onClo
             ) : yamlView ? (
               /* YAML View */
               <div className="flex-1 p-6 overflow-auto space-y-3">
+                {policyType !== 'seccomp' && (
+                  <div className="flex flex-wrap items-center gap-1.5" role="radiogroup" aria-label="Network policy format">
+                    {NETWORK_EXPORT_FORMATS.map((f) => {
+                      const blocked = !!(f.requiresCilium && cniMismatch);
+                      return (
+                        <button
+                          key={f.id}
+                          role="radio"
+                          aria-checked={networkFormat === f.id}
+                          disabled={blocked}
+                          title={blocked ? ciliumWarning ?? f.hint : f.hint}
+                          onClick={() => selectNetworkFormat(f.id)}
+                          className={`px-3 py-1.5 text-xs rounded-control border transition-colors ${
+                            networkFormat === f.id
+                              ? 'bg-hubble-accent/20 border-hubble-accent text-hubble-accent'
+                              : blocked
+                                ? 'border-hubble-border text-tertiary opacity-60 cursor-not-allowed'
+                                : 'border-hubble-border text-secondary hover:border-hubble-accent/50'
+                          }`}
+                        >
+                          {f.label}
+                        </button>
+                      );
+                    })}
+                    <span className="text-[11px] text-tertiary ml-1">
+                      {NETWORK_EXPORT_FORMATS.find((f) => f.id === networkFormat)?.hint}
+                    </span>
+                  </div>
+                )}
                 {policyType === 'seccomp' && (
                   <div className="flex flex-wrap items-center gap-1.5" role="radiogroup" aria-label="Seccomp export format">
                     {SECCOMP_EXPORT_FORMATS.map((f) => (
@@ -272,13 +314,8 @@ const NetworkPolicyEditor: React.FC<NetworkPolicyEditorProps> = ({ isOpen, onClo
                   </div>
                 )}
                 <pre className="bg-hubble-dark text-secondary p-4 rounded-lg font-mono text-sm overflow-x-auto">
-                  {policyType === 'network' && policy
-                    ? policyToYAML(policy)
-                    : policyType === 'cilium' && ciliumPolicy
-                    ? ciliumPolicyToYAML(ciliumPolicy)
-                    : policyType === 'seccomp' && seccompProfile
-                    ? getExportContent() ?? ''
-                    : ''}
+                  {/* One source of truth for view, copy and download: the export content honours the chosen format. */}
+                  {getExportContent() ?? ''}
                 </pre>
               </div>
             ) : (
@@ -2119,7 +2156,9 @@ const NetworkPolicyEditor: React.FC<NetworkPolicyEditorProps> = ({ isOpen, onClo
                     : seccompFormat === 'json'
                       ? 'Generated from observed syscalls, exported as a raw seccomp JSON document.'
                       : 'Generated from observed syscalls, exported as a kguardian.dev SeccompProfile CR. Commit it, apply it, and reference the node path in your pod template — kguardian never applies it for you.'
-                  : 'This policy was generated from observed network traffic. Review and customize before applying.'}
+                  : networkFormat === 'audit'
+                    ? 'Generated from observed traffic, exported as a kguardian.dev AuditNetworkPolicy: same spec, nothing is dropped; the evaluator reports what it would deny. Promote with kubectl kguardian audit promote when it is quiet.'
+                    : 'This policy was generated from observed network traffic. Review and customize before applying.'}
               </p>
               <div className="flex gap-2">
                 <button
@@ -2132,7 +2171,9 @@ const NetworkPolicyEditor: React.FC<NetworkPolicyEditorProps> = ({ isOpen, onClo
                   onClick={handleDownload}
                   className="px-4 py-2 text-sm bg-hubble-accent text-white rounded-lg hover:bg-hubble-accent-hover transition-colors"
                 >
-                  {policyType === 'seccomp' ? (seccompFormat === 'spo' ? 'Save SPO CR' : seccompFormat === 'json' ? 'Save JSON' : 'Save CR') : 'Save Policy'}
+                  {policyType === 'seccomp'
+                    ? (seccompFormat === 'spo' ? 'Save SPO CR' : seccompFormat === 'json' ? 'Save JSON' : 'Save CR')
+                    : networkFormat === 'audit' ? 'Save Audit Policy' : 'Save Policy'}
                 </button>
               </div>
             </div>

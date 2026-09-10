@@ -81,7 +81,7 @@ test('standard visual editor: host-network peer shows as an ipBlock with its not
 
 test('cilium visual editor: host-network peer renders read-only entities chips', async () => {
   render(<NetworkPolicyEditor isOpen onClose={() => {}} pod={hostnetEgress} />);
-  fireEvent.click(screen.getByText('Cilium Policy'));
+  fireEvent.click(await screen.findByRole('radio', { name: /CiliumNetworkPolicy/ }));
   const pre = await screen.findByText((_, el) => el?.tagName === 'PRE' && !!el.textContent?.includes('toEntities:'));
   expect(pre.textContent).toContain('- host\n    - remote-node');
   expect(pre.textContent).not.toContain('toEndpoints');
@@ -95,7 +95,7 @@ test('cilium visual editor: host-network peer renders read-only entities chips',
 
 test('cilium visual editor: cross-namespace peer shows a namespace chip beside its labels', async () => {
   render(<NetworkPolicyEditor isOpen onClose={() => {}} pod={crossNamespace} />);
-  fireEvent.click(screen.getByText('Cilium Policy'));
+  fireEvent.click(await screen.findByRole('radio', { name: /CiliumNetworkPolicy/ }));
   const pre = await screen.findByText((_, el) => el?.tagName === 'PRE' && !!el.textContent?.includes('toEndpoints:'));
   // The writer quotes the key (it contains ':' and '.'); still the exact Cilium label.
   expect(pre.textContent).toContain('"k8s:io.kubernetes.pod.namespace": downloads');
