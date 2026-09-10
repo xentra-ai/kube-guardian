@@ -486,12 +486,15 @@ impl PodComputeLatest {
 }
 
 /// One node's live compute state. Positional — matches
-/// `schema::node_compute_latest`.
+/// `schema::node_compute_latest`. `treat_none_as_null` so a controller
+/// that stops sending a field (an older one without the probe failure
+/// counters) clears the previous value instead of leaving it stale.
 #[derive(
     Debug, Clone, Serialize, Deserialize, Queryable, Insertable, AsChangeset, Identifiable,
 )]
 #[diesel(table_name = crate::schema::node_compute_latest)]
 #[diesel(primary_key(node))]
+#[diesel(treat_none_as_null = true)]
 pub struct NodeComputeLatest {
     pub node: String,
     #[serde(with = "utc_ts")]
