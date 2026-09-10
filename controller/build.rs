@@ -7,6 +7,7 @@ use libbpf_cargo::SkeletonBuilder;
 const SYSCALL_SRC: &str = "src/bpf/syscall.bpf.c";
 const TCP_PROBE_SRC: &str = "src/bpf/network_probe.bpf.c";
 const PACKET_DROP_SRC: &str = "src/bpf/netpolicy_drop.bpf.c";
+const SCHED_CONTENTION_SRC: &str = "src/bpf/sched_contention.bpf.c";
 
 fn main() {
     // Generated skeletons go to OUT_DIR, never into the source tree.
@@ -29,6 +30,7 @@ fn main() {
     let out = out_dir.join("syscall.skel.rs");
     let pkt_drop_out = out_dir.join("netpolicy_drop.skel.rs");
     let tcp_probe_out = out_dir.join("network_probe.skel.rs");
+    let sched_contention_out = out_dir.join("sched_contention.skel.rs");
 
     let arch = env::var("CARGO_CFG_TARGET_ARCH")
         .expect("CARGO_CFG_TARGET_ARCH must be set in build script");
@@ -55,9 +57,18 @@ fn main() {
         .source(PACKET_DROP_SRC)
         .clang_args([
             OsStr::new("-I"),
-            vmlinux::include_path_root().join(arch).as_os_str(),
+            vmlinux::include_path_root().join(&arch).as_os_str(),
         ])
         .build_and_generate(&pkt_drop_out)
+        .unwrap();
+
+    SkeletonBuilder::new()
+        .source(SCHED_CONTENTION_SRC)
+        .clang_args([
+            OsStr::new("-I"),
+            vmlinux::include_path_root().join(arch).as_os_str(),
+        ])
+        .build_and_generate(&sched_contention_out)
         .unwrap();
 
     println!("cargo:rerun-if-changed=src/bpf");
