@@ -953,10 +953,13 @@ pub fn classify_cgroup_path(path: &str) -> (&'static str, String) {
             None => ("pod", last_two(p)),
         };
     }
-    if p.starts_with("system.slice") || p == "init.scope" {
-        return ("system", last_two(p));
-    }
-    ("unknown", last_two(p))
+    // Everything that is not a pod is a node service by definition, whatever
+    // the distro calls its tree: systemd (`system.slice/kubelet.service`,
+    // `init.scope`, `user.slice/…`), Talos (`podruntime/kubelet`,
+    // `podruntime/runtime`, `system/apid`, `init`), or anything else that
+    // sits beside `kubepods` under the host root. `unknown` is reserved for
+    // ids that cannot be resolved to a path at all.
+    ("system", last_two(p))
 }
 
 fn last_two(p: &str) -> String {
@@ -2083,11 +2086,21 @@ mod tests {
             classify_cgroup_path("init.scope"),
             ("system", "init.scope".to_string())
         );
+        // Talos has no systemd: node services live beside kubepods.
+        assert_eq!(
+            classify_cgroup_path("podruntime/kubelet"),
+            ("system", "podruntime/kubelet".to_string())
+        );
+        assert_eq!(
+            classify_cgroup_path("system/apid"),
+            ("system", "system/apid".to_string())
+        );
+        assert_eq!(classify_cgroup_path("init"), ("system", "init".to_string()));
         assert_eq!(classify_cgroup_path(""), ("kernel", "kernel".to_string()));
         assert_eq!(classify_cgroup_path("/"), ("kernel", "kernel".to_string()));
         assert_eq!(
             classify_cgroup_path("user.slice/user-1000.slice/session-3.scope"),
-            ("unknown", "user-1000.slice/session-3.scope".to_string())
+            ("system", "user-1000.slice/session-3.scope".to_string())
         );
         // `kubepods` itself contains "pod" — must not be mistaken for a uid.
         assert_eq!(

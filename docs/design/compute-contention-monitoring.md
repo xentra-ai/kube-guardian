@@ -555,10 +555,12 @@ A cgroup id that is not in `tracked_cgroups` is resolved by a
 | `kubepods.slice/…`, not tracked (excluded namespace, not yet registered) | `pod` | `pod:<uid8>` |
 | `system.slice/<unit>`, `init.scope` | `system` | unit name |
 | id 0 / pid 0 | `kernel` | `kernel` |
-| anything else | `unknown` | last two path components |
+| anything else beside `kubepods` (Talos `podruntime/kubelet`, `system/apid`, `init`; systemd `user.slice/…`) | `system` | last two path components |
 
-The `unknown` share is exported per node; if it climbs, attribution is
-broken and the UI says so rather than blaming "unknown".
+`unknown` is reserved for ids that resolve to no path at all (a cgroup that
+exited within the tick, or an index miss). Its share is exported per node;
+if it climbs, attribution is broken and the UI says so rather than blaming
+"unknown".
 
 ## Lessons from the references
 
