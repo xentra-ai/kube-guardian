@@ -66,6 +66,10 @@ impl ContentionSource for crate::contention::ContentionProbe {
 /// How often the `/sys/fs/cgroup` id→path index is rebuilt for culprit
 /// resolution. Only maintained while a probe is loaded.
 const CGROUP_INDEX_REFRESH: Duration = Duration::from_secs(30);
+/// Minimum ticks between index rebuilds triggered by an unresolved
+/// culprit, so a stream of transient scopes cannot force a full walk
+/// every tick.
+const ONDEMAND_REBUILD_EVERY_TICKS: u64 = 6;
 /// Upper bound on directories visited per index walk.
 pub const CGROUP_INDEX_LIMIT: usize = 20_000;
 /// Fold cadence for the history endpoint.
@@ -80,9 +84,10 @@ pub fn fold_size(sample_interval: Duration) -> u32 {
     let secs = sample_interval.as_secs().max(1);
     (HISTORY_INTERVAL.as_secs() / secs).max(1) as u32
 }
-/// Pending POSTs held across a broker outage before the oldest are
-/// dropped: two minutes of 5 s samples plus their minute rollups.
-const MAX_PENDING_BATCHES: usize = 30;
+/// Pending POSTs held across a broker outage, in TICKS: the newest 24
+/// ticks' worth of chunks (two minutes at 5 s) are kept whatever the
+/// chunk count per tick; older ticks are dropped first.
+const MAX_PENDING_TICKS: usize = 24;
 /// Blame entries shipped per victim per sample.
 const SAMPLE_BLAME_LIMIT: usize = 20;
 /// Blame entries shipped per victim per minute.
@@ -1008,6 +1013,7 @@ fn resolve_culprit(
     id: u64,
     registry: &ComputeMap,
     index: &HashMap<u64, String>,
+    exited: &HashSet<u64>,
 ) -> (&'static str, String, Option<String>) {
     if let Some(c) = registry.lookup_cgroup(id) {
         return (
@@ -1033,6 +1039,9 @@ fn resolve_culprit(
             let (kind, r) = classify_cgroup_path(path);
             (kind, r, None)
         }
+        // Judged after a rebuild and still absent: the cgroup exited.
+        None if exited.contains(&id) => ("unknown", "exited".to_string(), None),
+        // Not yet judged (rebuild rate-limited): unknown for now.
         None => ("unknown", format!("cgroup:{id}"), None),
     }
 }
@@ -1041,6 +1050,7 @@ fn blame_for(
     pairs: &[PairDelta],
     registry: &ComputeMap,
     index: &HashMap<u64, String>,
+    exited: &HashSet<u64>,
     limit: usize,
 ) -> Vec<BlameEntry> {
     let mut out: Vec<BlameEntry> = pairs
@@ -1048,7 +1058,7 @@ fn blame_for(
         .filter(|p| p.count > 0 || p.wait_ns > 0)
         .map(|p| {
             let (kind, reference, container_uid) =
-                resolve_culprit(p.culprit_cgroup_id, registry, index);
+                resolve_culprit(p.culprit_cgroup_id, registry, index, exited);
             BlameEntry {
                 cgroup_id: p.culprit_cgroup_id,
                 kind,
@@ -1152,18 +1162,27 @@ struct NodePrev {
     at: Instant,
 }
 
-/// One pending POST: endpoint path and body.
-pub type PendingPost = (&'static str, serde_json::Value);
+/// One pending POST: the tick it came from, endpoint path and body.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingPost {
+    pub tick: u64,
+    pub path: &'static str,
+    pub body: serde_json::Value,
+}
 
-/// Drop the oldest pending posts until `len <= max`. Returns how many
-/// were dropped. Same policy as `network::cap_batch`.
-pub fn cap_pending(pending: &mut VecDeque<PendingPost>, max: usize) -> usize {
-    if pending.len() <= max {
+/// Keep only the posts from the newest `keep_ticks` ticks, dropping the
+/// oldest ticks first. Returns how many posts were dropped. Ticks are
+/// monotonic, so the queue is ordered by tick.
+pub fn cap_pending(pending: &mut VecDeque<PendingPost>, keep_ticks: usize) -> usize {
+    let Some(newest) = pending.back().map(|p| p.tick) else {
         return 0;
+    };
+    let oldest_kept = newest.saturating_sub(keep_ticks.max(1) as u64 - 1);
+    let before = pending.len();
+    while pending.front().is_some_and(|p| p.tick < oldest_kept) {
+        pending.pop_front();
     }
-    let drop = pending.len() - max;
-    pending.drain(..drop);
-    drop
+    before - pending.len()
 }
 
 /// The sampler's whole state. Lives in an `Arc<Mutex<_>>` so a tick that
@@ -1182,6 +1201,17 @@ pub struct Sampler {
     cgroup_index: HashMap<u64, String>,
     index_built: Option<Instant>,
     index_truncated_warned: bool,
+    /// Tick counter, for the on-demand index rebuild rate limit.
+    tick: u64,
+    /// Tick of the last index rebuild of any kind.
+    last_rebuild_tick: u64,
+    /// On-demand rebuilds so far (observability + tests).
+    pub(crate) ondemand_rebuilds: u64,
+    /// Culprit ids still unresolved right after a rebuild: the cgroup is
+    /// gone (a transient scope that exited within the tick). Reported as
+    /// `unknown`/`exited` and never used to trigger another rebuild.
+    /// Cleared on every periodic rebuild so a recycled id is re-judged.
+    exited: HashSet<u64>,
     fold: MinuteFold,
     fold_every: u32,
     /// Set once the probe has been told about every id in the registry.
@@ -1213,6 +1243,10 @@ impl Sampler {
             cgroup_index: HashMap::new(),
             index_built: None,
             index_truncated_warned: false,
+            tick: 0,
+            last_rebuild_tick: 0,
+            ondemand_rebuilds: 0,
+            exited: HashSet::new(),
             fold: MinuteFold::default(),
             fold_every,
             tracked_synced: false,
@@ -1290,6 +1324,7 @@ impl Sampler {
         let (index, truncated) = build_cgroup_index(&self.cfg.cgroup_root, CGROUP_INDEX_LIMIT);
         self.cgroup_index = index;
         self.index_built = Some(started);
+        self.last_rebuild_tick = self.tick;
         if truncated {
             if self.index_truncated_warned {
                 debug!(
@@ -1325,25 +1360,60 @@ impl Sampler {
             .unwrap_or(true);
         if due {
             self.rebuild_index("periodic");
+            self.exited.clear();
         }
         due
     }
 
-    /// Culprit ids this snapshot names that nothing can currently
-    /// resolve: not a registered container in either tier, not the
-    /// kernel, not in the index. An immediate rebuild (at most once per
-    /// tick) resolves cgroups created since the last walk before they
-    /// are written off as `unknown`.
-    fn unresolved_culprits(&self, snapshot: &ContentionSnapshot) -> bool {
-        snapshot.per_victim.values().any(|v| {
-            v.pairs.iter().any(|p| {
-                let id = p.culprit_cgroup_id;
-                id != 0
-                    && !self.cgroup_index.contains_key(&id)
-                    && self.registry.lookup_cgroup(id).is_none()
-                    && self.registry.lookup_identity(id).is_none()
+    /// Culprit ids this snapshot names that nothing can resolve: not a
+    /// registered container in either tier, not the kernel, not in the
+    /// index, and not already known to have exited.
+    fn unresolved_culprits(&self, snapshot: &ContentionSnapshot) -> Vec<u64> {
+        let mut ids: Vec<u64> = snapshot
+            .per_victim
+            .values()
+            .flat_map(|v| v.pairs.iter().map(|p| p.culprit_cgroup_id))
+            .filter(|id| {
+                *id != 0
+                    && !self.cgroup_index.contains_key(id)
+                    && !self.exited.contains(id)
+                    && self.registry.lookup_cgroup(*id).is_none()
+                    && self.registry.lookup_identity(*id).is_none()
             })
-        })
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
+    /// After a rebuild, whatever is still unresolved is a cgroup that no
+    /// longer exists: remember it so it is reported as `exited` and does
+    /// not trigger another walk.
+    fn mark_exited(&mut self, snapshot: &ContentionSnapshot) {
+        for id in self.unresolved_culprits(snapshot) {
+            self.exited.insert(id);
+        }
+    }
+
+    /// Rebuild the index for a culprit the index does not know, at most
+    /// once every [`ONDEMAND_REBUILD_EVERY_TICKS`] ticks. Ids that are
+    /// still unknown afterwards are marked exited.
+    fn resolve_unknown_culprits(&mut self, snapshot: &ContentionSnapshot, rebuilt_this_tick: bool) {
+        if rebuilt_this_tick {
+            self.mark_exited(snapshot);
+            return;
+        }
+        if self.unresolved_culprits(snapshot).is_empty() {
+            return;
+        }
+        if self.tick.saturating_sub(self.last_rebuild_tick) < ONDEMAND_REBUILD_EVERY_TICKS {
+            // Rate-limited: this tick reports them as `cgroup:<id>`
+            // (unknown, not yet judged) and tries again later.
+            return;
+        }
+        self.rebuild_index("unresolved culprit");
+        self.ondemand_rebuilds += 1;
+        self.mark_exited(snapshot);
     }
 
     /// Once, three sample intervals after the watcher first saw an
@@ -1361,7 +1431,7 @@ impl Sampler {
             return;
         }
         self.self_check_done = true;
-        if self.registry.containers().is_empty() && self.registry.eligible_pods_seen() > 0 {
+        if self.registry.resolved_containers() == 0 && self.registry.eligible_pods_seen() > 0 {
             tracing::error!(
                 eligible_pods_seen = self.registry.eligible_pods_seen(),
                 cgroup_root = %self.cfg.cgroup_root.display(),
@@ -1445,6 +1515,7 @@ impl Sampler {
             .filter(|ms| *ms > 0)
             .unwrap_or(self.cfg.sample_interval.as_millis() as u64);
         self.last_tick = Some(now);
+        self.tick += 1;
 
         self.sync_tracked();
         let index_rebuilt = self.refresh_index_if_due();
@@ -1468,9 +1539,7 @@ impl Sampler {
         };
         let contention_loaded = self.probe.is_some() && !snapshot_failed;
         if let Some(snap) = &snapshot {
-            if !index_rebuilt && self.unresolved_culprits(snap) {
-                self.rebuild_index("unresolved culprit");
-            }
+            self.resolve_unknown_culprits(snap, index_rebuilt);
         }
 
         let mut seen: HashSet<u64> = HashSet::new();
@@ -1493,6 +1562,7 @@ impl Sampler {
                                     &v.pairs,
                                     &self.registry,
                                     &self.cgroup_index,
+                                    &self.exited,
                                     SAMPLE_BLAME_LIMIT,
                                 )
                             })
@@ -1540,6 +1610,83 @@ impl Sampler {
     }
 }
 
+/// Node-level pressure and capacity from host `/proc`, no state. The
+/// sampler's per-tick path also tracks the context-switch rate; this is
+/// the static subset the disabled heartbeat can afford.
+pub fn read_node_static(host_proc: &Path) -> (NodePressure, NodeCapacity) {
+    let cpu_psi = read_opt(host_proc, "pressure/cpu").and_then(|b| parse_pressure(&b));
+    let mem_psi = read_opt(host_proc, "pressure/memory").and_then(|b| parse_pressure(&b));
+    let stat = read_opt(host_proc, "stat")
+        .map(|b| parse_proc_stat(&b))
+        .unwrap_or_default();
+    let memory_bytes = read_opt(host_proc, "meminfo")
+        .and_then(|b| parse_meminfo_total_bytes(&b))
+        .unwrap_or(0);
+    (
+        NodePressure {
+            cpu_some10: cpu_psi.map(|p| p.some_avg10).unwrap_or(0.0),
+            cpu_full10: cpu_psi.map(|p| p.full_avg10).unwrap_or(0.0),
+            mem_some10: mem_psi.map(|p| p.some_avg10).unwrap_or(0.0),
+            mem_full10: mem_psi.map(|p| p.full_avg10).unwrap_or(0.0),
+        },
+        NodeCapacity {
+            cpu_cores: stat.cpus,
+            memory_bytes,
+        },
+    )
+}
+
+/// Cadence of the disabled heartbeat.
+pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(300);
+
+/// The node-only envelope a controller with `COMPUTE_ENABLED=false`
+/// posts (design D10): it makes the UI's `off` state reachable, so a
+/// node whose operator switched the feature off can be told apart from
+/// a node running a controller older than the feature (which posts
+/// nothing). No registry, no sampler, no cgroup files are read —
+/// `compute_supported` is the same existence check node facts use.
+pub fn disabled_heartbeat(cfg: &ComputeConfig, node: &str) -> ComputeBatch {
+    let (node_pressure, node_capacity) = read_node_static(&cfg.host_proc);
+    ComputeBatch {
+        node: node.to_string(),
+        ts: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+        interval_ms: HEARTBEAT_INTERVAL.as_millis() as u64,
+        ctxt_per_sec: 0.0,
+        compute_enabled: false,
+        compute_supported: compute_supported(&cfg.cgroup_root, &cfg.host_proc),
+        contention_loaded: false,
+        node_pressure,
+        node_capacity,
+        bpf_occupancy: BpfOccupancy::default(),
+        unknown_blame_share: 0.0,
+        containers: Vec::new(),
+    }
+}
+
+/// The `compute-sampler` subsystem when the feature is OFF: post the
+/// disabled heartbeat at startup and every five minutes. Best-effort;
+/// a failed POST is logged at debug and retried next time.
+pub async fn run_heartbeat(cfg: ComputeConfig, node: String) -> Result<(), Error> {
+    info!(
+        interval_secs = HEARTBEAT_INTERVAL.as_secs(),
+        "compute sampler disabled (COMPUTE_ENABLED=false); posting a node-only heartbeat"
+    );
+    let mut ticker = tokio::time::interval(HEARTBEAT_INTERVAL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        ticker.tick().await;
+        let batch = disabled_heartbeat(&cfg, &node);
+        if let Err(e) = api_post_call(
+            serde_json::to_value(&batch).unwrap_or_default(),
+            SAMPLE_PATH,
+        )
+        .await
+        {
+            debug!(error = %e, "compute heartbeat POST failed; retrying next interval");
+        }
+    }
+}
+
 /// cgroup v2 root with PSI available.
 pub fn compute_supported(cgroup_root: &Path, host_proc: &Path) -> bool {
     cgroup_root.join("cgroup.controllers").exists() && host_proc.join("pressure/cpu").exists()
@@ -1550,7 +1697,7 @@ pub fn compute_supported(cgroup_root: &Path, host_proc: &Path) -> bool {
 async fn flush_pending(pending: &mut VecDeque<PendingPost>) -> usize {
     loop {
         let (path, body) = match pending.front() {
-            Some((p, b)) => (*p, b.clone()),
+            Some(p) => (p.path, p.body.clone()),
             None => break,
         };
         match api_post_call(body, path).await {
@@ -1568,11 +1715,11 @@ async fn flush_pending(pending: &mut VecDeque<PendingPost>) -> usize {
             }
         }
     }
-    let dropped = cap_pending(pending, MAX_PENDING_BATCHES);
+    let dropped = cap_pending(pending, MAX_PENDING_TICKS);
     if dropped > 0 {
         warn!(
             dropped,
-            cap = MAX_PENDING_BATCHES,
+            keep_ticks = MAX_PENDING_TICKS,
             "compute pending queue overflow during broker outage; dropped oldest batches"
         );
     }
@@ -1618,10 +1765,12 @@ pub async fn run(
     let mut pending: VecDeque<PendingPost> = VecDeque::new();
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut tick: u64 = 0;
     // The first tick fires immediately; it seeds the counters and posts
     // a node envelope so the broker learns the node is on.
     loop {
         ticker.tick().await;
+        tick += 1;
         let state = std::sync::Arc::clone(&sampler);
         let joined = tokio::task::spawn_blocking(move || {
             // A poisoned mutex is a previous tick's panic; the state is
@@ -1648,17 +1797,19 @@ pub async fn run(
             "compute sample collected"
         );
         for chunk in chunk_batch(batch, MAX_CONTAINERS_PER_POST) {
-            pending.push_back((
-                SAMPLE_PATH,
-                serde_json::to_value(&chunk).unwrap_or_default(),
-            ));
+            pending.push_back(PendingPost {
+                tick,
+                path: SAMPLE_PATH,
+                body: serde_json::to_value(&chunk).unwrap_or_default(),
+            });
         }
         if let Some(h) = history {
             for chunk in chunk_history(h, MAX_CONTAINERS_PER_POST) {
-                pending.push_back((
-                    HISTORY_PATH,
-                    serde_json::to_value(&chunk).unwrap_or_default(),
-                ));
+                pending.push_back(PendingPost {
+                    tick,
+                    path: HISTORY_PATH,
+                    body: serde_json::to_value(&chunk).unwrap_or_default(),
+                });
             }
         }
         flush_pending(&mut pending).await;
@@ -1975,15 +2126,23 @@ mod tests {
     }
 
     #[test]
-    fn cap_pending_drops_oldest_first() {
-        let mut q: VecDeque<PendingPost> = (0..5)
-            .map(|i| (SAMPLE_PATH, serde_json::json!(i)))
-            .collect();
-        assert_eq!(cap_pending(&mut q, 5), 0);
-        assert_eq!(cap_pending(&mut q, 2), 3);
-        assert_eq!(q.front().unwrap().1, serde_json::json!(3));
-        assert_eq!(cap_pending(&mut q, 0), 2);
-        assert!(q.is_empty());
+    fn cap_pending_keeps_the_newest_ticks_whatever_their_chunk_count() {
+        let post = |tick: u64| PendingPost {
+            tick,
+            path: SAMPLE_PATH,
+            body: serde_json::json!(tick),
+        };
+        // 30 ticks, two chunks each (a 300-container node).
+        let mut q: VecDeque<PendingPost> = (1..=30).flat_map(|t| [post(t), post(t)]).collect();
+        assert_eq!(cap_pending(&mut q, 30), 0);
+        assert_eq!(cap_pending(&mut q, 24), 12, "ticks 1..=6, two chunks each");
+        assert_eq!(q.front().unwrap().tick, 7);
+        assert_eq!(q.back().unwrap().tick, 30);
+        assert_eq!(q.len(), 48);
+        assert_eq!(cap_pending(&mut q, 1), 46);
+        assert_eq!(q.len(), 2);
+        let mut empty = VecDeque::new();
+        assert_eq!(cap_pending(&mut empty, 24), 0);
     }
 
     #[test]
@@ -2254,6 +2413,79 @@ mod tests {
     }
 
     #[test]
+    fn transient_culprits_rebuild_the_index_at_most_once_per_six_ticks() {
+        let base =
+            std::env::temp_dir().join(format!("kg-compute-ratelimit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let root = base.join("cgroup");
+        let proc_ = base.join("proc");
+        std::fs::create_dir_all(proc_.join("pressure")).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("cgroup.controllers"), "cpu memory\n").unwrap();
+        std::fs::write(
+            proc_.join("pressure/cpu"),
+            "some avg10=0.00 avg60=0.00 avg300=0.00 total=0\n",
+        )
+        .unwrap();
+        std::fs::write(proc_.join("stat"), PROC_STAT).unwrap();
+        std::fs::write(proc_.join("meminfo"), MEMINFO).unwrap();
+        let rel = "kubepods.slice/x.scope";
+        write_cgroup(&root.join(rel), 1_000, 100);
+        let registry: ComputeMap = Arc::new(ComputeRegistry::new());
+        let events = registry.subscribe();
+        registry.insert_container(ContainerCompute {
+            pod_uid: "u1".into(),
+            namespace: "n".into(),
+            pod_name: "p".into(),
+            container_name: "c".into(),
+            container_id: "a".into(),
+            pid: 1,
+            cgroup_path: rel.into(),
+            cgroup_id: 100,
+            resources: ResourceSpec::default(),
+            node: "n".into(),
+        });
+        let probe = FakeProbe {
+            tracked: Default::default(),
+            victims: vec![],
+            occupancy: (0, 0, 0),
+            fail: false,
+            rotate_culprit: Some(9_000_000),
+        };
+        let cfg = ComputeConfig {
+            cgroup_root: root.clone(),
+            host_proc: proc_,
+            ..Default::default()
+        };
+        let mut s = Sampler::new(cfg, "n".into(), registry, Some(Box::new(probe)), events);
+        let mut usage = 1_000;
+        let mut refs = Vec::new();
+        for _ in 1..=8 {
+            usage += 1_000;
+            write_cgroup(&root.join(rel), usage, 100);
+            let (b, _) = s.collect();
+            refs.push(
+                b.containers
+                    .first()
+                    .and_then(|c| c.blame.first())
+                    .map(|e| e.reference.clone()),
+            );
+        }
+        // Tick 1: periodic (first) rebuild. Ticks 2–6: rate-limited.
+        // Tick 7: one on-demand rebuild. Tick 8: rate-limited again.
+        assert_eq!(s.ondemand_rebuilds, 1, "{refs:?}");
+        assert_eq!(s.last_rebuild_tick, 7);
+        // A culprit judged after a rebuild is `exited`; one seen while
+        // rate-limited is `cgroup:<id>` (not yet judged).
+        assert_eq!(refs[6].as_deref(), Some("exited"));
+        assert!(
+            refs[7].as_deref().unwrap().starts_with("cgroup:"),
+            "{refs:?}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn a_failed_snapshot_ships_null_runq_and_contention_loaded_false() {
         let base = std::env::temp_dir().join(format!("kg-compute-snapfail-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
@@ -2290,6 +2522,7 @@ mod tests {
             victims: vec![],
             occupancy: (0, 0, 0),
             fail: true,
+            rotate_culprit: None,
         };
         let cfg = ComputeConfig {
             cgroup_root: root.clone(),
@@ -2305,6 +2538,40 @@ mod tests {
         assert_eq!(b.containers.len(), 1);
         assert!(b.containers[0].runq.is_none(), "null, not a row of zeros");
         assert_eq!(b.bpf_occupancy, BpfOccupancy::default());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_disabled_controller_posts_a_node_only_heartbeat() {
+        let base = std::env::temp_dir().join(format!("kg-compute-hb-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("proc/pressure")).unwrap();
+        std::fs::write(base.join("proc/stat"), PROC_STAT).unwrap();
+        std::fs::write(base.join("proc/meminfo"), MEMINFO).unwrap();
+        std::fs::write(
+            base.join("proc/pressure/cpu"),
+            "some avg10=1.50 avg60=0.00 avg300=0.00 total=0\n",
+        )
+        .unwrap();
+        let cfg = ComputeConfig {
+            enabled: false,
+            host_proc: base.join("proc"),
+            cgroup_root: base.join("no-cgroup-mount"),
+            ..Default::default()
+        };
+        let b = disabled_heartbeat(&cfg, "worker-9");
+        assert!(!b.compute_enabled);
+        assert!(!b.contention_loaded);
+        assert!(!b.compute_supported, "no cgroup root mounted");
+        assert!(b.containers.is_empty());
+        assert_eq!(b.interval_ms, 300_000);
+        assert_eq!(b.node, "worker-9");
+        assert_eq!(b.node_capacity.cpu_cores, 4);
+        assert!((b.node_pressure.cpu_some10 - 1.5).abs() < 1e-9);
+        assert_eq!(b.bpf_occupancy, BpfOccupancy::default());
+        let v = serde_json::to_value(&b).unwrap();
+        assert_eq!(v["compute_enabled"], false);
+        assert_eq!(v["containers"].as_array().unwrap().len(), 0);
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -2362,6 +2629,9 @@ mod tests {
         occupancy: (u64, u64, u64),
         /// Make `snapshot()` fail.
         fail: bool,
+        /// When set, every snapshot names a fresh, never-seen culprit id
+        /// (a transient scope) for victim 100.
+        rotate_culprit: Option<u64>,
     }
 
     impl ContentionSource for FakeProbe {
@@ -2376,6 +2646,10 @@ mod tests {
         fn snapshot(&mut self) -> anyhow::Result<ContentionSnapshot> {
             if self.fail {
                 anyhow::bail!("map read failed");
+            }
+            if let Some(next) = self.rotate_culprit.as_mut() {
+                *next += 1;
+                self.victims = vec![(100, [0; 24], vec![(*next, 1, 1)])];
             }
             let mut per_victim = HashMap::new();
             for (victim, hist, pairs) in &self.victims {
@@ -2488,6 +2762,7 @@ mod tests {
             )],
             occupancy: (11, 22, 33),
             fail: false,
+            rotate_culprit: None,
         };
         let cfg = ComputeConfig {
             cgroup_root: root.clone(),
@@ -2553,7 +2828,8 @@ mod tests {
         let unknown = c.blame.iter().find(|b| b.cgroup_id == 424242).unwrap();
         assert_eq!(
             (unknown.kind, unknown.reference.as_str()),
-            ("unknown", "cgroup:424242")
+            ("unknown", "exited"),
+            "judged after the tick-1 rebuild and still absent"
         );
         // 2 000 ns unknown out of 6 100 001 000 ns of blamed wait.
         assert!(b2.unknown_blame_share < 1e-5 && b2.unknown_blame_share > 0.0);

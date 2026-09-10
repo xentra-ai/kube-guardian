@@ -8,7 +8,9 @@ use tracing::info;
 use kguardian::bpf::ebpf_handle;
 use kguardian::compute_config::ComputeConfig;
 use kguardian::compute_registry::{ComputeMap, ComputeRegistry};
-use kguardian::compute_sampler::{run as run_compute_sampler, ContentionSource};
+use kguardian::compute_sampler::{
+    run as run_compute_sampler, run_heartbeat as run_compute_heartbeat, ContentionSource,
+};
 use kguardian::log::init_logger;
 use kguardian::network::{handle_network_events, handle_policy_drop_events, PolicyDropEvent};
 use kguardian::pod_watcher::ComputeContext;
@@ -256,11 +258,12 @@ async fn main() -> Result<(), Error> {
     // unreachable; if you add one, that is the behaviour you are
     // choosing, and "best-effort" will no longer describe it.
     supervisor.spawn(Subsystem::SeccompDistributor, run_seccomp_distributor());
-    // Compute sampler: spawned only when COMPUTE_ENABLED, and `MayRetire`
-    // for the same reason as the distributor — `run` returns `Ok` when
-    // the feature is off. An `Err` is still fatal.
-    if let (Some(map), Some(events)) = (compute_map, compute_events) {
-        supervisor.spawn(
+    // Compute sampler, `MayRetire` for the same reason as the distributor.
+    // With COMPUTE_ENABLED=false there is no registry and no sampler;
+    // the same roster slot runs a five-minute node-only heartbeat so the
+    // broker can show the node as "off" rather than "pending" (D10).
+    match (compute_map, compute_events) {
+        (Some(map), Some(events)) => supervisor.spawn(
             Subsystem::ComputeSampler,
             run_compute_sampler(
                 compute_config,
@@ -269,7 +272,11 @@ async fn main() -> Result<(), Error> {
                 contention_probe,
                 events,
             ),
-        );
+        ),
+        _ => supervisor.spawn(
+            Subsystem::ComputeSampler,
+            run_compute_heartbeat(compute_config, node_name_for_compute),
+        ),
     }
     supervisor.spawn(Subsystem::EbpfLoader, async move { ebpf_handle.await? });
 

@@ -1,8 +1,8 @@
 use crate::capture_tiers::CaptureLevel;
 use crate::compute_config::COMPUTE_ANNOTATION;
 use crate::compute_registry::{
-    cgroup_id_for_path, containerd_cgroups_path, parse_cpu_millis, parse_memory_bytes,
-    resolve_container_cgroup, ComputeMap, ContainerCompute, ResourceSpec, Tier,
+    cgroup_id_for_path, parse_cpu_millis, parse_memory_bytes, resolve_container_cgroup,
+    resolve_pid_and_cgroups_path, ComputeMap, ContainerCompute, ResourceSpec, Tier,
 };
 use crate::models::{pod_flags, ContainerMap, PodRegistration};
 use crate::network::canonicalize_ip;
@@ -867,21 +867,16 @@ async fn register_compute(pod: &Pod, ctx: &ComputeContext) {
                 (*e).clone()
             }
             _ => {
-                // Same containerd lookup (and the same connect / RPC
-                // ceilings) the netns registration uses.
-                let Some(inspect) = PodInspect::default().get_pod_inspect(raw_id).await else {
-                    continue;
-                };
-                let Some(pid) = inspect.pid else {
-                    continue;
-                };
-                let cid = crate::container::parse_container_id(raw_id).unwrap_or_default();
-                // The controller's own cgroup namespace makes
+                // One containerd channel per container: Tasks.Get (the
+                // same call and ceilings the netns registration uses)
+                // then Containers.Get for the OCI cgroupsPath. The
+                // controller's own cgroup namespace makes
                 // /proc/<pid>/cgroup useless for other pods (it renders
-                // `../..` paths), so the cgroup is resolved from
-                // containerd's OCI spec first, then by a bounded search;
-                // see `resolve_container_cgroup`.
-                let spec_path = containerd_cgroups_path(&cid).await;
+                // `../..` paths); see `resolve_container_cgroup`.
+                let cid = crate::container::parse_container_id(raw_id).unwrap_or_default();
+                let Some((pid, spec_path)) = resolve_pid_and_cgroups_path(&cid).await else {
+                    continue;
+                };
                 let resolved = match resolve_container_cgroup(
                     &ctx.cgroup_root,
                     &ctx.host_proc,

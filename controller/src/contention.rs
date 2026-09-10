@@ -114,6 +114,38 @@ pub struct ContentionProbe {
     ticks: u64,
     /// Last `runq_enqueued` count, re-reported between recounts.
     last_runq_enqueued: u64,
+    /// Scratch space for `bpf_map_lookup_batch`, sized to the largest map
+    /// read so far and reused across snapshots (see [`BatchBuffers`]).
+    bufs: BatchBuffers,
+}
+
+/// Reusable buffers for batched map reads. Sized to `max_entries` of the
+/// largest map on first use (≈ 3 MiB across the four maps) and never
+/// shrunk or re-zeroed: the kernel fills the first `count` rows of
+/// `keys`/`values` and only that prefix is read back, so stale bytes
+/// past it are never observed. Allocating and zeroing this per snapshot
+/// was ~3 MiB of memset every tick for nothing.
+#[derive(Default)]
+struct BatchBuffers {
+    keys: Vec<u8>,
+    values: Vec<u8>,
+    in_batch: Vec<u8>,
+    out_batch: Vec<u8>,
+}
+
+impl BatchBuffers {
+    /// Grow (never shrink) so the key/value areas hold `batch` rows.
+    fn ensure(&mut self, batch: usize, key_size: usize, value_size: usize) {
+        let grow = |v: &mut Vec<u8>, n: usize| {
+            if v.len() < n {
+                v.resize(n, 0);
+            }
+        };
+        grow(&mut self.keys, batch * key_size);
+        grow(&mut self.values, batch * value_size);
+        grow(&mut self.in_batch, key_size);
+        grow(&mut self.out_batch, key_size);
+    }
 }
 
 /// On the per-key fallback path `runq_enqueued` (up to 65536 keys, one
@@ -168,19 +200,21 @@ impl ContentionProbe {
             batch_supported: true,
             ticks: 0,
             last_runq_enqueued: 0,
+            bufs: BatchBuffers::default(),
         })
     }
 
     /// Start recording `cgroup_id` as a victim.
     ///
     /// The value is a bare presence flag, not a generation-bearing flags
-    /// word like `inode_num`'s. That is safe here because a cgroup v2 id
-    /// is `kernfs_node.id`, which on 64-bit kernels is
-    /// `ino | (generation << 32)` and the kernfs idr bumps the generation
-    /// each time an inode number is recycled — a replacement pod that
-    /// lands on a reused ino gets a different u64 and cannot inherit the
-    /// old pod's histogram or pair rows. The key carries the generation;
-    /// nothing has to be folded in.
+    /// word like `inode_num`'s. That is safe because a cgroup v2 id is
+    /// `kernfs_node.id`, which on 64-bit kernels is
+    /// `ino | (id_highbits << 32)` (fs/kernfs/dir.c): the low half comes
+    /// from a cyclic IDR that does not reissue a number until it has
+    /// wrapped the whole 31-bit space, and `id_highbits` increments on
+    /// each wrap. A u64 id never repeats within one boot, so a
+    /// replacement pod cannot inherit the old pod's histogram or pair
+    /// rows; nothing has to be folded in.
     pub fn track(&self, cgroup_id: u64) -> Result<(), Error> {
         self.skel
             .maps
@@ -193,7 +227,7 @@ impl ContentionProbe {
     ///
     /// `runq_hist` is a plain HASH that nothing in the kernel ever frees,
     /// so without this each dead pod would leave 24 rows behind and the
-    /// map (8192 rows ≈ 341 cgroups) would fill under ordinary pod churn,
+    /// map (65 536 rows ≈ 2 730 cgroups) would fill under ordinary pod churn,
     /// after which NEW pods silently get no histogram. The pair map is
     /// LRU and ages out on its own; its rows for this victim are left to
     /// it. The userspace baseline needs no cleanup: `snapshot()` replaces
@@ -246,7 +280,7 @@ impl ContentionProbe {
         let maps = &self.skel.maps;
 
         let mut cur_hist: HashMap<HistKey, u64> = HashMap::new();
-        for (key, value) in read_map(&mut self.batch_supported, &maps.runq_hist)? {
+        for (key, value) in read_map(&mut self.batch_supported, &mut self.bufs, &maps.runq_hist)? {
             let (Some(k), Some(count)) = (hist_key_from_bytes(&key), u64_from_bytes(&value)) else {
                 continue;
             };
@@ -260,10 +294,14 @@ impl ContentionProbe {
         // kept out of the snapshot. tracked_cgroups is read AFTER
         // runq_hist so a cgroup tracked between the two reads (whose
         // first rows may already be in cur_hist) is seen as tracked.
-        let tracked: HashSet<u64> = read_map(&mut self.batch_supported, &maps.tracked_cgroups)?
-            .into_iter()
-            .filter_map(|(k, _)| u64_from_bytes(&k))
-            .collect();
+        let tracked: HashSet<u64> = read_map(
+            &mut self.batch_supported,
+            &mut self.bufs,
+            &maps.tracked_cgroups,
+        )?
+        .into_iter()
+        .filter_map(|(k, _)| u64_from_bytes(&k))
+        .collect();
         let orphans: Vec<HistKey> = cur_hist
             .keys()
             .filter(|(cg, _)| !tracked.contains(cg))
@@ -277,7 +315,7 @@ impl ContentionProbe {
         }
 
         let mut cur_pair: HashMap<PairKey, PairCounters> = HashMap::new();
-        for (key, value) in read_map(&mut self.batch_supported, &maps.pair)? {
+        for (key, value) in read_map(&mut self.batch_supported, &mut self.bufs, &maps.pair)? {
             let (Some(k), Some(v)) = (pair_key_from_bytes(&key), pair_value_from_bytes(&value))
             else {
                 continue;
@@ -286,7 +324,7 @@ impl ContentionProbe {
         }
 
         let runq_enqueued = if self.batch_supported {
-            match lookup_batch(&maps.runq_enqueued)? {
+            match lookup_batch(&mut self.bufs, &maps.runq_enqueued)? {
                 Some(rows) => rows.len() as u64,
                 None => {
                     self.batch_supported = false;
@@ -332,10 +370,11 @@ impl ContentionProbe {
 /// hold `&self.skel.maps` across the call.
 fn read_map(
     batch_supported: &mut bool,
+    bufs: &mut BatchBuffers,
     map: &MapMut<'_>,
 ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, Error> {
     if *batch_supported {
-        match lookup_batch(map)? {
+        match lookup_batch(bufs, map)? {
             Some(rows) => return Ok(rows),
             None => {
                 warn!(
@@ -372,14 +411,20 @@ const ENOTSUPP: i32 = 524;
 /// because it swallows every error other than ENOENT/EINTR by ending the
 /// iteration early, which would make an unsupported kernel look exactly
 /// like an empty map and turn the next snapshot's deltas into garbage.
-fn lookup_batch(map: &MapMut<'_>) -> Result<Option<Vec<(Vec<u8>, Vec<u8>)>>, Error> {
+fn lookup_batch(
+    bufs: &mut BatchBuffers,
+    map: &MapMut<'_>,
+) -> Result<Option<Vec<(Vec<u8>, Vec<u8>)>>, Error> {
     let key_size = map.key_size() as usize;
     let value_size = map.value_size() as usize;
     let batch = map.max_entries().max(1);
-    let mut keys = vec![0u8; key_size * batch as usize];
-    let mut values = vec![0u8; value_size * batch as usize];
-    let mut in_batch = vec![0u8; key_size];
-    let mut out_batch = vec![0u8; key_size];
+    bufs.ensure(batch as usize, key_size, value_size);
+    let BatchBuffers {
+        keys,
+        values,
+        in_batch,
+        out_batch,
+    } = bufs;
     let opts = libbpf_sys::bpf_map_batch_opts {
         sz: std::mem::size_of::<libbpf_sys::bpf_map_batch_opts>() as libbpf_sys::size_t,
         elem_flags: 0,
@@ -438,7 +483,7 @@ fn lookup_batch(map: &MapMut<'_>) -> Result<Option<Vec<(Vec<u8>, Vec<u8>)>>, Err
             return Ok(Some(rows));
         }
         first = false;
-        in_batch.copy_from_slice(&out_batch);
+        in_batch[..key_size].copy_from_slice(&out_batch[..key_size]);
     }
 }
 
@@ -850,7 +895,6 @@ mod tests {
     /// BPF_FETCH) over all SHF_EXECINSTR sections.
     fn scan_bpf_atomics(elf: &[u8]) -> (usize, usize) {
         let u16_at = |o: usize| u16::from_le_bytes(elf[o..o + 2].try_into().unwrap());
-        let u32_at = |o: usize| u32::from_le_bytes(elf[o..o + 4].try_into().unwrap());
         let u64_at = |o: usize| u64::from_le_bytes(elf[o..o + 8].try_into().unwrap());
         assert_eq!(&elf[..4], b"\x7fELF", "not an ELF object");
         assert_eq!(elf[4], 2, "expected ELF64");

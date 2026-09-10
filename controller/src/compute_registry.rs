@@ -298,6 +298,14 @@ impl ComputeRegistry {
             .collect()
     }
 
+    /// Containers registered in EITHER tier. An opted-out pod resolved
+    /// into the identity tier is a success of the resolution path, so
+    /// the startup self-check counts it.
+    pub fn resolved_containers(&self) -> usize {
+        let g = self.read();
+        g.containers.len() + g.identity.len()
+    }
+
     /// A sampled container by cgroup id.
     pub fn lookup_cgroup(&self, cgroup_id: u64) -> Option<Arc<ContainerCompute>> {
         self.read().containers.get(&cgroup_id).map(Arc::clone)
@@ -476,11 +484,14 @@ pub fn parse_oci_cgroups_path(json: &[u8]) -> Option<String> {
         .map(String::from)
 }
 
-/// Ask containerd for a container's OCI spec and return its
-/// `linux.cgroupsPath`. Same socket, connect ceiling and RPC ceiling as
-/// the netns path's `Tasks.Get`. `None` on any failure; the caller
-/// falls through to the filesystem search.
-pub async fn containerd_cgroups_path(container_id: &str) -> Option<String> {
+/// Resolve a container's host pid AND its OCI `linux.cgroupsPath` over
+/// ONE containerd channel: `Tasks.Get` (the netns path's own
+/// `PodInspect::get_pid`, same RPC ceiling) followed by
+/// `Containers.Get` on the same connection, so a wedged daemon costs
+/// one connect ceiling per container, not two. `None` pid means the
+/// container is skipped; a `None` cgroups path falls through to the
+/// filesystem search.
+pub async fn resolve_pid_and_cgroups_path(container_id: &str) -> Option<(u32, Option<String>)> {
     use containerd_client::services::v1::{
         containers_client::ContainersClient, GetContainerRequest,
     };
@@ -492,24 +503,31 @@ pub async fn containerd_cgroups_path(container_id: &str) -> Option<String> {
         crate::container::CONNECT_TIMEOUT,
     )
     .await?;
+    let inspect = crate::PodInspect {
+        container_id: Some(container_id.to_string()),
+        ..Default::default()
+    }
+    .get_pid(channel.clone())
+    .await;
+    let pid = inspect.pid?;
+
     let mut client = ContainersClient::new(channel);
     let req = GetContainerRequest {
         id: container_id.to_string(),
     };
     let req = with_namespace!(req, "k8s.io");
-    let resp = match tokio::time::timeout(crate::container::RPC_TIMEOUT, client.get(req)).await {
-        Ok(Ok(r)) => r,
+    let spec = match tokio::time::timeout(crate::container::RPC_TIMEOUT, client.get(req)).await {
+        Ok(Ok(r)) => r.into_inner().container.and_then(|c| c.spec),
         Ok(Err(e)) => {
             debug!(container_id, error = %e, "containerd Containers.Get failed");
-            return None;
+            None
         }
         Err(_) => {
             debug!(container_id, "containerd Containers.Get timed out");
-            return None;
+            None
         }
     };
-    let spec = resp.into_inner().container?.spec?;
-    parse_oci_cgroups_path(&spec.value)
+    Some((pid, spec.and_then(|a| parse_oci_cgroups_path(&a.value))))
 }
 
 /// Bounded search under `<root>/kubepods*` for a cgroup directory whose
@@ -870,6 +888,11 @@ mod tests {
         assert!(r.lookup_cgroup(200).is_none());
         let id = r.lookup_identity(200).unwrap();
         assert_eq!(id.container_uid(), "bully/worker");
+        assert_eq!(
+            r.resolved_containers(),
+            1,
+            "identity entries count as resolved"
+        );
         assert_eq!(
             r.container_for("bully", "worker").map(|(_, t)| t),
             Some(Tier::IdentityOnly)

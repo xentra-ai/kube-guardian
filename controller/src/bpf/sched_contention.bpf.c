@@ -3,7 +3,7 @@
 //
 // Design: docs/design/compute-contention-monitoring.md, D4. The shape
 // is Netflix's runq.latency + sched.switch.out split, with the bcc
-// runqlat fixes (re-timestamp a preempted `prev`; latest wakeup wins)
+// runqlat fix (re-timestamp a preempted `prev`)
 // and the corrections the olga-mir reference needed: typed BPF_PROG()
 // arguments instead of a hand-cast ctx, a sched_wakeup_new hook so
 // forked tasks are not orphaned, a sched_process_exit hook so dead pids
@@ -49,12 +49,14 @@ _Static_assert(sizeof(struct pair_value) == 16, "pair_value is 16 bytes on the w
 //
 // No registration generation is folded into this key, unlike inode_num
 // (helper.h KG_GEN_SHIFT). A cgroup v2 id IS kernfs_node.id, which on
-// 64-bit kernels is `ino | (generation << 32)`: the kernfs idr bumps the
-// generation every time an inode number is recycled (kernfs_id_gen /
-// kernfs_gen), so a replacement pod landing on a reused ino still gets
-// a different u64 here and cannot inherit its predecessor's rows. The
-// design doc's "same generation discipline" is therefore satisfied by
-// the key itself.
+// 64-bit kernels is `ino | (id_highbits << 32)` (fs/kernfs/dir.c,
+// __kernfs_new_node): the low 32 bits come from a CYCLIC idr, so an
+// inode number is not handed out again until the allocator has walked
+// through the whole 31-bit space and wrapped, and on each wrap
+// kernfs_root.id_highbits increments. A u64 id therefore never repeats
+// within one boot, however many pods come and go, and a replacement
+// pod cannot inherit its predecessor's rows. The design doc's "same
+// generation discipline" is satisfied by the key itself.
 struct
 {
     __uint(type, BPF_MAP_TYPE_HASH);
@@ -164,14 +166,21 @@ static __always_inline u32 task_state(struct task_struct *t)
     return (u32)BPF_CORE_READ(to, state);
 }
 
-// True when the task is currently executing on a CPU. `on_cpu` exists
-// only under CONFIG_SMP; on a UP kernel nothing can be woken while it
-// runs in the sense that matters here, so the answer is "no".
+// True when the task is currently executing on a CPU.
+//
+// `on_cpu` exists only under CONFIG_SMP. On a UP kernel the only task
+// that can be "on a CPU" while this probe runs is the one the probe
+// interrupted, which is `current` — so the fallback compares against
+// bpf_get_current_task(). That comparison is also kept on SMP: an
+// IRQ-context wakeup of the interrupted task takes the `p == current`
+// path in try_to_wake_up() and fires sched_wakeup, and `current` is
+// on-CPU by definition, so the two tests agree and the second costs
+// one helper call only on the rare path where on_cpu is unavailable.
 static __always_inline bool task_on_cpu(struct task_struct *t)
 {
-    if (!bpf_core_field_exists(t->on_cpu))
-        return false;
-    return BPF_CORE_READ(t, on_cpu) != 0;
+    if (bpf_core_field_exists(t->on_cpu))
+        return BPF_CORE_READ(t, on_cpu) != 0;
+    return (u64)t == bpf_get_current_task();
 }
 
 // cgroup v2 id via the probe-read path: task->cgroups->dfl_cgrp->kn->id.
@@ -239,14 +248,24 @@ static __always_inline u32 runq_bucket(u64 lat_ns)
 //    TASK_INTERRUPTIBLE ahead of schedule() and a wakeup landed in the
 //    window (ttwu_runnable() -> ttwu_do_wakeup() whenever
 //    task_on_rq_queued(); also the p == current self-wake path). It
-//    then carries on running, never switches in, and an entry stamped
-//    now would be popped by its NEXT switch-in — after it has run,
+//    then carries on running and never switches in, so a stamp taken
+//    now would survive until its NEXT switch-in — after it has run,
 //    blocked for real and been woken again — charging the run and the
-//    sleep to run-queue latency. With a keep-oldest policy that stale
-//    stamp also survived the genuine wakeup, and the result was a
-//    phantom multi-second p99 in the victim's histogram and a bogus
-//    pair. Hence: ignore wakeups of an on-CPU task, and let the latest
-//    wakeup win (BPF_ANY, bcc runqlat semantics).
+//    sleep to run-queue latency: a phantom multi-second p99 in the
+//    victim's histogram and a bogus pair. Hence the guard: a wakeup of
+//    a task that is on a CPU (or is `current`, which covers the
+//    CONFIG_SMP=n case) is ignored.
+//
+//  - With that guard every stamp that exists belongs to a task that is
+//    genuinely queued, and it is popped by its switch-in or deleted by
+//    its exit — no stale stamp can survive. So BPF_NOEXIST is the right
+//    policy: a task that was preempted between set_current_state() and
+//    schedule() is stamped at the preemption (handle_switch, `preempt`
+//    branch) while still queued with state != RUNNING; the wakeup that
+//    then lands via ttwu_runnable() is NOT on-CPU and does fire
+//    sched_wakeup. Letting that later wakeup win would throw away the
+//    preemption-to-wakeup part of a real wait, which is precisely the
+//    neighbour-induced portion.
 //
 // Not measured, same as bcc: wake-list IPI latency. sched_wakeup fires
 // on the CPU that finally enqueues the task (ttwu_do_activate), so time
@@ -261,7 +280,7 @@ static __always_inline int handle_wakeup(struct task_struct *p)
         return 0;
 
     u64 ts = bpf_ktime_get_ns();
-    bpf_map_update_elem(&runq_enqueued, &pid, &ts, BPF_ANY);
+    bpf_map_update_elem(&runq_enqueued, &pid, &ts, BPF_NOEXIST);
     return 0;
 }
 

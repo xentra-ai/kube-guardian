@@ -126,7 +126,7 @@ impl PodInspect {
         self
     }
 
-    async fn get_pid(self, channel: Channel) -> Self {
+    pub(crate) async fn get_pid(self, channel: Channel) -> Self {
         self.get_pid_bounded(channel, RPC_TIMEOUT).await
     }
 
