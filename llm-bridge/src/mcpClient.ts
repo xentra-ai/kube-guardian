@@ -3,7 +3,7 @@ import type { ToolCall, ToolResult } from "./types/index.js";
 import { TOOL_DEFS } from "./tools/registry.js";
 import { executeInProcessTool } from "./tools/execute.js";
 
-// the assistant's 12 tools run IN-PROCESS here — this class no
+// the assistant's tools run IN-PROCESS here — this class no
 // longer talks to a separate mcp-server over MCP transport. It reaches the
 // broker directly and generates network policies / seccomp profiles itself
 // (src/tools/*), so neither the mcp-server nor the advisor-serve service is
@@ -93,13 +93,19 @@ IMPORTANT: You have access to tools that fetch real-time data from the cluster. 
 - generate_network_policy: Generate a least-privilege NetworkPolicy or CiliumNetworkPolicy (YAML) for a pod. Use when the user asks to generate/create a network policy or lock down a pod. Pass policy_type 'cilium' only if the user asks for Cilium. Present the YAML in a fenced \`\`\`yaml code block so the user can copy or apply it.
 - generate_seccomp_profile: Generate a least-privilege seccomp profile (JSON) for a pod. Use when the user asks to generate/create a seccomp profile. Present the JSON in a fenced \`\`\`json code block.
 
+**Compute / Noisy-Neighbour Tools** (CPU, memory and scheduler contention — nothing to do with network traffic):
+- get_pod_compute: Live per-container CPU usage vs request/limit, throttling, PSI pressure, memory working set, run-queue latency and blame list, plus a 60-minute history summary. Requires namespace AND pod_name. THE first tool for "why is pod X slow / starved / throttled / under memory pressure".
+- get_compute_findings: Broker-computed findings — noisy-neighbor (names the culprit and its blame share), cpu-contended, cpu-throttled (the pod's OWN limit is the cause; no culprit), memory-pressure, memory-limit-thrash. Optional namespace and/or node filter; none = whole cluster. THE tool for "who is the noisy neighbour", "what is starving X", "which pods are throttled", "any compute problems".
+- get_node_contention: Raw culprit → victim pre-emption pairs on one node (count, wait time). Requires node; optional minutes (default 5). Use to rank every bully on a node or explain a finding's blame.
+
 ## Constraints
-- Pod-specific tools take only pod_name — do NOT pass namespace to them.
-- Cluster, service, and audit tools accept an optional "namespace" parameter to scope results.`;
+- Network pod-specific tools take only pod_name — do NOT pass namespace to them. get_pod_compute is the exception: it needs namespace and pod_name.
+- Cluster, service, and audit tools accept an optional "namespace" parameter to scope results.
+- For "why is X slow" questions call get_pod_compute, then get_compute_findings for the same namespace, and answer from the evidence (throttled_ratio, PSI, runq p99, blame share). Do not guess a culprit the tools did not name.`;
 
     if (context?.namespace) {
       prompt += `\n\n## Current Context
-The user is viewing namespace "${context.namespace}". ALWAYS pass namespace="${context.namespace}" to get_cluster_traffic, get_cluster_pods, list_services, and get_audit_verdicts unless the user explicitly asks for all namespaces.`;
+The user is viewing namespace "${context.namespace}". ALWAYS pass namespace="${context.namespace}" to get_cluster_traffic, get_cluster_pods, list_services, get_audit_verdicts, get_compute_findings and get_pod_compute unless the user explicitly asks for all namespaces.`;
     }
 
     if (context?.podNames && context.podNames.length > 0) {

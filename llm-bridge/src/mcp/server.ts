@@ -15,7 +15,7 @@ import { TOOL_DEFS } from "../tools/registry.js";
 import { executeInProcessTool } from "../tools/execute.js";
 
 /**
- * The MCP protocol layer: the same 12 tools the assistant runs in-process,
+ * The MCP protocol layer: the same tools the assistant runs in-process,
  * spoken as MCP so external clients (Claude Code, for one) can call them.
  *
  * This uses the SDK's LOW-LEVEL `Server` with raw request handlers rather
@@ -100,9 +100,11 @@ export function createMcpServer(): Server {
       instructions:
         "kguardian exposes observed Kubernetes runtime behaviour: pod network traffic, " +
         "syscalls, service and pod inventory, network-policy audit verdicts, and generation " +
-        "of least-privilege NetworkPolicy / seccomp profiles from that observed baseline. " +
-        "Pod-specific tools take only pod_name, never a namespace; cluster-wide tools accept " +
-        "an optional namespace filter.",
+        "of least-privilege NetworkPolicy / seccomp profiles from that observed baseline, plus " +
+        "live compute gauges and noisy-neighbour findings (CPU starvation, throttling, memory " +
+        "pressure, scheduler contention blame). " +
+        "Network pod-specific tools take only pod_name, never a namespace; cluster-wide tools accept " +
+        "an optional namespace filter; get_pod_compute requires namespace and pod_name.",
     },
   );
 

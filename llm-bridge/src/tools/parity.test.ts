@@ -37,7 +37,26 @@ const CALLS: Record<string, Record<string, unknown>> = {
   get_audit_verdicts: {},
   generate_network_policy: { pod_name: "web-1" },
   generate_seccomp_profile: { pod_name: "web-1" },
+  get_pod_compute: { namespace: "default", pod_name: "web-1" },
+  get_compute_findings: {},
+  get_node_contention: { node: "node-a" },
 };
+
+// The compute tools post-date the retired mcp-server, so the shared contract
+// fixtures carry no routes or goldens for them. They are served from this
+// local fixture table (keyed by path, query string stripped like the rest)
+// and wiring-checked only; their summariser and URL construction are
+// unit-tested in compute.test.ts.
+const COMPUTE_FIXTURES: Record<string, unknown> = {
+  "/compute/latest": {
+    containers: [{ container_uid: "uid-web-1/web", pod_uid: "uid-web-1", pod_name: "web-1", namespace: "default", container: "web", node: "node-a", cpu_usage_millis: 120.5, blame: [] }],
+    nodes: [{ node: "node-a", cpu_cores: 8, contention_loaded: true }],
+  },
+  "/compute/history/uid-web-1": { rows: [{ container_uid: "uid-web-1/web", container: "web", ts: "2026-09-10T02:41:00", cpu_usage_millis_avg: 100, cpu_usage_millis_max: 150, cpu_nr_periods: 600, cpu_nr_throttled: 6 }] },
+  "/compute/findings": { findings: [] },
+  "/compute/contention": { pairs: [] },
+};
+const COMPUTE_TOOLS = new Set(["get_pod_compute", "get_compute_findings", "get_node_contention"]);
 
 // Both generate_* tools now run IN-PROCESS rather than proxying to the
 // advisor. Their output correctness is proven exhaustively by the G2 generator
@@ -53,7 +72,7 @@ before(async () => {
   server = http.createServer((req, res) => {
     const urlPath = (req.url || "").split("?")[0];
     // Advisor generate endpoints are keyed in fixtures without the query string.
-    const body = fixtures[urlPath];
+    const body = fixtures[urlPath] ?? COMPUTE_FIXTURES[urlPath];
     if (body === undefined) { res.writeHead(404); res.end(); return; }
     if (typeof body === "string") { res.writeHead(200, { "Content-Type": "text/plain" }); res.end(body); return; }
     res.writeHead(200, { "Content-Type": "application/json" }); res.end(JSON.stringify(body));
@@ -78,6 +97,12 @@ for (const [tool, args] of Object.entries(CALLS)) {
     if (GENERATED_TOOLS.has(tool)) {
       // In-process generator: wiring check only (correctness is G2's job).
       assert.ok(got.text.length > 0, `${tool} produced empty output`);
+      return;
+    }
+    if (COMPUTE_TOOLS.has(tool)) {
+      // No mcp-server golden exists; assert the wiring reached the broker
+      // fixture and produced parseable JSON (shape is compute.test.ts's job).
+      assert.ok(typeof JSON.parse(got.text) === "object", `${tool} did not return JSON`);
       return;
     }
     // Broker data tool: strict semantic comparison against the mcp-server golden.
