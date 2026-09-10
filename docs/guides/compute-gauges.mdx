@@ -120,7 +120,9 @@ Traffic and syscalls stay on manual refresh.
 
 A pod with no gauge shows a muted dot instead, and the dot's tooltip says
 why: **off** (the node's controller reports `compute.enabled` false — a
-disabled controller still posts a heartbeat), **pending** (`no compute
+disabled controller still posts a heartbeat; when *every* node reports it
+off, the compute layer is hidden and pods look exactly as they did before
+the feature), **pending** (`no compute
 sample yet`: the pod's first sample has not arrived, it is opted out, or
 its controller predates the feature), or **unsupported** (the node is
 cgroup v1 or has no PSI).

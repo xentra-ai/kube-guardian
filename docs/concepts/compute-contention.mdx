@@ -181,8 +181,11 @@ enabled and supported on that node and whether the scheduler probe attached.
   Without it the probe does not load, the node reports
   `contention_loaded: false` and keeps its gauges and stall findings; it
   just never produces a `noisy-neighbor`.
-- **A node with no compute row at all** is either running with
-  `compute.enabled=false` or a controller older than this feature.
+- **A node with no compute row at all** is running a controller older
+  than this feature (a disabled controller still posts a heartbeat that
+  says `compute.enabled` is false). When every node reports the feature
+  disabled, the map hides the compute layer and pods render exactly as
+  they did before.
 
 ## Overhead
 

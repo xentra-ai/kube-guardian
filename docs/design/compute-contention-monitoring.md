@@ -473,8 +473,12 @@ travels with every node sample into `node_compute_latest` instead:
 `contention_loaded` (`tp_btf` attach succeeded; requires kernel BTF). The UI reads
 `node_compute_latest` to render a node's pods without gauges and a tooltip
 that says *why* (feature off vs cgroup v1 vs probe failed), instead of an
-empty bar. A node that has no `node_compute_latest` row at all is "feature
-off or controller older than this feature".
+empty bar. A disabled controller still posts a node-only heartbeat every
+five minutes with `compute_enabled=false`, so a node that has no
+`node_compute_latest` row at all is "controller older than this feature"
+(or a heartbeat that has not arrived yet). When every node reports
+`compute_enabled=false` the UI hides the compute layer entirely and pods
+render exactly as before the feature.
 
 ## Data model
 
