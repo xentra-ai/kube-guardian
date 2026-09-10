@@ -623,11 +623,13 @@ pub async fn get_compute_findings(
             history_disabled: true,
         }));
     }
-    let _permit = match budget
-        .acquire(cost_kib(
-            FINDINGS_HISTORY_ROW_CAP + FINDINGS_PAIR_ROW_CAP + FINDINGS_MAX_VICTIMS,
-            COMPUTE_ROW_COST_BYTES,
-        ))
+    // First permit, before any DB access: the victim-scope query only
+    // (501 rows + one count). The heavy reads are charged separately
+    // below, sized to what the scope actually contains, so a cluster-
+    // wide poll on a small cluster does not reserve the 33 MiB worst
+    // case and shed the reads next to it.
+    let _scope_permit = match budget
+        .acquire(cost_kib(FINDINGS_MAX_VICTIMS + 1, COMPUTE_ROW_COST_BYTES))
         .await
     {
         Ok(p) => p,
@@ -635,9 +637,31 @@ pub async fn get_compute_findings(
     };
     let thresholds = ComputeThresholds::from_env();
     let cutoff = chrono::Utc::now().naive_utc() - chrono::Duration::minutes(WINDOW_MINUTES);
+    let scope_pool = pool.clone();
+    let victims = web::block(move || -> Result<FindingsVictims, DbError> {
+        let mut conn = scope_pool.get()?;
+        load_findings_victims(&mut conn, ns, node, cutoff)
+    })
+    .await?
+    .map_err(actix_web::error::ErrorInternalServerError)?;
+    if victims.victims.is_empty() {
+        return Ok(HttpResponse::Ok().json(FindingsResponse {
+            findings: Vec::new(),
+            truncated: victims.truncated,
+            victims_evaluated: 0,
+            history_disabled: false,
+        }));
+    }
+    // Second permit, sized to the real scope. Refused (503) if it does
+    // not fit — never a partial engine input.
+    let rows = findings_scope_rows(victims.victims.len() as i64, victims.containers_on_nodes);
+    let _rows_permit = match budget.acquire(cost_kib(rows, COMPUTE_ROW_COST_BYTES)).await {
+        Ok(p) => p,
+        Err(shed) => return Ok(shed.into_response()),
+    };
     let scope = web::block(move || -> Result<FindingsScope, DbError> {
         let mut conn = pool.get()?;
-        load_findings_scope(&mut conn, ns, node, cutoff)
+        load_findings_rows(&mut conn, victims, cutoff)
     })
     .await?
     .map_err(actix_web::error::ErrorInternalServerError)?;
@@ -681,27 +705,52 @@ struct VictimRef {
     node: String,
 }
 
-/// Load the engine's input for one call.
-///
-/// 1. Victims: every container with minute rows in the window that
-///    matches the scope (`namespace=` / `node=`; none = cluster),
-///    ordered by `container_uid`, capped at [`FINDINGS_MAX_VICTIMS`]
-///    (one extra row is fetched to detect the cap).
-/// 2. History: for every container on the victims' NODES (culprits are
-///    cross-namespace; the memory heuristic needs the whole node), the
-///    newest [`FINDINGS_ROWS_PER_CONTAINER`] minute rows each, under
-///    [`FINDINGS_HISTORY_ROW_CAP`].
-/// 3. Pairs: for each victim, the top [`FINDINGS_PAIRS_PER_VICTIM`] by
-///    wait in the window, under [`FINDINGS_PAIR_ROW_CAP`].
-/// 4. The nodes' `node_compute_latest` rows.
-///
-/// Hitting any cap sets `truncated`.
-pub fn load_findings_scope(
+/// Step one of a findings call: who is in scope and how much the heavy
+/// read will cost.
+pub struct FindingsVictims {
+    /// Sorted, deduplicated, capped at [`FINDINGS_MAX_VICTIMS`].
+    pub victims: Vec<String>,
+    pub truncated: bool,
+    /// Nodes hosting the victims.
+    pub node_names: Vec<String>,
+    /// Distinct containers with minute rows on those nodes in the window
+    /// — what the history read will actually return rows for.
+    pub containers_on_nodes: i64,
+}
+
+/// Rows the heavy read can return for a scope, and so what it is
+/// charged: [`FINDINGS_ROWS_PER_CONTAINER`] per container on the
+/// victims' nodes (never fewer than the victims themselves) plus
+/// [`FINDINGS_PAIRS_PER_VICTIM`] per victim, each under its cap. Pure.
+pub(crate) fn findings_scope_rows(victims: i64, containers_on_nodes: i64) -> i64 {
+    let containers = containers_on_nodes.max(victims).max(1);
+    let history = containers
+        .saturating_mul(FINDINGS_ROWS_PER_CONTAINER)
+        .min(FINDINGS_HISTORY_ROW_CAP);
+    let pairs = victims
+        .max(0)
+        .saturating_mul(FINDINGS_PAIRS_PER_VICTIM)
+        .min(FINDINGS_PAIR_ROW_CAP);
+    history + pairs
+}
+
+#[derive(diesel::QueryableByName)]
+struct CountRow {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    n: i64,
+}
+
+/// Victims: every container with minute rows in the window that matches
+/// the scope (`namespace=` / `node=`; none = cluster), ordered by
+/// `container_uid`, capped at [`FINDINGS_MAX_VICTIMS`] (one extra row is
+/// fetched to detect the cap); plus their nodes and a count of the
+/// containers on those nodes, which sizes the second permit.
+pub fn load_findings_victims(
     conn: &mut PgConnection,
     ns: Option<String>,
     node: Option<String>,
     cutoff: NaiveDateTime,
-) -> Result<FindingsScope, DbError> {
+) -> Result<FindingsVictims, DbError> {
     use diesel::sql_types::{Array, BigInt, Nullable, Text, Timestamp};
 
     let victim_refs = diesel::sql_query(
@@ -717,13 +766,65 @@ pub fn load_findings_scope(
     .bind::<Nullable<Text>, _>(node)
     .bind::<BigInt, _>(FINDINGS_MAX_VICTIMS + 1)
     .load::<VictimRef>(conn)?;
-    let (victims, mut truncated) = cap_victims(
+    let (victims, truncated) = cap_victims(
         victim_refs
             .iter()
             .map(|v| v.container_uid.clone())
             .collect(),
         FINDINGS_MAX_VICTIMS,
     );
+    let mut node_names: Vec<String> = victim_refs
+        .iter()
+        .filter(|v| victims.binary_search(&v.container_uid).is_ok())
+        .map(|v| v.node.clone())
+        .collect();
+    node_names.sort();
+    node_names.dedup();
+    let containers_on_nodes = if node_names.is_empty() {
+        0
+    } else {
+        // Served by the (node, ts DESC) index; cheap next to the read it
+        // sizes.
+        diesel::sql_query(
+            "SELECT COUNT(DISTINCT container_uid) AS n FROM pod_compute_history \
+             WHERE resolution_secs = 60 AND ts >= $1 AND node = ANY($2)",
+        )
+        .bind::<Timestamp, _>(cutoff)
+        .bind::<Array<Text>, _>(&node_names)
+        .get_result::<CountRow>(conn)?
+        .n
+    };
+    Ok(FindingsVictims {
+        victims,
+        truncated,
+        node_names,
+        containers_on_nodes,
+    })
+}
+
+/// Step two: the engine's input for the scope.
+///
+/// - History: for every container on the victims' NODES (culprits are
+///   cross-namespace; the memory heuristic needs the whole node), the
+///   newest [`FINDINGS_ROWS_PER_CONTAINER`] minute rows each, under
+///   [`FINDINGS_HISTORY_ROW_CAP`].
+/// - Pairs: for each victim, the top [`FINDINGS_PAIRS_PER_VICTIM`] by
+///   wait in the window, under [`FINDINGS_PAIR_ROW_CAP`].
+/// - The nodes' `node_compute_latest` rows.
+///
+/// Hitting either cap sets `truncated`.
+pub fn load_findings_rows(
+    conn: &mut PgConnection,
+    scope: FindingsVictims,
+    cutoff: NaiveDateTime,
+) -> Result<FindingsScope, DbError> {
+    use diesel::sql_types::{Array, BigInt, Text, Timestamp};
+    let FindingsVictims {
+        victims,
+        mut truncated,
+        node_names,
+        ..
+    } = scope;
     if victims.is_empty() {
         return Ok(FindingsScope {
             victims,
@@ -733,13 +834,6 @@ pub fn load_findings_scope(
             nodes: Vec::new(),
         });
     }
-    let mut node_names: Vec<String> = victim_refs
-        .iter()
-        .filter(|v| victims.binary_search(&v.container_uid).is_ok())
-        .map(|v| v.node.clone())
-        .collect();
-    node_names.sort();
-    node_names.dedup();
 
     // `SELECT *` on the ranked subquery also yields `rn`; QueryableByName
     // reads columns by name and ignores it.
@@ -895,6 +989,33 @@ mod tests {
             FINDINGS_MAX_CONTAINERS * FINDINGS_ROWS_PER_CONTAINER
         );
         const { assert!(FINDINGS_MAX_CONTAINERS >= FINDINGS_MAX_VICTIMS) };
+    }
+
+    #[test]
+    fn findings_scope_rows_scale_with_the_real_scope() {
+        // A 20-container namespace on nodes holding 80 containers: 80 x 6
+        // history rows + 20 x 30 pairs, not the 33 000-row worst case.
+        assert_eq!(findings_scope_rows(20, 80), 80 * 6 + 20 * 30);
+        // Containers on the nodes can never be fewer than the victims
+        // (they ARE on those nodes); a stale count is floored.
+        assert_eq!(findings_scope_rows(20, 0), 20 * 6 + 20 * 30);
+        // Empty scope still charges one container's rows.
+        assert_eq!(findings_scope_rows(0, 0), FINDINGS_ROWS_PER_CONTAINER);
+        // Both halves are capped independently.
+        assert_eq!(
+            findings_scope_rows(FINDINGS_MAX_VICTIMS, 1_000_000),
+            FINDINGS_HISTORY_ROW_CAP + FINDINGS_PAIR_ROW_CAP
+        );
+        assert_eq!(
+            findings_scope_rows(1_000_000, 1),
+            FINDINGS_HISTORY_ROW_CAP + FINDINGS_PAIR_ROW_CAP
+        );
+        // The worst case equals what the single up-front permit used to
+        // charge (minus the victim-scope permit taken separately).
+        assert_eq!(
+            findings_scope_rows(FINDINGS_MAX_VICTIMS, FINDINGS_MAX_CONTAINERS),
+            FINDINGS_HISTORY_ROW_CAP + FINDINGS_PAIR_ROW_CAP
+        );
     }
 
     #[test]

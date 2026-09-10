@@ -114,6 +114,12 @@ pub struct BpfOccupancy {
     pub runq_hist: i64,
     #[serde(default)]
     pub pair: i64,
+    /// Cumulative failed `runq_hist` / `pair` map updates since probe
+    /// load (dropped samples); `None` from an older controller.
+    #[serde(default)]
+    pub hist_update_failures: Option<i64>,
+    #[serde(default)]
+    pub pair_update_failures: Option<i64>,
 }
 
 /// One container's 5 s sample.
@@ -507,6 +513,11 @@ pub struct NodeComputeLatest {
     pub unknown_blame_share: f64,
     #[serde(with = "utc_ts")]
     pub updated_at: NaiveDateTime,
+    /// Cumulative BPF map insert failures since probe load — the
+    /// "loss shows up as a number" guarantee. NULL = older controller.
+    /// Last: positional Queryable.
+    pub bpf_hist_update_failures: Option<i64>,
+    pub bpf_pair_update_failures: Option<i64>,
 }
 
 impl NodeComputeLatest {
@@ -530,6 +541,8 @@ impl NodeComputeLatest {
             bpf_pair: batch.bpf_occupancy.pair,
             unknown_blame_share: batch.unknown_blame_share,
             updated_at: now,
+            bpf_hist_update_failures: batch.bpf_occupancy.hist_update_failures,
+            bpf_pair_update_failures: batch.bpf_occupancy.pair_update_failures,
         }
     }
 }
@@ -908,6 +921,25 @@ mod tests {
         let node = NodeComputeLatest::from_batch(&batch, now);
         assert_eq!(node.cpu_cores, 32);
         assert!(!node.contention_loaded);
+        // The contract example carries no failure counters → NULL.
+        assert_eq!(node.bpf_hist_update_failures, None);
+        assert_eq!(node.bpf_pair_update_failures, None);
+    }
+
+    #[test]
+    fn bpf_update_failures_round_trip_to_the_node_row() {
+        let mut v: serde_json::Value = serde_json::from_str(SAMPLE).unwrap();
+        v["bpf_occupancy"]["hist_update_failures"] = serde_json::json!(17);
+        v["bpf_occupancy"]["pair_update_failures"] = serde_json::json!(4200);
+        let batch: ComputeBatch = serde_json::from_value(v).unwrap();
+        let node = NodeComputeLatest::from_batch(&batch, NaiveDateTime::default());
+        assert_eq!(node.bpf_hist_update_failures, Some(17));
+        assert_eq!(node.bpf_pair_update_failures, Some(4200));
+        let out = serde_json::to_value(&node).unwrap();
+        assert_eq!(out["bpf_hist_update_failures"], 17);
+        assert_eq!(out["bpf_pair_update_failures"], 4200);
+        let back: NodeComputeLatest = serde_json::from_value(out).unwrap();
+        assert_eq!(back.bpf_pair_update_failures, Some(4200));
     }
 
     #[test]

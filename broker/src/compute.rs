@@ -882,6 +882,8 @@ mod tests {
             bpf_pair: 0,
             unknown_blame_share: 0.0,
             updated_at: t0(),
+            bpf_hist_update_failures: None,
+            bpf_pair_update_failures: None,
         }
     }
 
