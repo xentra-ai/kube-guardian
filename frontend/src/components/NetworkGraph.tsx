@@ -18,6 +18,7 @@ import { EDGE_COLOR_CONTENTION, buildContentionEdges } from '../utils/contention
 import { hasComputeGauges, nodeHeight } from '../utils/compute';
 import {
   isRectInView,
+  keepOnMap,
   layoutIntent,
   layoutSignatureOf,
   mergeNodeData,
@@ -267,9 +268,7 @@ const NetworkGraphInner: React.FC<NetworkGraphProps> = ({
     // A pod with an active contention edge stays on the map even when the
     // traffic filter would hide it: an edge to nothing explains nothing.
     const contentionIds = showContention ? new Set(contention.edges.flatMap((e) => [e.source, e.target])) : null;
-    const visiblePods = showTraffic
-      ? pods.filter((pod) => (pod.traffic && pod.traffic.length > 0) || contentionIds?.has(pod.id))
-      : pods;
+    const visiblePods = pods.filter((pod) => keepOnMap(pod, showTraffic, contentionIds, hasComputeGauges));
     const culprits = showContention ? contention.externalCulprits : [];
     return [...visiblePods, ...daemonSetPartition.visible, ...culprits];
   }, [pods, daemonSetPartition, showTraffic, showContention, contention]);

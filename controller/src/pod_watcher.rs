@@ -330,7 +330,11 @@ async fn process_pod(
                 IgnoreMapAction::HostNetwork => log_host_network_skip_once(pod, &pod_ip),
                 IgnoreMapAction::None => {}
             }
-            if should_process_pod(&pod.metadata.namespace, excluded_namespaces) {
+            let plan = registration_plan(
+                should_process_pod(&pod.metadata.namespace, excluded_namespaces),
+                compute.is_some(),
+            );
+            if plan.netns {
                 return process_container_ids(
                     &con_ids,
                     pod,
@@ -340,6 +344,16 @@ async fn process_pod(
                     compute,
                 )
                 .await;
+            }
+            if plan.compute {
+                // Excluded namespace: no traffic or syscall tracking (those
+                // feed policies the operator chose not to generate here),
+                // but compute gauges are observation only, and every pod on
+                // the node matters as a possible victim or culprit — the
+                // kguardian namespace itself included.
+                if let Some(ctx) = compute {
+                    register_compute(pod, ctx).await;
+                }
             }
         }
     }
@@ -437,6 +451,25 @@ fn log_host_network_skip_once(pod: &Pod, pod_ip: &str) {
             ip = pod_ip,
             "host-network daemonset pod shares the node IP; not ignoring node traffic"
         );
+    }
+}
+
+/// Which registrations a ready pod gets. `EXCLUDED_NAMESPACES` switches
+/// off the netns registration (traffic + syscalls, the policy inputs)
+/// only; compute sampling follows `COMPUTE_ENABLED` alone, so an excluded
+/// namespace still shows CPU/memory gauges and takes part in noisy-
+/// neighbour attribution. The per-pod opt-out for compute is the
+/// `kguardian.dev/compute: "off"` annotation, handled in `register_compute`.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub struct RegistrationPlan {
+    pub netns: bool,
+    pub compute: bool,
+}
+
+pub fn registration_plan(namespace_tracked: bool, compute_enabled: bool) -> RegistrationPlan {
+    RegistrationPlan {
+        netns: namespace_tracked,
+        compute: compute_enabled,
     }
 }
 
@@ -1538,6 +1571,42 @@ mod tests {
         assert!(parse_lenient_bool("", true));
         assert!(!parse_lenient_bool("   ", false));
         assert!(parse_lenient_bool("2", true));
+    }
+
+    #[test]
+    fn excluded_namespaces_skip_netns_but_keep_compute() {
+        // Tracked namespace, compute on: both.
+        assert_eq!(
+            registration_plan(true, true),
+            RegistrationPlan {
+                netns: true,
+                compute: true
+            }
+        );
+        // Excluded namespace (e.g. kguardian itself): no traffic/syscalls,
+        // but gauges and blame still work.
+        assert_eq!(
+            registration_plan(false, true),
+            RegistrationPlan {
+                netns: false,
+                compute: true
+            }
+        );
+        // Compute off: excluded namespaces register nothing at all.
+        assert_eq!(
+            registration_plan(false, false),
+            RegistrationPlan {
+                netns: false,
+                compute: false
+            }
+        );
+        assert_eq!(
+            registration_plan(true, false),
+            RegistrationPlan {
+                netns: true,
+                compute: false
+            }
+        );
     }
 
     #[test]

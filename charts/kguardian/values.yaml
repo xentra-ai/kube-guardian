@@ -173,7 +173,12 @@ controller:
   #       maxUnavailable: 20%
   updateStrategy: {}
 
-  # -- Namespaces to be excluded from monitoring (comma-separated list)
+  # -- Namespaces excluded from network-flow and syscall capture (the inputs
+  # to NetworkPolicy and seccomp generation). Compute gauges and noisy-
+  # neighbour attribution still cover these namespaces when `compute.enabled`
+  # is on: a pod here still shows CPU/memory and can be a victim or a
+  # culprit. Opt a single pod out of compute with the `kguardian.dev/compute:
+  # "off"` annotation instead.
   excludedNamespaces:
     - kguardian
     - kube-system

@@ -118,3 +118,23 @@ describe('isRectInView', () => {
     expect(isRectInView({ x: 1500, y: 100, width: 240, height: 100 }, { x: -800, y: 0, zoom: 0.5 }, pane)).toBe(false);
   });
 });
+
+import { keepOnMap } from './graphNodes';
+
+describe('keepOnMap (Traffic filter)', () => {
+  const gauges = (c: string | undefined) => c === 'gauges';
+  test('filter off: everything stays', () => {
+    expect(keepOnMap({ id: 'a' }, false, null, gauges)).toBe(true);
+  });
+  test('filter on: pods with flows stay, silent pods without gauges go', () => {
+    expect(keepOnMap({ id: 'a', traffic: [{}] }, true, null, gauges)).toBe(true);
+    expect(keepOnMap({ id: 'a', traffic: [] }, true, null, gauges)).toBe(false);
+  });
+  test('a pod with compute gauges stays even with no flows (excluded namespaces)', () => {
+    expect(keepOnMap({ id: 'kg', traffic: [], compute: 'gauges' }, true, null, gauges)).toBe(true);
+    expect(keepOnMap({ id: 'kg', traffic: [], compute: 'off' }, true, null, gauges)).toBe(false);
+  });
+  test('a pod on a contention edge stays', () => {
+    expect(keepOnMap({ id: 'v', traffic: [] }, true, new Set(['v']), gauges)).toBe(true);
+  });
+});

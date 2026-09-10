@@ -122,7 +122,7 @@ things that are not pods. The finding's `culprit.kind` is one of:
 
 | `kind` | `ref` | Meaning |
 |---|---|---|
-| `pod` | `namespace/pod/container` | Another tracked container on the node. Carries `pod_uid`, `namespace`, `pod_name` so the UI can draw an edge to it. A container kguardian does not track (excluded namespace, or not registered yet) is shown as `pod:<uid8>`. |
+| `pod` | `namespace/pod/container` | Another tracked container on the node. Carries `pod_uid`, `namespace`, `pod_name` so the UI can draw an edge to it. A container the controller has not registered yet (or one it could not resolve) is shown as `pod:<uid8>`. |
 | `system` | a systemd unit, e.g. `system.slice/kubelet.service` | kubelet, the CNI agent, a log shipper. Still actionable. |
 | `kernel` | `kernel` | Kernel threads — softirq, kswapd, writeback. |
 
@@ -155,11 +155,12 @@ in another namespace, and a contention edge on the map can point at a pod
 outside the namespace you selected (drawn as an external node, the same way
 cross-namespace traffic peers are). kguardian is a cluster-scoped operator
 tool and already lists cluster-wide traffic peers; this is documented
-behaviour, not hidden. The broker does not filter findings by namespace
-policy: a namespace in `controller.excludedNamespaces` never registers with
-the controller, so its pods are never sampled and never appear as victims.
-They can still appear as culprits, but only as an untracked `pod:<uid8>`
-reference, never by name.
+behaviour, not hidden. `controller.excludedNamespaces` does not
+apply here: it switches off network-flow and syscall capture (the policy
+inputs) for those namespaces, but compute sampling is observation only, so
+their pods, the `kguardian` namespace included, still show gauges and take
+part in attribution as victims and as culprits by name. The only way to keep
+a pod out of compute is the `kguardian.dev/compute: "off"` annotation.
 
 Per-pod opt-out is the annotation `kguardian.dev/compute: "off"`. An
 opted-out pod is not sampled and has no gauge, but it can still be named as a

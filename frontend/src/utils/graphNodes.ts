@@ -131,3 +131,22 @@ export function isRectInView(
   const bottom = top + rect.height * viewport.zoom;
   return left >= 0 && top >= 0 && right <= pane.width && bottom <= pane.height;
 }
+
+/**
+ * Whether a pod stays on the map while the Traffic filter is on. The filter
+ * hides pods that have no flows, but a pod with compute gauges (or an
+ * active contention edge) is still worth a card: the kguardian namespace
+ * itself, or any excluded namespace, has no traffic by design yet its CPU
+ * and memory matter.
+ */
+export function keepOnMap<C>(
+  pod: { id: string; traffic?: readonly unknown[] | null; compute?: C },
+  showTraffic: boolean,
+  contentionIds: ReadonlySet<string> | null,
+  hasGauges: (compute: C | undefined) => boolean,
+): boolean {
+  if (!showTraffic) return true;
+  if (pod.traffic && pod.traffic.length > 0) return true;
+  if (contentionIds?.has(pod.id)) return true;
+  return hasGauges(pod.compute);
+}

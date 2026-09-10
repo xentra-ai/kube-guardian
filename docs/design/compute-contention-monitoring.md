@@ -552,7 +552,7 @@ A cgroup id that is not in `tracked_cgroups` is resolved by a
 | Path | `kind` | `ref` |
 |---|---|---|
 | `kubepods.slice/…/cri-containerd-<cid>.scope`, tracked | `pod` | `ns/pod/container` |
-| `kubepods.slice/…`, not tracked (excluded namespace, not yet registered) | `pod` | `pod:<uid8>` |
+| `kubepods.slice/…`, not registered yet (or unresolvable) | `pod` | `pod:<uid8>` |
 | `system.slice/<unit>`, `init.scope` | `system` | unit name |
 | id 0 / pid 0 | `kernel` | `kernel` |
 | anything else beside `kubepods` (Talos `podruntime/kubelet`, `system/apid`, `init`; systemd `user.slice/…`) | `system` | last two path components |
@@ -741,7 +741,7 @@ payments/api slow?" from the tools alone.
 | Postgres growth (the `pod_traffic` incident) | Controller-side reduction; `latest` is upsert-bounded; minute rows downsampled to 5-minute after 24 h; 7-day retention pass; read budgets; row estimates in this doc checked against an accelerated-retention run in Phase 1. |
 | Cgroup id generation bits differ by provider (GKE) | `name_to_handle_at` for the userspace side, `kn->id` in BPF — expected to be the same 64-bit value; the Phase 0 exit test compares both against `bpftool cgroup tree` on GKE and Talos, and if they differ the sampler falls back to matching on the low 32 bits with a logged warning. |
 | cgroup v1 / no PSI nodes | Detected in node facts; feature reports unsupported per node; no crash, no empty bars. |
-| Cross-namespace culprit exposure | Documented behaviour of a cluster-scoped tool; excluded namespaces never register with the controller, so they cannot be victims and appear as culprits only as `pod:<uid8>`. |
+| Cross-namespace culprit exposure | Documented behaviour of a cluster-scoped tool. `EXCLUDED_NAMESPACES` only switches off traffic/syscall capture; compute sampling covers every namespace (decision 2026-09-10: the `kguardian` namespace must show gauges too), with the per-pod annotation as the only opt-out. |
 | `NODE_HEIGHT` change disturbs existing layouts / screenshots | Height only changes on expanded nodes; README screenshots re-shot once at Phase 1 with neutral sample data. |
 | A pod without requests is always "eligible" as culprit | Intentional: it is the textbook noisy neighbour. The finding text says "no CPU request set". |
 
