@@ -32,7 +32,7 @@ static REGEX_CONTAINERD: &str = "containerd://(?P<container_id>[0-9a-zA-Z]*)";
 /// socket, or a connector change upstream, puts the hang back — and a
 /// two-second ceiling on a same-node unix socket that a healthy
 /// containerd answers in single-digit milliseconds costs nothing.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Ceiling on the `Tasks.Get` RPC itself, and the load-bearing one.
 ///
@@ -53,7 +53,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 /// does. `tokio::time::timeout` bounds the same await with no new
 /// dependencies and, unlike the transport setting, is exercisable in a
 /// unit test.
-const RPC_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const RPC_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Parse a Kubernetes pod-status containerID URL.
 ///
@@ -75,7 +75,7 @@ pub(crate) fn parse_container_id(s: &str) -> Option<String> {
 /// Trim — a trailing newline from `CONTAINERD_SOCK="/run/...\n"` would
 /// break the unix-socket connect with a confusing "No such file or
 /// directory" error far from the env read.
-fn containerd_sock() -> String {
+pub(crate) fn containerd_sock() -> String {
     std::env::var("CONTAINERD_SOCK")
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|_| "/run/containerd/containerd.sock".to_string())
@@ -87,7 +87,7 @@ fn containerd_sock() -> String {
 /// testable against a socket that accepts and never speaks — the exact
 /// shape that used to park the pod watcher forever. See
 /// [`CONNECT_TIMEOUT`].
-async fn connect_containerd(sock_path: &str, timeout: Duration) -> Option<Channel> {
+pub(crate) async fn connect_containerd(sock_path: &str, timeout: Duration) -> Option<Channel> {
     match tokio::time::timeout(timeout, connect(sock_path)).await {
         Ok(Ok(channel)) => Some(channel),
         Ok(Err(err)) => {

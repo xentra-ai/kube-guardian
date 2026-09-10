@@ -28,7 +28,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chrono::{SecondsFormat, Utc};
@@ -39,8 +38,7 @@ use tracing::{debug, info, warn};
 use crate::client::api_post_call;
 use crate::compute_config::ComputeConfig;
 use crate::compute_registry::{
-    cgroup_id_for_full_path, ComputeMap, ComputeRegistration, ContainerCompute, PodCompute,
-    ResourceSpec,
+    cgroup_id_for_full_path, ComputeMap, ComputeRegistration, ContainerCompute, ResourceSpec,
 };
 use crate::contention::{quantiles_from_hist, ContentionSnapshot, MapOccupancy, PairDelta};
 use crate::error::Error;
@@ -72,6 +70,16 @@ const CGROUP_INDEX_REFRESH: Duration = Duration::from_secs(30);
 pub const CGROUP_INDEX_LIMIT: usize = 20_000;
 /// Fold cadence for the history endpoint.
 const HISTORY_INTERVAL: Duration = Duration::from_secs(60);
+/// Containers per POST. A 1 000-container node must never produce one
+/// body the broker rejects and the queue retries forever.
+pub const MAX_CONTAINERS_PER_POST: usize = 250;
+
+/// How many sample ticks make one history row: `60 / sampleInterval`
+/// (12 at the default 5 s), never fewer than one.
+pub fn fold_size(sample_interval: Duration) -> u32 {
+    let secs = sample_interval.as_secs().max(1);
+    (HISTORY_INTERVAL.as_secs() / secs).max(1) as u32
+}
 /// Pending POSTs held across a broker outage before the oldest are
 /// dropped: two minutes of 5 s samples plus their minute rollups.
 const MAX_PENDING_BATCHES: usize = 30;
@@ -434,6 +442,10 @@ pub struct BpfOccupancy {
     pub runq_enqueued: u64,
     pub runq_hist: u64,
     pub pair: u64,
+    /// Cumulative map-full insert failures since load (additive to the
+    /// contract): any increase means samples were lost in kernel.
+    pub hist_update_failures: u64,
+    pub pair_update_failures: u64,
 }
 
 impl From<&MapOccupancy> for BpfOccupancy {
@@ -442,6 +454,8 @@ impl From<&MapOccupancy> for BpfOccupancy {
             runq_enqueued: m.runq_enqueued,
             runq_hist: m.runq_hist,
             pair: m.pair,
+            hist_update_failures: m.hist_update_failures,
+            pair_update_failures: m.pair_update_failures,
         }
     }
 }
@@ -526,19 +540,6 @@ pub struct ContainerSample {
     pub blame: Vec<BlameEntry>,
 }
 
-/// Pod-level rollup (the pod's own cgroup). Additive to the contract:
-/// carried in a separate `pods` array so `containers` stays exactly one
-/// row per container.
-#[derive(Debug, Clone, Serialize, PartialEq)]
-pub struct PodSample {
-    pub pod_uid: String,
-    pub pod_name: String,
-    pub namespace: String,
-    pub cgroup_id: u64,
-    pub cpu: CpuSample,
-    pub memory: MemSample,
-}
-
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct ComputeBatch {
     pub node: String,
@@ -553,7 +554,6 @@ pub struct ComputeBatch {
     pub bpf_occupancy: BpfOccupancy,
     pub unknown_blame_share: f64,
     pub containers: Vec<ContainerSample>,
-    pub pods: Vec<PodSample>,
 }
 
 // ---------------------------------------------------------------------------
@@ -643,17 +643,6 @@ pub struct HistoryContainer {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
-pub struct HistoryPod {
-    pub pod_uid: String,
-    pub pod_name: String,
-    pub namespace: String,
-    pub cgroup_id: u64,
-    pub samples: u32,
-    pub cpu: HistoryCpu,
-    pub memory: HistoryMem,
-}
-
-#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct HistoryBatch {
     pub node: String,
     pub ts: String,
@@ -668,7 +657,6 @@ pub struct HistoryBatch {
     pub bpf_occupancy: BpfOccupancy,
     pub unknown_blame_share: f64,
     pub containers: Vec<HistoryContainer>,
-    pub pods: Vec<HistoryPod>,
 }
 
 // ---------------------------------------------------------------------------
@@ -756,14 +744,6 @@ impl MinuteAcc {
         }
     }
 
-    fn push_pod(&mut self, s: &PodSample, interval_ms: u64) {
-        self.cgroup_id = s.cgroup_id;
-        self.pod_uid = s.pod_uid.clone();
-        self.pod_name = s.pod_name.clone();
-        self.namespace = s.namespace.clone();
-        self.push_cpu_mem(&s.cpu, &s.memory, interval_ms);
-    }
-
     fn cpu(&self) -> HistoryCpu {
         HistoryCpu {
             usage_usec: self.counters.usage_usec,
@@ -816,18 +796,6 @@ impl MinuteAcc {
             blame,
         }
     }
-
-    fn into_pod(self) -> HistoryPod {
-        HistoryPod {
-            cpu: self.cpu(),
-            memory: self.memory(),
-            pod_uid: self.pod_uid,
-            pod_name: self.pod_name,
-            namespace: self.namespace,
-            cgroup_id: self.cgroup_id,
-            samples: self.n,
-        }
-    }
 }
 
 /// CPU usage as millicores over an interval: µs of CPU per ms of wall.
@@ -839,19 +807,28 @@ pub fn usage_millis(usage_usec: u64, interval_ms: u64) -> f64 {
 }
 
 /// Everything folded since the last history flush.
+///
+/// Closed by the sampler on the Nth sample (see [`fold_size`]), not by
+/// wall clock, so a row labelled `resolution_secs: 60` always holds
+/// exactly N samples and `interval_ms` is the sum of their intervals.
+/// Ticks that produced no container rows are not pushed and do not
+/// count.
 #[derive(Debug, Default)]
 pub struct MinuteFold {
     containers: HashMap<String, MinuteAcc>,
-    pods: HashMap<String, MinuteAcc>,
+    /// Samples folded so far.
+    ticks: u32,
     interval_ms: u64,
     ctxt: GaugeAcc,
     unknown_share: GaugeAcc,
-    started: Option<Instant>,
 }
 
 impl MinuteFold {
     pub fn push(&mut self, batch: &ComputeBatch) {
-        self.started.get_or_insert_with(Instant::now);
+        if batch.containers.is_empty() {
+            return;
+        }
+        self.ticks += 1;
         self.interval_ms += batch.interval_ms;
         self.ctxt.push(batch.ctxt_per_sec);
         self.unknown_share.push(batch.unknown_blame_share);
@@ -861,20 +838,19 @@ impl MinuteFold {
                 .or_default()
                 .push_container(c, batch.interval_ms);
         }
-        for p in &batch.pods {
-            self.pods
-                .entry(p.pod_uid.clone())
-                .or_default()
-                .push_pod(p, batch.interval_ms);
-        }
+    }
+
+    pub fn ticks(&self) -> u32 {
+        self.ticks
     }
 
     pub fn is_empty(&self) -> bool {
-        self.containers.is_empty() && self.pods.is_empty()
+        self.containers.is_empty()
     }
 
-    pub fn age(&self) -> Duration {
-        self.started.map(|s| s.elapsed()).unwrap_or_default()
+    /// `n` samples have been folded: time to close the row.
+    pub fn ready(&self, n: u32) -> bool {
+        self.ticks >= n.max(1)
     }
 
     /// Reduce to a history envelope, taking the node-level fields from
@@ -886,8 +862,6 @@ impl MinuteFold {
             .map(MinuteAcc::into_container)
             .collect();
         containers.sort_by(|a, b| a.container_uid.cmp(&b.container_uid));
-        let mut pods: Vec<HistoryPod> = self.pods.into_values().map(MinuteAcc::into_pod).collect();
-        pods.sort_by(|a, b| a.pod_uid.cmp(&b.pod_uid));
         HistoryBatch {
             node: latest.node.clone(),
             ts: latest.ts.clone(),
@@ -902,9 +876,43 @@ impl MinuteFold {
             bpf_occupancy: latest.bpf_occupancy.clone(),
             unknown_blame_share: self.unknown_share.gauge().avg,
             containers,
-            pods,
         }
     }
+}
+
+/// Split a batch into POSTs of at most `max` containers, each carrying
+/// the full node envelope. An empty batch is one POST (the node row).
+pub fn chunk_batch(batch: ComputeBatch, max: usize) -> Vec<ComputeBatch> {
+    let max = max.max(1);
+    if batch.containers.len() <= max {
+        return vec![batch];
+    }
+    let ComputeBatch { containers, .. } = &batch;
+    let mut out = Vec::with_capacity(containers.len().div_ceil(max));
+    for chunk in containers.chunks(max) {
+        out.push(ComputeBatch {
+            containers: chunk.to_vec(),
+            ..batch.clone()
+        });
+    }
+    out
+}
+
+/// Same as [`chunk_batch`] for the history envelope.
+pub fn chunk_history(batch: HistoryBatch, max: usize) -> Vec<HistoryBatch> {
+    let max = max.max(1);
+    if batch.containers.len() <= max {
+        return vec![batch];
+    }
+    let HistoryBatch { containers, .. } = &batch;
+    let mut out = Vec::with_capacity(containers.len().div_ceil(max));
+    for chunk in containers.chunks(max) {
+        out.push(HistoryBatch {
+            containers: chunk.to_vec(),
+            ..batch.clone()
+        });
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -961,17 +969,17 @@ pub fn pod_uid_from_cgroup_path(path: &str) -> Option<String> {
     None
 }
 
-/// id → relative path for every cgroup under `root`, bounded.
-pub fn build_cgroup_index(root: &Path, limit: usize) -> HashMap<u64, String> {
+/// id → relative path for every cgroup under `root`, bounded. The flag
+/// says whether the bound cut the walk short (the caller logs that
+/// once, not every 30 s).
+pub fn build_cgroup_index(root: &Path, limit: usize) -> (HashMap<u64, String>, bool) {
     let mut index = HashMap::new();
     let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
     let mut visited = 0usize;
+    let mut truncated = false;
     while let Some(dir) = stack.pop() {
         if visited >= limit {
-            warn!(
-                limit,
-                "cgroup index walk hit its bound; culprit resolution is partial"
-            );
+            truncated = true;
             break;
         }
         visited += 1;
@@ -993,7 +1001,7 @@ pub fn build_cgroup_index(root: &Path, limit: usize) -> HashMap<u64, String> {
             }
         }
     }
-    index
+    (index, truncated)
 }
 
 fn resolve_culprit(
@@ -1002,6 +1010,15 @@ fn resolve_culprit(
     index: &HashMap<u64, String>,
 ) -> (&'static str, String, Option<String>) {
     if let Some(c) = registry.lookup_cgroup(id) {
+        return (
+            "pod",
+            format!("{}/{}/{}", c.namespace, c.pod_name, c.container_name),
+            Some(c.container_uid()),
+        );
+    }
+    // Opted-out pods (design D9): not sampled, not tracked, but still
+    // named with their full identity when they are the bully.
+    if let Some(c) = registry.lookup_identity(id) {
         return (
             "pod",
             format!("{}/{}/{}", c.namespace, c.pod_name, c.container_name),
@@ -1124,59 +1141,6 @@ pub fn container_sample(
     }
 }
 
-/// Sum the containers' requests/limits for the pod-level row; `None` as
-/// soon as one container leaves the field unset, because a partial sum
-/// would normalise the gauge against the wrong denominator.
-pub fn pod_resources(containers: &[Arc<ContainerCompute>], pod_uid: &str) -> ResourceSpec {
-    let mut out = ResourceSpec {
-        cpu_request_millis: Some(0),
-        cpu_limit_millis: Some(0),
-        memory_request_bytes: Some(0),
-        memory_limit_bytes: Some(0),
-    };
-    let mut any = false;
-    for c in containers.iter().filter(|c| c.pod_uid == pod_uid) {
-        any = true;
-        let r = &c.resources;
-        out.cpu_request_millis = out
-            .cpu_request_millis
-            .zip(r.cpu_request_millis)
-            .map(|(a, b)| a + b);
-        out.cpu_limit_millis = out
-            .cpu_limit_millis
-            .zip(r.cpu_limit_millis)
-            .map(|(a, b)| a + b);
-        out.memory_request_bytes = out
-            .memory_request_bytes
-            .zip(r.memory_request_bytes)
-            .map(|(a, b)| a + b);
-        out.memory_limit_bytes = out
-            .memory_limit_bytes
-            .zip(r.memory_limit_bytes)
-            .map(|(a, b)| a + b);
-    }
-    if !any {
-        return ResourceSpec::default();
-    }
-    out
-}
-
-pub fn pod_sample(
-    p: &PodCompute,
-    raw: &CgroupRaw,
-    delta: &Counters,
-    res: &ResourceSpec,
-) -> PodSample {
-    PodSample {
-        pod_uid: p.pod_uid.clone(),
-        pod_name: p.pod_name.clone(),
-        namespace: p.namespace.clone(),
-        cgroup_id: p.pod_cgroup_id,
-        cpu: cpu_sample(raw, delta, res),
-        memory: mem_sample(raw, delta, res),
-    }
-}
-
 // ---------------------------------------------------------------------------
 // The sampler
 // ---------------------------------------------------------------------------
@@ -1202,7 +1166,9 @@ pub fn cap_pending(pending: &mut VecDeque<PendingPost>, max: usize) -> usize {
     drop
 }
 
-/// The sampler's whole state, moved into `spawn_blocking` for each tick.
+/// The sampler's whole state. Lives in an `Arc<Mutex<_>>` so a tick that
+/// panics inside `spawn_blocking` leaves the state (poisoned, recovered)
+/// behind rather than dropping it with the task.
 pub struct Sampler {
     cfg: ComputeConfig,
     node: String,
@@ -1215,9 +1181,13 @@ pub struct Sampler {
     last_tick: Option<Instant>,
     cgroup_index: HashMap<u64, String>,
     index_built: Option<Instant>,
+    index_truncated_warned: bool,
     fold: MinuteFold,
+    fold_every: u32,
     /// Set once the probe has been told about every id in the registry.
     tracked_synced: bool,
+    /// The startup self-check has fired (it fires at most once).
+    self_check_done: bool,
 }
 
 impl Sampler {
@@ -1229,6 +1199,7 @@ impl Sampler {
         events: broadcast::Receiver<ComputeRegistration>,
     ) -> Self {
         let supported = compute_supported(&cfg.cgroup_root, &cfg.host_proc);
+        let fold_every = fold_size(cfg.sample_interval);
         Self {
             cfg,
             node,
@@ -1241,8 +1212,11 @@ impl Sampler {
             last_tick: None,
             cgroup_index: HashMap::new(),
             index_built: None,
+            index_truncated_warned: false,
             fold: MinuteFold::default(),
+            fold_every,
             tracked_synced: false,
+            self_check_done: false,
         }
     }
 
@@ -1309,23 +1283,95 @@ impl Sampler {
         }
     }
 
-    fn refresh_index_if_due(&mut self) {
+    /// Rebuild the id → path index now. Returns nothing; the bound
+    /// warning fires once per process, then drops to debug.
+    fn rebuild_index(&mut self, why: &'static str) {
+        let started = Instant::now();
+        let (index, truncated) = build_cgroup_index(&self.cfg.cgroup_root, CGROUP_INDEX_LIMIT);
+        self.cgroup_index = index;
+        self.index_built = Some(started);
+        if truncated {
+            if self.index_truncated_warned {
+                debug!(
+                    limit = CGROUP_INDEX_LIMIT,
+                    "cgroup index walk hit its bound again"
+                );
+            } else {
+                warn!(
+                    limit = CGROUP_INDEX_LIMIT,
+                    "cgroup index walk hit its bound; culprit resolution is partial \
+                     (reported once; further hits at debug)"
+                );
+                self.index_truncated_warned = true;
+            }
+        }
+        debug!(
+            why,
+            entries = self.cgroup_index.len(),
+            took_ms = started.elapsed().as_millis(),
+            "cgroup index rebuilt"
+        );
+    }
+
+    /// Periodic rebuild; only while a probe is loaded, because nothing
+    /// else reads it. Returns whether a rebuild happened this tick.
+    fn refresh_index_if_due(&mut self) -> bool {
         if self.probe.is_none() {
-            return;
+            return false;
         }
         let due = self
             .index_built
             .map(|t| t.elapsed() >= CGROUP_INDEX_REFRESH)
             .unwrap_or(true);
         if due {
-            let started = Instant::now();
-            self.cgroup_index = build_cgroup_index(&self.cfg.cgroup_root, CGROUP_INDEX_LIMIT);
-            debug!(
-                entries = self.cgroup_index.len(),
-                took_ms = started.elapsed().as_millis(),
-                "cgroup index rebuilt"
+            self.rebuild_index("periodic");
+        }
+        due
+    }
+
+    /// Culprit ids this snapshot names that nothing can currently
+    /// resolve: not a registered container in either tier, not the
+    /// kernel, not in the index. An immediate rebuild (at most once per
+    /// tick) resolves cgroups created since the last walk before they
+    /// are written off as `unknown`.
+    fn unresolved_culprits(&self, snapshot: &ContentionSnapshot) -> bool {
+        snapshot.per_victim.values().any(|v| {
+            v.pairs.iter().any(|p| {
+                let id = p.culprit_cgroup_id;
+                id != 0
+                    && !self.cgroup_index.contains_key(&id)
+                    && self.registry.lookup_cgroup(id).is_none()
+                    && self.registry.lookup_identity(id).is_none()
+            })
+        })
+    }
+
+    /// Once, three sample intervals after the watcher first saw an
+    /// eligible pod: if nothing has been registered by then, the
+    /// resolution path is broken on this node and the operator must be
+    /// told at ERROR, not left with an empty UI and debug logs.
+    fn startup_self_check(&mut self) {
+        if self.self_check_done {
+            return;
+        }
+        let Some(first) = self.registry.first_eligible_at() else {
+            return;
+        };
+        if first.elapsed() < self.cfg.sample_interval * 3 {
+            return;
+        }
+        self.self_check_done = true;
+        if self.registry.containers().is_empty() && self.registry.eligible_pods_seen() > 0 {
+            tracing::error!(
+                eligible_pods_seen = self.registry.eligible_pods_seen(),
+                cgroup_root = %self.cfg.cgroup_root.display(),
+                "compute: the pod watcher has seen eligible pods but no container cgroup could be \
+                 resolved, so nothing is sampled. Check that {} is the HOST cgroup v2 root \
+                 (chart mounts /sys/fs/cgroup read-only when compute.enabled), that containerd's \
+                 Containers.Get is reachable on CONTAINERD_SOCK, and the per-container WARN lines \
+                 from the pod watcher (\"could not resolve container cgroup\") for what each route saw.",
+                self.cfg.cgroup_root.display()
             );
-            self.index_built = Some(started);
         }
     }
 
@@ -1388,9 +1434,9 @@ impl Sampler {
         delta.map(|d| (raw, d))
     }
 
-    /// One tick: read everything, build the sample batch and, when a
-    /// minute has elapsed, the history batch. Synchronous IO — call
-    /// from `spawn_blocking`.
+    /// One tick: read everything, build the sample batch and, when the
+    /// fold is full, the history batch. Synchronous IO — call from
+    /// `spawn_blocking`.
     pub fn collect(&mut self) -> (ComputeBatch, Option<HistoryBatch>) {
         let now = Instant::now();
         let interval_ms = self
@@ -1401,25 +1447,34 @@ impl Sampler {
         self.last_tick = Some(now);
 
         self.sync_tracked();
-        self.refresh_index_if_due();
+        let index_rebuilt = self.refresh_index_if_due();
 
         let (node_pressure, node_capacity, ctxt_per_sec) = self.read_node(now);
 
+        // A failed snapshot is not "no wait": this tick ships `runq:
+        // null` and says contention_loaded=false rather than a row of
+        // zeros that reads as a healthy scheduler.
+        let mut snapshot_failed = false;
         let snapshot = match self.probe.as_mut() {
             Some(p) => match p.snapshot() {
                 Ok(s) => Some(s),
                 Err(e) => {
-                    warn!(error = %e, "contention snapshot failed; this sample carries no blame");
+                    warn!(error = %e, "contention snapshot failed; this sample carries no runq/blame");
+                    snapshot_failed = true;
                     None
                 }
             },
             None => None,
         };
-        let contention_loaded = self.probe.is_some();
+        let contention_loaded = self.probe.is_some() && !snapshot_failed;
+        if let Some(snap) = &snapshot {
+            if !index_rebuilt && self.unresolved_culprits(snap) {
+                self.rebuild_index("unresolved culprit");
+            }
+        }
 
         let mut seen: HashSet<u64> = HashSet::new();
         let mut containers = Vec::new();
-        let mut pods = Vec::new();
 
         if self.supported {
             let registered = self.registry.containers();
@@ -1444,19 +1499,9 @@ impl Sampler {
                             .unwrap_or_default();
                         (Some(RunqSample::from_hist(hist)), blame)
                     }
-                    None if contention_loaded => (Some(RunqSample::from_hist([0; 24])), Vec::new()),
                     None => (None, Vec::new()),
                 };
                 containers.push(container_sample(c, &raw, &delta, runq, blame));
-            }
-            for p in self.registry.pods() {
-                seen.insert(p.pod_cgroup_id);
-                let Some((raw, delta)) = self.read_with_delta(p.pod_cgroup_id, &p.pod_cgroup_path)
-                else {
-                    continue;
-                };
-                let res = pod_resources(&registered, &p.pod_uid);
-                pods.push(pod_sample(&p, &raw, &delta, &res));
             }
         }
         // Forget counters for cgroups that are no longer registered.
@@ -1480,17 +1525,14 @@ impl Sampler {
                 .unwrap_or_default(),
             unknown_blame_share: unknown_share,
             containers,
-            pods,
         };
 
+        self.startup_self_check();
+
         self.fold.push(&batch);
-        let history = if self.fold.age() >= HISTORY_INTERVAL && !self.fold.is_empty() {
+        let history = if self.fold.ready(self.fold_every) {
             let fold = std::mem::take(&mut self.fold);
             Some(fold.finish(&batch))
-        } else if self.fold.age() >= HISTORY_INTERVAL {
-            // Nothing sampled this minute; restart the window.
-            self.fold = MinuteFold::default();
-            None
         } else {
             None
         };
@@ -1540,6 +1582,11 @@ async fn flush_pending(pending: &mut VecDeque<PendingPost>) -> usize {
 /// The `compute-sampler` subsystem. Returns `Ok(())` immediately when
 /// the feature is off (`MayRetire`); otherwise runs until the process
 /// does.
+///
+/// A panic inside a tick is logged at ERROR and the tick skipped. The
+/// alternative — letting the `JoinError` propagate — ends the whole
+/// controller, traffic capture included, for a bug in an optional
+/// gauge; a `MayRetire` subsystem must not take capture down.
 pub async fn run(
     cfg: ComputeConfig,
     node: String,
@@ -1552,11 +1599,12 @@ pub async fn run(
         return Ok(());
     }
     let interval = cfg.sample_interval;
-    let mut sampler = Sampler::new(cfg, node, registry, probe, events);
+    let sampler = Sampler::new(cfg, node, registry, probe, events);
     info!(
         interval_secs = interval.as_secs(),
         supported = sampler.supported(),
         contention_loaded = sampler.contention_loaded(),
+        fold_every = sampler.fold_every,
         "compute sampler started"
     );
     if !sampler.supported() {
@@ -1565,6 +1613,7 @@ pub async fn run(
              node samples will report compute_supported=false"
         );
     }
+    let sampler = std::sync::Arc::new(std::sync::Mutex::new(sampler));
 
     let mut pending: VecDeque<PendingPost> = VecDeque::new();
     let mut ticker = tokio::time::interval(interval);
@@ -1573,25 +1622,44 @@ pub async fn run(
     // a node envelope so the broker learns the node is on.
     loop {
         ticker.tick().await;
-        let (returned, batch, history) = tokio::task::spawn_blocking(move || {
-            let (b, h) = sampler.collect();
-            (sampler, b, h)
+        let state = std::sync::Arc::clone(&sampler);
+        let joined = tokio::task::spawn_blocking(move || {
+            // A poisoned mutex is a previous tick's panic; the state is
+            // still the best one available, so recover it.
+            let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+            s.collect()
         })
-        .await?;
-        sampler = returned;
+        .await;
+        let (batch, history) = match joined {
+            Ok(v) => v,
+            Err(e) if e.is_panic() => {
+                tracing::error!(
+                    error = %e,
+                    "compute sampler tick panicked; skipping this sample and continuing"
+                );
+                continue;
+            }
+            Err(e) => return Err(e.into()),
+        };
         debug!(
             containers = batch.containers.len(),
-            pods = batch.pods.len(),
             interval_ms = batch.interval_ms,
             history = history.is_some(),
             "compute sample collected"
         );
-        pending.push_back((
-            SAMPLE_PATH,
-            serde_json::to_value(&batch).unwrap_or_default(),
-        ));
+        for chunk in chunk_batch(batch, MAX_CONTAINERS_PER_POST) {
+            pending.push_back((
+                SAMPLE_PATH,
+                serde_json::to_value(&chunk).unwrap_or_default(),
+            ));
+        }
         if let Some(h) = history {
-            pending.push_back((HISTORY_PATH, serde_json::to_value(&h).unwrap_or_default()));
+            for chunk in chunk_history(h, MAX_CONTAINERS_PER_POST) {
+                pending.push_back((
+                    HISTORY_PATH,
+                    serde_json::to_value(&chunk).unwrap_or_default(),
+                ));
+            }
         }
         flush_pending(&mut pending).await;
     }
@@ -1602,6 +1670,7 @@ mod tests {
     use super::*;
     use crate::compute_registry::ComputeRegistry;
     use crate::contention::VictimStats;
+    use std::sync::Arc;
 
     // ---- fixture strings captured from a cgroup v2 node ----
 
@@ -1918,41 +1987,6 @@ mod tests {
     }
 
     #[test]
-    fn pod_resources_sum_or_none() {
-        let mk = |uid: &str, cpu_req: Option<u64>, mem_lim: Option<u64>| {
-            Arc::new(ContainerCompute {
-                pod_uid: uid.into(),
-                namespace: "n".into(),
-                pod_name: "p".into(),
-                container_name: format!("c{}", cpu_req.unwrap_or(0)),
-                container_id: "x".into(),
-                pid: 1,
-                cgroup_path: "x".into(),
-                cgroup_id: cpu_req.unwrap_or(7),
-                resources: ResourceSpec {
-                    cpu_request_millis: cpu_req,
-                    cpu_limit_millis: None,
-                    memory_request_bytes: None,
-                    memory_limit_bytes: mem_lim,
-                },
-                node: "n".into(),
-            })
-        };
-        let all = vec![
-            mk("u1", Some(250), Some(1 << 20)),
-            mk("u1", Some(500), Some(1 << 20)),
-            mk("u2", Some(100), None),
-        ];
-        let r = pod_resources(&all, "u1");
-        assert_eq!(r.cpu_request_millis, Some(750));
-        assert_eq!(r.memory_limit_bytes, Some(2 << 20));
-        assert_eq!(r.cpu_limit_millis, None);
-        let r = pod_resources(&all, "u2");
-        assert_eq!(r.memory_limit_bytes, None);
-        assert_eq!(pod_resources(&all, "nope"), ResourceSpec::default());
-    }
-
-    #[test]
     fn minute_fold_reduces_gauges_and_sums_counters() {
         let cont = ContainerCompute {
             pod_uid: "u".into(),
@@ -2009,7 +2043,6 @@ mod tests {
             bpf_occupancy: BpfOccupancy::default(),
             unknown_blame_share: blame_share,
             containers: vec![c],
-            pods: vec![],
         };
         let mut hist_a = [0u64; 24];
         hist_a[7] = 10;
@@ -2108,6 +2141,173 @@ mod tests {
         assert_eq!(c.blame[1].kind, "system");
     }
 
+    fn empty_batch(interval_ms: u64) -> ComputeBatch {
+        ComputeBatch {
+            node: "n".into(),
+            ts: "t".into(),
+            interval_ms,
+            ctxt_per_sec: 0.0,
+            compute_enabled: true,
+            compute_supported: true,
+            contention_loaded: false,
+            node_pressure: NodePressure {
+                cpu_some10: 0.0,
+                cpu_full10: 0.0,
+                mem_some10: 0.0,
+                mem_full10: 0.0,
+            },
+            node_capacity: NodeCapacity {
+                cpu_cores: 1,
+                memory_bytes: 1,
+            },
+            bpf_occupancy: BpfOccupancy::default(),
+            unknown_blame_share: 0.0,
+            containers: vec![],
+        }
+    }
+
+    fn one_container_batch(interval_ms: u64) -> ComputeBatch {
+        let cont = ContainerCompute {
+            pod_uid: "u".into(),
+            namespace: "n".into(),
+            pod_name: "p".into(),
+            container_name: "c".into(),
+            container_id: "x".into(),
+            pid: 1,
+            cgroup_path: "x".into(),
+            cgroup_id: 1,
+            resources: ResourceSpec::default(),
+            node: "n".into(),
+        };
+        let mut b = empty_batch(interval_ms);
+        b.containers = vec![container_sample(
+            &cont,
+            &CgroupRaw::default(),
+            &Counters {
+                usage_usec: 1_000,
+                ..Default::default()
+            },
+            None,
+            vec![],
+        )];
+        b
+    }
+
+    #[test]
+    fn fold_size_is_sixty_seconds_of_samples() {
+        assert_eq!(fold_size(Duration::from_secs(5)), 12);
+        assert_eq!(fold_size(Duration::from_secs(10)), 6);
+        assert_eq!(fold_size(Duration::from_secs(1)), 60);
+        assert_eq!(fold_size(Duration::from_secs(90)), 1, "never zero");
+    }
+
+    #[test]
+    fn fold_closes_on_the_nth_sample_and_ignores_empty_ticks() {
+        for (interval_s, n) in [(5u64, 12u32), (10, 6)] {
+            let n_cfg = fold_size(Duration::from_secs(interval_s));
+            assert_eq!(n_cfg, n);
+            let mut fold = MinuteFold::default();
+            // The empty t=0 seed batch must not count.
+            fold.push(&empty_batch(interval_s * 1000));
+            assert_eq!(fold.ticks(), 0);
+            for k in 1..n {
+                fold.push(&one_container_batch(interval_s * 1000));
+                assert_eq!(fold.ticks(), k);
+                assert!(!fold.ready(n), "not ready after {k} of {n}");
+            }
+            fold.push(&one_container_batch(interval_s * 1000));
+            assert!(fold.ready(n));
+            let h = fold.finish(&one_container_batch(interval_s * 1000));
+            assert_eq!(
+                h.interval_ms, 60_000,
+                "summed sample intervals at {interval_s}s"
+            );
+            assert_eq!(h.resolution_secs, 60);
+            assert_eq!(h.containers[0].samples, n);
+            assert_eq!(h.containers[0].cpu.usage_usec, 1_000 * u64::from(n));
+        }
+    }
+
+    #[test]
+    fn batches_are_chunked_with_the_node_envelope_repeated() {
+        let mut b = one_container_batch(5000);
+        let template = b.containers[0].clone();
+        b.containers = (0..601)
+            .map(|i| ContainerSample {
+                container_uid: format!("u/c{i}"),
+                ..template.clone()
+            })
+            .collect();
+        let chunks = chunk_batch(b.clone(), 250);
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0].containers.len(), 250);
+        assert_eq!(chunks[2].containers.len(), 101);
+        assert!(chunks
+            .iter()
+            .all(|c| c.node == "n" && c.interval_ms == 5000));
+        assert_eq!(chunks[2].containers[100].container_uid, "u/c600");
+        // Small and empty batches are one POST.
+        assert_eq!(chunk_batch(one_container_batch(1), 250).len(), 1);
+        assert_eq!(chunk_batch(empty_batch(1), 250).len(), 1);
+        let h = MinuteFold::default().finish(&b);
+        assert_eq!(chunk_history(h, 250).len(), 1);
+    }
+
+    #[test]
+    fn a_failed_snapshot_ships_null_runq_and_contention_loaded_false() {
+        let base = std::env::temp_dir().join(format!("kg-compute-snapfail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let root = base.join("cgroup");
+        let proc_ = base.join("proc");
+        std::fs::create_dir_all(proc_.join("pressure")).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("cgroup.controllers"), "cpu memory\n").unwrap();
+        std::fs::write(
+            proc_.join("pressure/cpu"),
+            "some avg10=0.00 avg60=0.00 avg300=0.00 total=0\n",
+        )
+        .unwrap();
+        std::fs::write(proc_.join("stat"), PROC_STAT).unwrap();
+        std::fs::write(proc_.join("meminfo"), MEMINFO).unwrap();
+        let rel = "kubepods.slice/x.scope";
+        write_cgroup(&root.join(rel), 1_000, 100);
+        let registry: ComputeMap = Arc::new(ComputeRegistry::new());
+        let events = registry.subscribe();
+        registry.insert_container(ContainerCompute {
+            pod_uid: "u1".into(),
+            namespace: "n".into(),
+            pod_name: "p".into(),
+            container_name: "c".into(),
+            container_id: "a".into(),
+            pid: 1,
+            cgroup_path: rel.into(),
+            cgroup_id: 100,
+            resources: ResourceSpec::default(),
+            node: "n".into(),
+        });
+        let probe = FakeProbe {
+            tracked: Default::default(),
+            victims: vec![],
+            occupancy: (0, 0, 0),
+            fail: true,
+        };
+        let cfg = ComputeConfig {
+            cgroup_root: root.clone(),
+            host_proc: proc_,
+            ..Default::default()
+        };
+        let mut s = Sampler::new(cfg, "n".into(), registry, Some(Box::new(probe)), events);
+        assert!(s.contention_loaded(), "the probe is loaded…");
+        let _ = s.collect();
+        write_cgroup(&root.join(rel), 2_000, 100);
+        let (b, _) = s.collect();
+        assert!(!b.contention_loaded, "…but this tick could not read it");
+        assert_eq!(b.containers.len(), 1);
+        assert!(b.containers[0].runq.is_none(), "null, not a row of zeros");
+        assert_eq!(b.bpf_occupancy, BpfOccupancy::default());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn sample_batch_serialises_to_the_contract_shape() {
         let cont = ContainerCompute {
@@ -2160,6 +2360,8 @@ mod tests {
         tracked: std::sync::Arc<std::sync::Mutex<Vec<u64>>>,
         victims: Vec<FakeVictim>,
         occupancy: (u64, u64, u64),
+        /// Make `snapshot()` fail.
+        fail: bool,
     }
 
     impl ContentionSource for FakeProbe {
@@ -2172,6 +2374,9 @@ mod tests {
             Ok(())
         }
         fn snapshot(&mut self) -> anyhow::Result<ContentionSnapshot> {
+            if self.fail {
+                anyhow::bail!("map read failed");
+            }
             let mut per_victim = HashMap::new();
             for (victim, hist, pairs) in &self.victims {
                 per_victim.insert(
@@ -2195,6 +2400,7 @@ mod tests {
                     runq_enqueued: self.occupancy.0,
                     runq_hist: self.occupancy.1,
                     pair: self.occupancy.2,
+                    ..Default::default()
                 },
             })
         }
@@ -2235,7 +2441,6 @@ mod tests {
 
         let pod_rel = "kubepods.slice/kubepods-burstable.slice/kubepods-burstable-podu1.slice";
         let api_rel = format!("{pod_rel}/cri-containerd-a.scope");
-        write_cgroup(&root.join(pod_rel), 1_000, 500);
         write_cgroup(&root.join(&api_rel), 1_000, 100);
 
         let registry: ComputeMap = Arc::new(ComputeRegistry::new());
@@ -2255,12 +2460,19 @@ mod tests {
             },
             node: "n".into(),
         });
-        registry.insert_pod(PodCompute {
-            pod_uid: "u1".into(),
-            namespace: "payments".into(),
-            pod_name: "api-1".into(),
-            pod_cgroup_path: pod_rel.into(),
-            pod_cgroup_id: 99,
+        // The bully: opted out with `kguardian.dev/compute: "off"`, so
+        // identity-only — never sampled, never tracked, still named.
+        registry.insert_identity_only(ContainerCompute {
+            pod_uid: "u2".into(),
+            namespace: "batch".into(),
+            pod_name: "etl-1".into(),
+            container_name: "worker".into(),
+            container_id: "b".into(),
+            pid: 2,
+            cgroup_path: "kubepods.slice/kubepods-besteffort.slice/kubepods-besteffort-podu2.slice/cri-containerd-b.scope".into(),
+            cgroup_id: 200,
+            resources: ResourceSpec::default(),
+            node: "n".into(),
         });
 
         let mut hist = [0u64; 24];
@@ -2275,6 +2487,7 @@ mod tests {
                 vec![(200, 210, 6_100_000_000), (0, 3, 1_000), (424242, 1, 2_000)],
             )],
             occupancy: (11, 22, 33),
+            fail: false,
         };
         let cfg = ComputeConfig {
             cgroup_root: root.clone(),
@@ -2294,7 +2507,6 @@ mod tests {
         let (b1, h1) = s.collect();
         assert!(h1.is_none());
         assert!(b1.containers.is_empty());
-        assert!(b1.pods.is_empty());
         assert_eq!(b1.node, "worker-3");
         assert!(b1.compute_supported && b1.contention_loaded && b1.compute_enabled);
         assert_eq!(b1.node_capacity.cpu_cores, 4);
@@ -2303,10 +2515,9 @@ mod tests {
         assert_eq!(b1.bpf_occupancy.pair, 33);
 
         // Advance the fixture and tick again.
-        write_cgroup(&root.join(pod_rel), 3_000, 600);
         write_cgroup(&root.join(&api_rel), 2_500, 150);
         let (b2, _) = s.collect();
-        assert_eq!(b2.containers.len(), 1);
+        assert_eq!(b2.containers.len(), 1, "the opted-out bully is not sampled");
         let c = &b2.containers[0];
         assert_eq!(c.container_uid, "u1/api");
         assert_eq!(c.cpu.usage_usec, 1_500);
@@ -2328,24 +2539,27 @@ mod tests {
             r.p99_us
         );
         assert_eq!(c.blame.len(), 3);
+        // The opted-out bully is named with its full identity, resolved
+        // from the identity-only tier before the cgroup index.
         assert_eq!(c.blame[0].cgroup_id, 200);
-        assert_eq!(
-            c.blame[0].kind, "unknown",
-            "200 is not in the registry nor the index"
-        );
-        assert_eq!(c.blame[0].reference, "cgroup:200");
+        assert_eq!(c.blame[0].kind, "pod");
+        assert_eq!(c.blame[0].reference, "batch/etl-1/worker");
+        assert_eq!(c.blame[0].container_uid.as_deref(), Some("u2/worker"));
         let kernel = c.blame.iter().find(|b| b.cgroup_id == 0).unwrap();
         assert_eq!(
             (kernel.kind, kernel.reference.as_str()),
             ("kernel", "kernel")
         );
-        assert!(b2.unknown_blame_share > 0.99);
-        assert_eq!(b2.pods.len(), 1);
-        assert_eq!(b2.pods[0].cpu.usage_usec, 2_000);
-        assert_eq!(b2.pods[0].cpu.request_millis, Some(250));
-        assert_eq!(b2.pods[0].memory.current, 600);
+        let unknown = c.blame.iter().find(|b| b.cgroup_id == 424242).unwrap();
+        assert_eq!(
+            (unknown.kind, unknown.reference.as_str()),
+            ("unknown", "cgroup:424242")
+        );
+        // 2 000 ns unknown out of 6 100 001 000 ns of blamed wait.
+        assert!(b2.unknown_blame_share < 1e-5 && b2.unknown_blame_share > 0.0);
 
-        // The probe was told to track the registered container.
+        // The probe was told to track the sampled container only —
+        // never the opted-out one.
         assert!(s.tracked_synced);
         assert_eq!(*tracked.lock().unwrap(), vec![100u64]);
 

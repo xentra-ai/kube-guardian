@@ -1,8 +1,8 @@
 use crate::capture_tiers::CaptureLevel;
 use crate::compute_config::COMPUTE_ANNOTATION;
 use crate::compute_registry::{
-    cgroup_id_for_path, cgroup_path_for_pid, parse_cpu_millis, parse_memory_bytes, pod_cgroup_path,
-    ComputeMap, ContainerCompute, PodCompute, ResourceSpec,
+    cgroup_id_for_path, containerd_cgroups_path, parse_cpu_millis, parse_memory_bytes,
+    resolve_container_cgroup, ComputeMap, ContainerCompute, ResourceSpec, Tier,
 };
 use crate::models::{pod_flags, ContainerMap, PodRegistration};
 use crate::network::canonicalize_ip;
@@ -23,7 +23,7 @@ use serde_json::json;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
 use tokio::sync::mpsc;
@@ -218,6 +218,12 @@ async fn resync_pods(
     );
     loop {
         tokio::time::sleep(RESYNC_INTERVAL).await;
+        // Taken BEFORE the LIST: only pods registered before this
+        // instant may be pruned on its evidence. The per-container walk
+        // below is serial and containerd-bound, and the streaming watch
+        // keeps registering pods meanwhile; those are newer than the
+        // list and must not be retired by it.
+        let listed_at = Instant::now();
         match pods.list(&lp).await {
             Ok(list) => {
                 let mut processed = 0u32;
@@ -253,7 +259,7 @@ async fn resync_pods(
                         .iter()
                         .filter_map(|p| p.metadata.uid.clone())
                         .collect();
-                    let stale = prune_compute_registry(&ctx.map, &live);
+                    let stale = prune_compute_registry(&ctx.map, &live, listed_at);
                     if stale > 0 {
                         debug!(
                             stale,
@@ -795,11 +801,17 @@ pub fn container_resources(pod: &Pod, container_name: &str) -> ResourceSpec {
     resource_spec_from(from_spec)
 }
 
-/// Retire every registered pod whose uid is not in `live`. Returns how
-/// many were removed.
-pub fn prune_compute_registry(map: &ComputeMap, live: &std::collections::HashSet<String>) -> usize {
+/// Retire every pod registered before `listed_at` whose uid is not in
+/// `live` (the LIST taken at `listed_at`). Pods registered after the
+/// list was taken are newer than its evidence and are left alone; the
+/// next resync judges them. Returns how many were removed.
+pub fn prune_compute_registry(
+    map: &ComputeMap,
+    live: &std::collections::HashSet<String>,
+    listed_at: Instant,
+) -> usize {
     let mut removed = 0;
-    for uid in map.pod_uids() {
+    for uid in map.pod_uids_registered_before(listed_at) {
         if !live.contains(&uid) {
             map.remove_pod(&uid);
             removed += 1;
@@ -811,21 +823,26 @@ pub fn prune_compute_registry(map: &ComputeMap, live: &std::collections::HashSet
 /// Walk EVERY container of the pod (not just the first that resolves),
 /// resolve its host pid through the existing containerd path, read its
 /// cgroup v2 path and id, and record it with its requests and limits.
-/// The pod's own cgroup (the parent of the container scopes) is
-/// recorded once per pod.
 ///
-/// Containers already registered under the same containerd id are
-/// skipped, so the 60 s resync costs no containerd RPC for a steady
+/// A pod annotated `kguardian.dev/compute: "off"` is walked the same
+/// way but lands in the registry's identity-only tier (design D9): it
+/// is never sampled or tracked, yet blame can still name it
+/// `ns/pod/container` when it is the bully.
+///
+/// Containers already registered under the same containerd id and tier
+/// are skipped, so the 60 s resync costs no containerd RPC for a steady
 /// pod. Every failure is per container and logged at debug: a pod that
 /// cannot be sampled must not stop its neighbours from being.
 async fn register_compute(pod: &Pod, ctx: &ComputeContext) {
     let Some(uid) = pod.metadata.uid.clone() else {
         return;
     };
-    if compute_opted_out(pod) {
-        ctx.map.remove_pod(&uid);
-        return;
-    }
+    ctx.map.note_eligible_pod();
+    let tier = if compute_opted_out(pod) {
+        Tier::IdentityOnly
+    } else {
+        Tier::Sampled
+    };
     let namespace = pod.metadata.namespace.clone().unwrap_or_default();
     let pod_name = pod.name_any();
     let Some(statuses) = pod
@@ -835,77 +852,96 @@ async fn register_compute(pod: &Pod, ctx: &ComputeContext) {
     else {
         return;
     };
-    let mut pod_cgroup: Option<String> = None;
     for status in statuses {
         let Some(raw_id) = status.container_id.as_deref() else {
             continue;
         };
-        if let Some(existing) = ctx.map.container_for(&uid, &status.name) {
-            if existing.container_id == raw_id {
-                if pod_cgroup.is_none() {
-                    pod_cgroup = pod_cgroup_path(&existing.cgroup_path);
+        let existing = ctx.map.container_for(&uid, &status.name);
+        let entry = match existing {
+            Some((e, t)) if e.container_id == raw_id => {
+                if t == tier {
+                    continue;
                 }
-                continue;
+                // Same container, the annotation changed: move tiers
+                // without another containerd round trip.
+                (*e).clone()
             }
-        }
-        // Same containerd lookup (and the same connect / RPC ceilings)
-        // the netns registration uses.
-        let Some(inspect) = PodInspect::default().get_pod_inspect(raw_id).await else {
-            continue;
-        };
-        let Some(pid) = inspect.pid else {
-            continue;
-        };
-        let cgroup_path = match cgroup_path_for_pid(&ctx.host_proc, pid) {
-            Ok(p) => p,
-            Err(e) => {
-                debug!(pod = %pod_name, container = %status.name, pid, error = %e, "no cgroup v2 path for pid");
-                continue;
+            _ => {
+                // Same containerd lookup (and the same connect / RPC
+                // ceilings) the netns registration uses.
+                let Some(inspect) = PodInspect::default().get_pod_inspect(raw_id).await else {
+                    continue;
+                };
+                let Some(pid) = inspect.pid else {
+                    continue;
+                };
+                let cid = crate::container::parse_container_id(raw_id).unwrap_or_default();
+                // The controller's own cgroup namespace makes
+                // /proc/<pid>/cgroup useless for other pods (it renders
+                // `../..` paths), so the cgroup is resolved from
+                // containerd's OCI spec first, then by a bounded search;
+                // see `resolve_container_cgroup`.
+                let spec_path = containerd_cgroups_path(&cid).await;
+                let resolved = match resolve_container_cgroup(
+                    &ctx.cgroup_root,
+                    &ctx.host_proc,
+                    pid,
+                    &cid,
+                    spec_path.as_deref(),
+                ) {
+                    Ok(r) => r,
+                    Err(failure) => {
+                        // WARN, not debug: every route failed, and if
+                        // this happens for every container the feature
+                        // is silently dead. The sampler's startup
+                        // self-check escalates that case to ERROR.
+                        warn!(
+                            pod = %pod_name,
+                            container = %status.name,
+                            pid,
+                            container_id = %cid,
+                            attempts = %failure,
+                            "compute: could not resolve container cgroup; container not sampled"
+                        );
+                        continue;
+                    }
+                };
+                let cgroup_path = resolved.path;
+                let via = resolved.via;
+                let cgroup_id = match cgroup_id_for_path(&ctx.cgroup_root, &cgroup_path) {
+                    Ok(id) => id,
+                    Err(e) => {
+                        debug!(pod = %pod_name, container = %status.name, cgroup = %cgroup_path, error = %e, "cgroup id lookup failed");
+                        continue;
+                    }
+                };
+                debug!(
+                    pod = %pod_name,
+                    container = %status.name,
+                    pid,
+                    cgroup = %cgroup_path,
+                    cgroup_id,
+                    via,
+                    ?tier,
+                    "compute: registered container cgroup"
+                );
+                ContainerCompute {
+                    pod_uid: uid.clone(),
+                    namespace: namespace.clone(),
+                    pod_name: pod_name.clone(),
+                    container_name: status.name.clone(),
+                    container_id: raw_id.to_string(),
+                    pid,
+                    cgroup_path,
+                    cgroup_id,
+                    resources: container_resources(pod, &status.name),
+                    node: ctx.node.clone(),
+                }
             }
         };
-        let cgroup_id = match cgroup_id_for_path(&ctx.cgroup_root, &cgroup_path) {
-            Ok(id) => id,
-            Err(e) => {
-                debug!(pod = %pod_name, container = %status.name, cgroup = %cgroup_path, error = %e, "cgroup id lookup failed");
-                continue;
-            }
-        };
-        if pod_cgroup.is_none() {
-            pod_cgroup = pod_cgroup_path(&cgroup_path);
-        }
-        debug!(
-            pod = %pod_name,
-            container = %status.name,
-            pid,
-            cgroup = %cgroup_path,
-            cgroup_id,
-            "compute: registered container cgroup"
-        );
-        ctx.map.insert_container(ContainerCompute {
-            pod_uid: uid.clone(),
-            namespace: namespace.clone(),
-            pod_name: pod_name.clone(),
-            container_name: status.name.clone(),
-            container_id: raw_id.to_string(),
-            pid,
-            cgroup_path,
-            cgroup_id,
-            resources: container_resources(pod, &status.name),
-            node: ctx.node.clone(),
-        });
-    }
-    if let Some(path) = pod_cgroup {
-        match cgroup_id_for_path(&ctx.cgroup_root, &path) {
-            Ok(pod_cgroup_id) => ctx.map.insert_pod(PodCompute {
-                pod_uid: uid,
-                namespace,
-                pod_name,
-                pod_cgroup_path: path,
-                pod_cgroup_id,
-            }),
-            Err(e) => {
-                debug!(pod = %pod_name, cgroup = %path, error = %e, "pod cgroup id lookup failed")
-            }
+        match tier {
+            Tier::Sampled => ctx.map.insert_container(entry),
+            Tier::IdentityOnly => ctx.map.insert_identity_only(entry),
         }
     }
 }
@@ -1958,28 +1994,37 @@ mod tests {
     }
 
     #[test]
-    fn prune_retires_pods_missing_from_the_list() {
+    fn prune_retires_only_pods_registered_before_the_list_and_missing_from_it() {
         use crate::compute_registry::ComputeRegistry;
         let map: ComputeMap = Arc::new(ComputeRegistry::new());
-        for (uid, id) in [("a", 1u64), ("b", 2)] {
-            map.insert_container(ContainerCompute {
-                pod_uid: uid.into(),
-                namespace: "n".into(),
-                pod_name: "p".into(),
-                container_name: "c".into(),
-                container_id: "x".into(),
-                pid: 1,
-                cgroup_path: "x".into(),
-                cgroup_id: id,
-                resources: ResourceSpec::default(),
-                node: "n".into(),
-            });
-        }
+        let mk = |uid: &str, id: u64| ContainerCompute {
+            pod_uid: uid.into(),
+            namespace: "n".into(),
+            pod_name: "p".into(),
+            container_name: "c".into(),
+            container_id: "x".into(),
+            pid: 1,
+            cgroup_path: "x".into(),
+            cgroup_id: id,
+            resources: ResourceSpec::default(),
+            node: "n".into(),
+        };
+        map.insert_container(mk("a", 1));
+        map.insert_container(mk("b", 2));
+        let listed_at = Instant::now();
+        std::thread::sleep(Duration::from_millis(2));
+        // Registered by the watch while the resync walk was running:
+        // absent from the list, but newer than it.
+        map.insert_container(mk("c", 3));
         let live = ["b".to_string()].into_iter().collect();
-        assert_eq!(prune_compute_registry(&map, &live), 1);
-        assert!(map.lookup_cgroup(1).is_none());
-        assert!(map.lookup_cgroup(2).is_some());
-        assert_eq!(prune_compute_registry(&map, &live), 0);
+        assert_eq!(prune_compute_registry(&map, &live, listed_at), 1);
+        assert!(map.lookup_cgroup(1).is_none(), "a: old and absent → pruned");
+        assert!(map.lookup_cgroup(2).is_some(), "b: listed → kept");
+        assert!(
+            map.lookup_cgroup(3).is_some(),
+            "c: newer than the list → kept"
+        );
+        assert_eq!(prune_compute_registry(&map, &live, listed_at), 0);
     }
 
     #[test]

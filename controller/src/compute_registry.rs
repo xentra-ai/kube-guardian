@@ -8,8 +8,16 @@
 //! parallel, per-container registry described in the design (D1): one
 //! [`ContainerCompute`] per container, keyed by the 64-bit cgroup id that
 //! `bpf_get_current_cgroup_id()` yields in BPF and `name_to_handle_at`
-//! yields in userspace, plus one [`PodCompute`] per pod for the
-//! pod-level rollup cgroup.
+//! yields in userspace.
+//!
+//! Two tiers of entry:
+//!
+//! * **sampled** — read every tick, announced to the BPF
+//!   `tracked_cgroups` map, eligible as a victim;
+//! * **identity-only** — pods opted out with `kguardian.dev/compute:
+//!   "off"` (design D9). Never sampled, never tracked, but blame
+//!   resolution consults them before the cgroup index so an opted-out
+//!   bully is still named `ns/pod/container` rather than `pod:<uid8>`.
 //!
 //! Locking: a single `std::sync::RwLock` around a plain map, taken only
 //! for synchronous, allocation-light operations. Every read returns an
@@ -18,10 +26,14 @@
 //! guards the DashMap-based `ContainerMap` against does not arise.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::io;
 use std::path::Path;
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::Instant;
 use tokio::sync::broadcast;
+use tracing::debug;
 
 /// Requests and limits per container, captured from the pod spec at
 /// registration so the broker never needs the API server to normalise a
@@ -57,39 +69,49 @@ impl ContainerCompute {
     }
 }
 
-/// A pod's own cgroup (the parent of its container scopes), recorded so
-/// pause-container and init-container time is not lost and so the graph
-/// node can show a single gauge.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PodCompute {
-    pub pod_uid: String,
-    pub namespace: String,
-    pub pod_name: String,
-    pub pod_cgroup_path: String,
-    pub pod_cgroup_id: u64,
-}
-
-/// Registration events for the BPF `tracked_cgroups` map. Only container
-/// cgroups are announced: tasks live in the leaf scopes, and the pod
-/// slice above them holds none of its own.
+/// Registration events for the BPF `tracked_cgroups` map. Only sampled
+/// container cgroups are announced; identity-only entries never are.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ComputeRegistration {
     Added { cgroup_id: u64 },
     Removed { cgroup_id: u64 },
 }
 
-#[derive(Default)]
-struct Inner {
-    containers: HashMap<u64, Arc<ContainerCompute>>,
-    pods: HashMap<String, Arc<PodCompute>>,
-    /// pod_uid -> container cgroup ids, for `remove_pod`.
-    by_pod: HashMap<String, Vec<u64>>,
+/// Which tier a container is registered in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tier {
+    Sampled,
+    IdentityOnly,
 }
 
-/// Registry of every container and pod cgroup this node samples.
+#[derive(Default)]
+struct Inner {
+    /// Sampled containers, keyed by cgroup id.
+    containers: HashMap<u64, Arc<ContainerCompute>>,
+    /// Opted-out containers, keyed by cgroup id: identity for blame only.
+    identity: HashMap<u64, Arc<ContainerCompute>>,
+    /// pod_uid -> its containers, for `remove_pod` and the by-name lookups.
+    by_pod: HashMap<String, PodEntry>,
+}
+
+struct PodEntry {
+    /// When the pod was first registered. The resync prune only retires
+    /// pods registered BEFORE its LIST was taken, so a pod the watch
+    /// registered during the (serial, containerd-bound) resync walk is
+    /// not pruned and re-registered a minute later.
+    since: Instant,
+    ids: Vec<(u64, Tier)>,
+}
+
+/// Registry of every container cgroup this node knows about.
 pub struct ComputeRegistry {
     inner: RwLock<Inner>,
     events: broadcast::Sender<ComputeRegistration>,
+    /// Pods the watcher tried to register (eligible: on-node, ready,
+    /// not excluded). Drives the sampler's startup self-check: eligible
+    /// pods seen but an empty registry means resolution is broken.
+    eligible_seen: AtomicU64,
+    first_eligible: Mutex<Option<Instant>>,
 }
 
 pub type ComputeMap = Arc<ComputeRegistry>;
@@ -111,7 +133,31 @@ impl ComputeRegistry {
         Self {
             inner: RwLock::new(Inner::default()),
             events,
+            eligible_seen: AtomicU64::new(0),
+            first_eligible: Mutex::new(None),
         }
+    }
+
+    /// The pod watcher saw a pod it would sample (before trying to
+    /// resolve its cgroups).
+    pub fn note_eligible_pod(&self) {
+        self.eligible_seen.fetch_add(1, Ordering::Relaxed);
+        let mut first = self
+            .first_eligible
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        first.get_or_insert_with(Instant::now);
+    }
+
+    pub fn eligible_pods_seen(&self) -> u64 {
+        self.eligible_seen.load(Ordering::Relaxed)
+    }
+
+    pub fn first_eligible_at(&self) -> Option<Instant> {
+        *self
+            .first_eligible
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 
     fn read(&self) -> std::sync::RwLockReadGuard<'_, Inner> {
@@ -122,114 +168,161 @@ impl ComputeRegistry {
         self.inner.write().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Insert (or replace) a container, keyed by cgroup id. Idempotent:
-    /// re-registering the same cgroup id emits no event, so the 60 s pod
-    /// resync does not churn the BPF map. A container whose cgroup id
-    /// changed (restart → new scope) is announced as a fresh `Added`,
-    /// and its previous id is retired with `Removed`.
+    /// Insert (or replace) a sampled container, keyed by cgroup id.
+    /// Idempotent: re-registering the same cgroup id emits no event, so
+    /// the 60 s pod resync does not churn the BPF map. A container whose
+    /// cgroup id changed (restart → new scope) is announced as a fresh
+    /// `Added`, and its previous id is retired with `Removed`. An
+    /// identity-only entry for the same container (opt-out annotation
+    /// removed) is promoted.
     pub fn insert_container(&self, c: ContainerCompute) {
+        self.insert(c, Tier::Sampled);
+    }
+
+    /// Insert (or replace) an identity-only container: never sampled,
+    /// never tracked, but nameable as a culprit. A sampled entry for the
+    /// same container (opt-out annotation added) is demoted and retired
+    /// from the BPF map.
+    pub fn insert_identity_only(&self, c: ContainerCompute) {
+        self.insert(c, Tier::IdentityOnly);
+    }
+
+    fn insert(&self, c: ContainerCompute, tier: Tier) {
         let mut events = Vec::new();
         {
             let mut g = self.write();
-            // Retire a stale id for the same container name (restart).
-            let stale: Vec<u64> = g
+            // Retire every other entry for the same container name (a
+            // restart, or a tier change).
+            let stale: Vec<(u64, Tier)> = g
                 .by_pod
                 .get(&c.pod_uid)
-                .map(|ids| {
-                    ids.iter()
+                .map(|entry| {
+                    entry
+                        .ids
+                        .iter()
                         .copied()
-                        .filter(|id| {
-                            *id != c.cgroup_id
-                                && g.containers
-                                    .get(id)
-                                    .is_some_and(|old| old.container_name == c.container_name)
+                        .filter(|(id, t)| {
+                            let same_name = match t {
+                                Tier::Sampled => g.containers.get(id),
+                                Tier::IdentityOnly => g.identity.get(id),
+                            }
+                            .is_some_and(|old| old.container_name == c.container_name);
+                            same_name && (*id != c.cgroup_id || *t != tier)
                         })
                         .collect()
                 })
                 .unwrap_or_default();
-            for id in &stale {
-                g.containers.remove(id);
-                events.push(ComputeRegistration::Removed { cgroup_id: *id });
+            for (id, t) in &stale {
+                match t {
+                    Tier::Sampled => {
+                        g.containers.remove(id);
+                        events.push(ComputeRegistration::Removed { cgroup_id: *id });
+                    }
+                    Tier::IdentityOnly => {
+                        g.identity.remove(id);
+                    }
+                }
             }
-            let ids = g.by_pod.entry(c.pod_uid.clone()).or_default();
+            let ids = &mut g
+                .by_pod
+                .entry(c.pod_uid.clone())
+                .or_insert_with(|| PodEntry {
+                    since: Instant::now(),
+                    ids: Vec::new(),
+                })
+                .ids;
             ids.retain(|x| !stale.contains(x));
-            let is_new = !ids.contains(&c.cgroup_id);
-            if is_new {
-                ids.push(c.cgroup_id);
-                events.push(ComputeRegistration::Added {
-                    cgroup_id: c.cgroup_id,
-                });
+            if !ids.contains(&(c.cgroup_id, tier)) {
+                ids.push((c.cgroup_id, tier));
+                if tier == Tier::Sampled {
+                    events.push(ComputeRegistration::Added {
+                        cgroup_id: c.cgroup_id,
+                    });
+                }
             }
-            g.containers.insert(c.cgroup_id, Arc::new(c));
+            let entry = Arc::new(c);
+            match tier {
+                Tier::Sampled => g.containers.insert(entry.cgroup_id, entry),
+                Tier::IdentityOnly => g.identity.insert(entry.cgroup_id, entry),
+            };
         }
         for e in events {
             let _ = self.events.send(e);
         }
     }
 
-    pub fn insert_pod(&self, p: PodCompute) {
-        self.write().pods.insert(p.pod_uid.clone(), Arc::new(p));
-    }
-
-    /// Remove a pod and every container registered under it.
+    /// Remove a pod and every container registered under it, in either
+    /// tier.
     pub fn remove_pod(&self, pod_uid: &str) {
-        let removed: Vec<u64> = {
+        let removed: Vec<(u64, Tier)> = {
             let mut g = self.write();
-            g.pods.remove(pod_uid);
-            let ids = g.by_pod.remove(pod_uid).unwrap_or_default();
-            for id in &ids {
-                g.containers.remove(id);
+            let ids = g.by_pod.remove(pod_uid).map(|e| e.ids).unwrap_or_default();
+            for (id, t) in &ids {
+                match t {
+                    Tier::Sampled => g.containers.remove(id),
+                    Tier::IdentityOnly => g.identity.remove(id),
+                };
             }
             ids
         };
-        for id in removed {
-            let _ = self
-                .events
-                .send(ComputeRegistration::Removed { cgroup_id: id });
+        for (id, t) in removed {
+            if t == Tier::Sampled {
+                let _ = self
+                    .events
+                    .send(ComputeRegistration::Removed { cgroup_id: id });
+            }
         }
     }
 
-    /// Snapshot of every container; no guard is held on return.
+    /// Snapshot of every SAMPLED container; no guard is held on return.
+    /// Identity-only entries are excluded by construction.
     pub fn containers(&self) -> Vec<Arc<ContainerCompute>> {
         self.read().containers.values().map(Arc::clone).collect()
     }
 
-    /// Snapshot of every pod-level cgroup.
-    pub fn pods(&self) -> Vec<Arc<PodCompute>> {
-        self.read().pods.values().map(Arc::clone).collect()
-    }
-
-    /// Every registered pod uid — used by the resync pass to retire pods
-    /// that are gone from the API server without a watch event.
+    /// Every registered pod uid, both tiers — used by the resync pass to
+    /// retire pods that are gone from the API server without a watch
+    /// event.
     pub fn pod_uids(&self) -> Vec<String> {
-        let g = self.read();
-        let mut uids: Vec<String> = g.by_pod.keys().cloned().collect();
-        for uid in g.pods.keys() {
-            if !uids.contains(uid) {
-                uids.push(uid.clone());
-            }
-        }
-        uids
+        self.read().by_pod.keys().cloned().collect()
     }
 
+    /// Pod uids first registered before `t` — the only ones a resync
+    /// prune based on a LIST taken at `t` may retire.
+    pub fn pod_uids_registered_before(&self, t: Instant) -> Vec<String> {
+        self.read()
+            .by_pod
+            .iter()
+            .filter(|(_, e)| e.since < t)
+            .map(|(uid, _)| uid.clone())
+            .collect()
+    }
+
+    /// A sampled container by cgroup id.
     pub fn lookup_cgroup(&self, cgroup_id: u64) -> Option<Arc<ContainerCompute>> {
         self.read().containers.get(&cgroup_id).map(Arc::clone)
     }
 
-    /// The registered entry for a container by pod uid and name, so the
-    /// pod watcher can skip the containerd lookup for a container it has
-    /// already resolved.
+    /// An identity-only (opted-out) container by cgroup id, for blame.
+    pub fn lookup_identity(&self, cgroup_id: u64) -> Option<Arc<ContainerCompute>> {
+        self.read().identity.get(&cgroup_id).map(Arc::clone)
+    }
+
+    /// The registered entry for a container by pod uid and name, in
+    /// either tier, so the pod watcher can skip the containerd lookup
+    /// for a container it has already resolved.
     pub fn container_for(
         &self,
         pod_uid: &str,
         container_name: &str,
-    ) -> Option<Arc<ContainerCompute>> {
+    ) -> Option<(Arc<ContainerCompute>, Tier)> {
         let g = self.read();
-        g.by_pod.get(pod_uid)?.iter().find_map(|id| {
-            g.containers
-                .get(id)
-                .filter(|c| c.container_name == container_name)
-                .map(Arc::clone)
+        g.by_pod.get(pod_uid)?.ids.iter().find_map(|(id, t)| {
+            let entry = match t {
+                Tier::Sampled => g.containers.get(id),
+                Tier::IdentityOnly => g.identity.get(id),
+            }?;
+            (entry.container_name == container_name).then(|| (Arc::clone(entry), *t))
         })
     }
 
@@ -320,14 +413,268 @@ pub fn parse_proc_cgroup_v2(body: &str) -> Option<String> {
         .map(|p| p.trim().trim_start_matches('/').to_string())
 }
 
-/// Parent of a container scope: the pod-level cgroup. Works for both
-/// the systemd driver (`…/kubepods-burstable-pod<uid>.slice/cri-containerd-<cid>.scope`)
-/// and cgroupfs (`kubepods/burstable/pod<uid>/<cid>`). `None` when the
-/// path has no parent (a root-level cgroup).
-pub fn pod_cgroup_path(container_cgroup_path: &str) -> Option<String> {
-    let trimmed = container_cgroup_path.trim_matches('/');
-    let idx = trimmed.rfind('/')?;
-    Some(trimmed[..idx].to_string())
+/// Convert an OCI `linux.cgroupsPath` (what containerd's `Containers.Get`
+/// spec carries) into a path relative to the cgroupfs root.
+///
+/// Two forms exist:
+///
+/// * systemd driver: `<slice>:<prefix>:<name>`, e.g.
+///   `kubepods-burstable-pod<uid>.slice:cri-containerd:<cid>`. systemd
+///   nests a slice under every `-`-separated prefix, so that becomes
+///   `kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod<uid>.slice/cri-containerd-<cid>.scope`
+///   (guaranteed pods have no QoS segment: `kubepods-pod<uid>.slice`).
+/// * cgroupfs driver: a plain path, `/kubepods/burstable/pod<uid>/<cid>`,
+///   used as-is.
+///
+/// This is deterministic and needs no filesystem access, which is what
+/// makes it the preferred route: it is independent of the cgroup
+/// namespace the controller happens to run in.
+pub fn cgroups_path_to_cgroupfs(spec: &str) -> Option<String> {
+    let s = spec.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let parts: Vec<&str> = s.split(':').collect();
+    match parts.as_slice() {
+        [slice, prefix, name] => {
+            let slice = slice.strip_suffix(".slice").unwrap_or(slice);
+            if slice.is_empty() || name.is_empty() || slice.contains('/') {
+                return None;
+            }
+            let mut dirs = Vec::new();
+            let mut acc = String::new();
+            for seg in slice.split('-') {
+                if !acc.is_empty() {
+                    acc.push('-');
+                }
+                acc.push_str(seg);
+                dirs.push(format!("{acc}.slice"));
+            }
+            dirs.push(if prefix.is_empty() {
+                format!("{name}.scope")
+            } else {
+                format!("{prefix}-{name}.scope")
+            });
+            Some(dirs.join("/"))
+        }
+        [path] => {
+            let p = path.trim_matches('/');
+            (!p.is_empty() && !p.contains("..")).then(|| p.to_string())
+        }
+        _ => None,
+    }
+}
+
+/// Pull `linux.cgroupsPath` out of an OCI runtime spec (JSON).
+pub fn parse_oci_cgroups_path(json: &[u8]) -> Option<String> {
+    serde_json::from_slice::<serde_json::Value>(json)
+        .ok()?
+        .get("linux")?
+        .get("cgroupsPath")?
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+}
+
+/// Ask containerd for a container's OCI spec and return its
+/// `linux.cgroupsPath`. Same socket, connect ceiling and RPC ceiling as
+/// the netns path's `Tasks.Get`. `None` on any failure; the caller
+/// falls through to the filesystem search.
+pub async fn containerd_cgroups_path(container_id: &str) -> Option<String> {
+    use containerd_client::services::v1::{
+        containers_client::ContainersClient, GetContainerRequest,
+    };
+    use containerd_client::tonic::Request;
+    use containerd_client::with_namespace;
+
+    let channel = crate::container::connect_containerd(
+        &crate::container::containerd_sock(),
+        crate::container::CONNECT_TIMEOUT,
+    )
+    .await?;
+    let mut client = ContainersClient::new(channel);
+    let req = GetContainerRequest {
+        id: container_id.to_string(),
+    };
+    let req = with_namespace!(req, "k8s.io");
+    let resp = match tokio::time::timeout(crate::container::RPC_TIMEOUT, client.get(req)).await {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => {
+            debug!(container_id, error = %e, "containerd Containers.Get failed");
+            return None;
+        }
+        Err(_) => {
+            debug!(container_id, "containerd Containers.Get timed out");
+            return None;
+        }
+    };
+    let spec = resp.into_inner().container?.spec?;
+    parse_oci_cgroups_path(&spec.value)
+}
+
+/// Bounded search under `<root>/kubepods*` for a cgroup directory whose
+/// name contains `cid` (`cri-containerd-<cid>.scope`, `crio-<cid>.scope`
+/// or a bare `<cid>` under the cgroupfs driver). Returns the path
+/// relative to `root`.
+pub fn search_cgroup_by_cid(
+    root: &Path,
+    cid: &str,
+    max_depth: usize,
+    limit: usize,
+) -> Option<String> {
+    if cid.is_empty() {
+        return None;
+    }
+    let roots = std::fs::read_dir(root).ok()?;
+    let mut stack: Vec<(std::path::PathBuf, usize)> = roots
+        .flatten()
+        .filter(|e| {
+            e.file_name().to_string_lossy().starts_with("kubepods")
+                && e.file_type().map(|t| t.is_dir()).unwrap_or(false)
+        })
+        .map(|e| (e.path(), 1))
+        .collect();
+    let mut visited = 0usize;
+    while let Some((dir, depth)) = stack.pop() {
+        if visited >= limit {
+            break;
+        }
+        visited += 1;
+        if dir
+            .file_name()
+            .map(|n| n.to_string_lossy().contains(cid))
+            .unwrap_or(false)
+        {
+            return dir
+                .strip_prefix(root)
+                .ok()
+                .map(|p| p.to_string_lossy().to_string());
+        }
+        if depth >= max_depth {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                stack.push((e.path(), depth + 1));
+            }
+        }
+    }
+    None
+}
+
+/// Depth bound for [`search_cgroup_by_cid`]: `kubepods.slice/<qos>.slice/<pod>.slice/<scope>` is 4.
+pub const CGROUP_SEARCH_MAX_DEPTH: usize = 6;
+/// Directory bound for one [`search_cgroup_by_cid`] call.
+pub const CGROUP_SEARCH_LIMIT: usize = 20_000;
+
+/// How a container's cgroup path was established.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CgroupResolution {
+    /// Relative to the cgroup root; verified to exist.
+    pub path: String,
+    /// `spec` (containerd OCI spec), `search` (cgroupfs walk) or `proc`
+    /// (`/proc/<pid>/cgroup`).
+    pub via: &'static str,
+}
+
+/// Every route failed. Carries what each one saw so the log line says
+/// why, not just that.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CgroupResolveFailure {
+    pub spec: String,
+    pub search: String,
+    pub proc: String,
+}
+
+impl fmt::Display for CgroupResolveFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "spec: {}; search: {}; proc: {}",
+            self.spec, self.search, self.proc
+        )
+    }
+}
+
+/// Resolve a container's cgroup path in a way that does not depend on
+/// the controller's own cgroup namespace.
+///
+/// The controller runs in a private cgroupns (containerd and CRI-O add
+/// one unconditionally on cgroup v2), so `/proc/<pid>/cgroup` for any
+/// OTHER pod's pid renders relative to the controller's cgroup —
+/// `0::/../../../kubepods-burstable.slice/…` — which does not exist
+/// under the host cgroupfs mount. Order of preference:
+///
+/// 1. the OCI spec's `linux.cgroupsPath` from containerd, converted
+///    deterministically ([`cgroups_path_to_cgroupfs`]);
+/// 2. a bounded search under `<root>/kubepods*` for the container id;
+/// 3. `/proc/<pid>/cgroup`, only when it contains no `..`.
+///
+/// Whatever route wins, the directory must exist before an id is taken
+/// from it.
+pub fn resolve_container_cgroup(
+    root: &Path,
+    host_proc: &Path,
+    pid: u32,
+    cid: &str,
+    spec_path: Option<&str>,
+) -> Result<CgroupResolution, CgroupResolveFailure> {
+    let exists = |rel: &str| root.join(rel).join("cpu.stat").exists() || root.join(rel).is_dir();
+
+    let spec = match spec_path {
+        None => "unavailable".to_string(),
+        Some(raw) => match cgroups_path_to_cgroupfs(raw) {
+            None => format!("unparseable cgroupsPath {raw:?}"),
+            Some(rel) if exists(&rel) => {
+                return Ok(CgroupResolution {
+                    path: rel,
+                    via: "spec",
+                })
+            }
+            Some(rel) => format!("{rel} does not exist under {}", root.display()),
+        },
+    };
+
+    let search = match search_cgroup_by_cid(root, cid, CGROUP_SEARCH_MAX_DEPTH, CGROUP_SEARCH_LIMIT)
+    {
+        Some(rel) if exists(&rel) => {
+            return Ok(CgroupResolution {
+                path: rel,
+                via: "search",
+            })
+        }
+        Some(rel) => format!("found {rel} but it vanished"),
+        None => format!(
+            "no directory containing {cid:?} under {}/kubepods*",
+            root.display()
+        ),
+    };
+
+    let proc_ = match cgroup_path_for_pid(host_proc, pid) {
+        Err(e) => format!(
+            "{}: {e}",
+            host_proc.join(pid.to_string()).join("cgroup").display()
+        ),
+        Ok(rel) if rel.contains("..") => {
+            format!("{rel:?} is relative to another cgroup namespace (contains ..)")
+        }
+        Ok(rel) if exists(&rel) => {
+            return Ok(CgroupResolution {
+                path: rel,
+                via: "proc",
+            })
+        }
+        Ok(rel) => format!("{rel:?} does not exist under {}", root.display()),
+    };
+
+    Err(CgroupResolveFailure {
+        spec,
+        search,
+        proc: proc_,
+    })
 }
 
 /// Parse a Kubernetes CPU quantity into millicores: `100m` → 100,
@@ -442,6 +789,14 @@ mod tests {
         }
     }
 
+    fn drain(rx: &mut broadcast::Receiver<ComputeRegistration>) -> Vec<ComputeRegistration> {
+        let mut seen = Vec::new();
+        while let Ok(e) = rx.try_recv() {
+            seen.push(e);
+        }
+        seen
+    }
+
     #[test]
     fn insert_lookup_remove_round_trip() {
         let r = ComputeRegistry::new();
@@ -449,16 +804,11 @@ mod tests {
         r.insert_container(container("u1", "api", 10));
         r.insert_container(container("u1", "sidecar", 11));
         r.insert_container(container("u2", "web", 20));
-        r.insert_pod(PodCompute {
-            pod_uid: "u1".into(),
-            namespace: "ns".into(),
-            pod_name: "pod".into(),
-            pod_cgroup_path: "kubepods.slice/podu1.slice".into(),
-            pod_cgroup_id: 9,
-        });
         assert_eq!(r.lookup_cgroup(11).unwrap().container_name, "sidecar");
         assert_eq!(r.containers().len(), 3);
-        assert_eq!(r.pods().len(), 1);
+        let (c, tier) = r.container_for("u1", "sidecar").unwrap();
+        assert_eq!((c.cgroup_id, tier), (11, Tier::Sampled));
+        assert!(r.container_for("u1", "nope").is_none());
         let mut uids = r.pod_uids();
         uids.sort();
         assert_eq!(uids, vec!["u1", "u2"]);
@@ -467,14 +817,10 @@ mod tests {
         assert!(r.lookup_cgroup(10).is_none());
         assert!(r.lookup_cgroup(11).is_none());
         assert!(r.lookup_cgroup(20).is_some());
-        assert!(r.pods().is_empty());
+        assert_eq!(r.pod_uids(), vec!["u2"]);
 
-        let mut seen = Vec::new();
-        while let Ok(e) = rx.try_recv() {
-            seen.push(e);
-        }
         assert_eq!(
-            seen,
+            drain(&mut rx),
             vec![
                 ComputeRegistration::Added { cgroup_id: 10 },
                 ComputeRegistration::Added { cgroup_id: 11 },
@@ -494,22 +840,238 @@ mod tests {
         r.insert_container(container("u1", "api", 10));
         r.insert_container(container("u1", "api", 10));
         assert_eq!(
-            rx.try_recv(),
-            Ok(ComputeRegistration::Added { cgroup_id: 10 })
+            drain(&mut rx),
+            vec![ComputeRegistration::Added { cgroup_id: 10 }]
         );
-        assert!(rx.try_recv().is_err());
         // Container restarted: same name, new scope, new id.
         r.insert_container(container("u1", "api", 12));
         assert_eq!(
-            rx.try_recv(),
-            Ok(ComputeRegistration::Removed { cgroup_id: 10 })
-        );
-        assert_eq!(
-            rx.try_recv(),
-            Ok(ComputeRegistration::Added { cgroup_id: 12 })
+            drain(&mut rx),
+            vec![
+                ComputeRegistration::Removed { cgroup_id: 10 },
+                ComputeRegistration::Added { cgroup_id: 12 },
+            ]
         );
         assert!(r.lookup_cgroup(10).is_none());
         assert_eq!(r.containers().len(), 1);
+    }
+
+    #[test]
+    fn identity_only_entries_are_nameable_but_never_sampled_or_tracked() {
+        // Design D9: an opted-out pod is not sampled and not in
+        // tracked_cgroups, yet it can still be named as a culprit with
+        // its full identity.
+        let r = ComputeRegistry::new();
+        let mut rx = r.subscribe();
+        r.insert_identity_only(container("bully", "worker", 200));
+        r.insert_identity_only(container("bully", "worker", 200));
+        assert!(r.containers().is_empty(), "not sampled");
+        assert!(drain(&mut rx).is_empty(), "not tracked");
+        assert!(r.lookup_cgroup(200).is_none());
+        let id = r.lookup_identity(200).unwrap();
+        assert_eq!(id.container_uid(), "bully/worker");
+        assert_eq!(
+            r.container_for("bully", "worker").map(|(_, t)| t),
+            Some(Tier::IdentityOnly)
+        );
+        assert_eq!(r.pod_uids(), vec!["bully"]);
+
+        // Removal clears it, silently.
+        r.remove_pod("bully");
+        assert!(r.lookup_identity(200).is_none());
+        assert!(r.pod_uids().is_empty());
+        assert!(drain(&mut rx).is_empty());
+    }
+
+    #[test]
+    fn toggling_the_opt_out_moves_a_container_between_tiers() {
+        let r = ComputeRegistry::new();
+        let mut rx = r.subscribe();
+        r.insert_container(container("u1", "api", 10));
+        assert_eq!(
+            drain(&mut rx),
+            vec![ComputeRegistration::Added { cgroup_id: 10 }]
+        );
+        // Annotation added: demoted, retired from the BPF map.
+        r.insert_identity_only(container("u1", "api", 10));
+        assert_eq!(
+            drain(&mut rx),
+            vec![ComputeRegistration::Removed { cgroup_id: 10 }]
+        );
+        assert!(r.lookup_cgroup(10).is_none());
+        assert!(r.lookup_identity(10).is_some());
+        assert_eq!(r.containers().len(), 0);
+        // Annotation removed: promoted, tracked again.
+        r.insert_container(container("u1", "api", 10));
+        assert_eq!(
+            drain(&mut rx),
+            vec![ComputeRegistration::Added { cgroup_id: 10 }]
+        );
+        assert!(r.lookup_identity(10).is_none());
+        assert_eq!(r.containers().len(), 1);
+    }
+
+    #[test]
+    fn registration_time_gates_the_resync_prune() {
+        let r = ComputeRegistry::new();
+        r.insert_container(container("old", "c", 1));
+        let listed_at = Instant::now();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        r.insert_container(container("new", "c", 2));
+        // Re-inserting keeps the ORIGINAL registration time.
+        r.insert_container(container("old", "c", 1));
+        assert_eq!(r.pod_uids_registered_before(listed_at), vec!["old"]);
+    }
+
+    #[test]
+    fn eligible_pod_counter_and_first_seen() {
+        let r = ComputeRegistry::new();
+        assert_eq!(r.eligible_pods_seen(), 0);
+        assert!(r.first_eligible_at().is_none());
+        r.note_eligible_pod();
+        r.note_eligible_pod();
+        assert_eq!(r.eligible_pods_seen(), 2);
+        assert!(r.first_eligible_at().is_some());
+    }
+
+    #[test]
+    fn systemd_cgroups_path_expands_for_every_qos_class() {
+        assert_eq!(
+            cgroups_path_to_cgroupfs(
+                "kubepods-burstable-pod3f2a9c1e_7b4d_4e0a_9f1c_0123456789ab.slice:cri-containerd:abc123"
+            )
+            .as_deref(),
+            Some(
+                "kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod3f2a9c1e_7b4d_4e0a_9f1c_0123456789ab.slice/cri-containerd-abc123.scope"
+            )
+        );
+        assert_eq!(
+            cgroups_path_to_cgroupfs(
+                "kubepods-besteffort-pod3f2a9c1e_7b4d_4e0a_9f1c_0123456789ab.slice:cri-containerd:abc123"
+            )
+            .as_deref(),
+            Some(
+                "kubepods.slice/kubepods-besteffort.slice/kubepods-besteffort-pod3f2a9c1e_7b4d_4e0a_9f1c_0123456789ab.slice/cri-containerd-abc123.scope"
+            )
+        );
+        // Guaranteed: no QoS segment.
+        assert_eq!(
+            cgroups_path_to_cgroupfs(
+                "kubepods-pod3f2a9c1e_7b4d_4e0a_9f1c_0123456789ab.slice:cri-containerd:abc123"
+            )
+            .as_deref(),
+            Some(
+                "kubepods.slice/kubepods-pod3f2a9c1e_7b4d_4e0a_9f1c_0123456789ab.slice/cri-containerd-abc123.scope"
+            )
+        );
+        // CRI-O prefix.
+        assert_eq!(
+            cgroups_path_to_cgroupfs("kubepods-burstable-podx.slice:crio:abc").as_deref(),
+            Some("kubepods.slice/kubepods-burstable.slice/kubepods-burstable-podx.slice/crio-abc.scope")
+        );
+        // cgroupfs driver: as-is, no leading slash.
+        assert_eq!(
+            cgroups_path_to_cgroupfs(
+                "/kubepods/burstable/pod3f2a9c1e-7b4d-4e0a-9f1c-0123456789ab/abc123"
+            )
+            .as_deref(),
+            Some("kubepods/burstable/pod3f2a9c1e-7b4d-4e0a-9f1c-0123456789ab/abc123")
+        );
+        assert_eq!(cgroups_path_to_cgroupfs(""), None);
+        assert_eq!(cgroups_path_to_cgroupfs("a:b"), None);
+        assert_eq!(cgroups_path_to_cgroupfs("/../escape"), None);
+        assert_eq!(
+            parse_oci_cgroups_path(br#"{"ociVersion":"1.1.0","linux":{"cgroupsPath":"kubepods-podx.slice:cri-containerd:c1","resources":{}}}"#)
+                .as_deref(),
+            Some("kubepods-podx.slice:cri-containerd:c1")
+        );
+        assert_eq!(parse_oci_cgroups_path(b"{}"), None);
+        assert_eq!(parse_oci_cgroups_path(b"not json"), None);
+    }
+
+    /// A fixture tree with a cgroupfs mount and a `/proc/<pid>/cgroup`
+    /// rendered from inside another cgroup namespace (the `..` form).
+    fn cgroupns_fixture(tag: &str) -> (std::path::PathBuf, std::path::PathBuf, String) {
+        let base = std::env::temp_dir().join(format!("kg-cgroupns-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let root = base.join("cgroup");
+        let proc_ = base.join("proc");
+        let scope = "kubepods.slice/kubepods-burstable.slice/kubepods-burstable-podabc.slice/cri-containerd-deadbeef.scope";
+        std::fs::create_dir_all(root.join(scope)).unwrap();
+        std::fs::write(root.join(scope).join("cpu.stat"), "usage_usec 1\n").unwrap();
+        std::fs::create_dir_all(proc_.join("4242")).unwrap();
+        std::fs::write(
+            proc_.join("4242/cgroup"),
+            "0::/../../../kubepods-burstable.slice/kubepods-burstable-podabc.slice/cri-containerd-deadbeef.scope\n",
+        )
+        .unwrap();
+        (root, proc_, scope.to_string())
+    }
+
+    #[test]
+    fn resolution_prefers_the_spec_then_the_search_and_rejects_dotdot_proc() {
+        let (root, proc_, scope) = cgroupns_fixture("ok");
+        // 1. spec wins when it converts to an existing directory.
+        let r = resolve_container_cgroup(
+            &root,
+            &proc_,
+            4242,
+            "deadbeef",
+            Some("kubepods-burstable-podabc.slice:cri-containerd:deadbeef"),
+        )
+        .unwrap();
+        assert_eq!((r.path.as_str(), r.via), (scope.as_str(), "spec"));
+        // 2. no spec: the search finds the scope by container id even
+        //    though /proc renders the `..` form.
+        let r = resolve_container_cgroup(&root, &proc_, 4242, "deadbeef", None).unwrap();
+        assert_eq!((r.path.as_str(), r.via), (scope.as_str(), "search"));
+        // 2b. a spec that does not exist on disk falls through to search.
+        let r = resolve_container_cgroup(
+            &root,
+            &proc_,
+            4242,
+            "deadbeef",
+            Some("kubepods-podabc.slice:cri-containerd:deadbeef"),
+        )
+        .unwrap();
+        assert_eq!(r.via, "search");
+        // 3. unknown cid and a `..` proc path: every route fails, and
+        //    the failure names all three attempts.
+        let e = resolve_container_cgroup(&root, &proc_, 4242, "nope", None).unwrap_err();
+        assert_eq!(e.spec, "unavailable");
+        assert!(e.search.contains("nope"), "{e}");
+        assert!(e.proc.contains(".."), "{e}");
+        // 3b. proc is accepted only when it has no `..` and exists.
+        std::fs::write(proc_.join("4242/cgroup"), format!("0::/{scope}\n")).unwrap();
+        let r = resolve_container_cgroup(&root, &proc_, 4242, "nope", None).unwrap();
+        assert_eq!(r.via, "proc");
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[test]
+    fn search_is_bounded_by_depth_and_scoped_to_kubepods() {
+        let base = std::env::temp_dir().join(format!("kg-cgsearch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("system.slice/cri-containerd-abc.scope")).unwrap();
+        std::fs::create_dir_all(base.join("kubepods.slice/a/b/c/d/e/f/cri-containerd-deep.scope"))
+            .unwrap();
+        std::fs::create_dir_all(base.join("kubepods/besteffort/podx/abc")).unwrap();
+        // Not under kubepods*: never found.
+        assert_eq!(
+            search_cgroup_by_cid(&base, "abc", 6, 1000).as_deref(),
+            Some("kubepods/besteffort/podx/abc")
+        );
+        assert_eq!(
+            search_cgroup_by_cid(&base, "deep", 6, 1000),
+            None,
+            "beyond the depth bound"
+        );
+        assert_eq!(
+            search_cgroup_by_cid(&base, "deep", 8, 1000).as_deref(),
+            Some("kubepods.slice/a/b/c/d/e/f/cri-containerd-deep.scope")
+        );
+        assert_eq!(search_cgroup_by_cid(&base, "", 6, 1000), None);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -529,22 +1091,6 @@ mod tests {
         assert_eq!(parse_proc_cgroup_v2("12:cpu:/foo\n"), None);
         // Root cgroup.
         assert_eq!(parse_proc_cgroup_v2("0::/\n").as_deref(), Some(""));
-    }
-
-    #[test]
-    fn pod_cgroup_is_the_parent_of_the_container_scope() {
-        assert_eq!(
-            pod_cgroup_path(
-                "kubepods.slice/kubepods-burstable.slice/kubepods-burstable-podabc.slice/cri-containerd-x.scope"
-            )
-            .as_deref(),
-            Some("kubepods.slice/kubepods-burstable.slice/kubepods-burstable-podabc.slice")
-        );
-        assert_eq!(
-            pod_cgroup_path("kubepods/besteffort/podabc/x").as_deref(),
-            Some("kubepods/besteffort/podabc")
-        );
-        assert_eq!(pod_cgroup_path("init.scope"), None);
     }
 
     #[test]
