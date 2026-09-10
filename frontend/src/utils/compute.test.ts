@@ -1,5 +1,8 @@
 import { describe, expect, test } from 'vitest';
 import {
+  COMPUTE_STATE_OFF,
+  COMPUTE_STATE_PENDING,
+  COMPUTE_STATE_UNSUPPORTED,
   NODE_HEIGHT_BASE,
   NODE_HEIGHT_EXPANDED,
   NODE_HEIGHT_GAUGE_ROW,
@@ -113,28 +116,43 @@ describe('statusFromFindings / nodeComputeState / statusTooltip', () => {
     expect(statusFromFindings([finding('medium'), finding('high')])).toBe('warning');
     expect(statusFromFindings([finding('high'), finding('critical')])).toBe('critical');
   });
-  test('node row gates: none/off → off, unsupported → unsupported', () => {
-    expect(nodeComputeState(undefined)).toBe('off');
+  test('node row gates: no row → pending, off → off, unsupported → unsupported', () => {
+    // Fix #4: an absent node row is "not reported (yet)", never "feature off".
+    expect(nodeComputeState(undefined)).toBe('pending');
     expect(nodeComputeState(node({ compute_enabled: false }))).toBe('off');
     expect(nodeComputeState(node({ compute_supported: false }))).toBe('unsupported');
     expect(nodeComputeState(node())).toBe('ok');
   });
-  test('unsupported and off explain themselves differently', () => {
+  test('unsupported, off and pending explain themselves differently', () => {
     expect(statusTooltip('unsupported')).toMatch(/cgroup v1/);
     expect(statusTooltip('off')).toMatch(/compute\.enabled/);
+    expect(statusTooltip('pending')).toMatch(/No compute sample yet/);
+    expect(new Set([statusTooltip('unsupported'), statusTooltip('off'), statusTooltip('pending')]).size).toBe(3);
     expect(statusTooltip('critical', [finding('critical', 'noisy-neighbor')])).toBe('Compute critical: noisy-neighbor');
   });
 });
 
 describe('buildPodComputeData', () => {
-  test('no rows on a reporting node → undefined (the card renders as before)', () => {
-    expect(buildPodComputeData({ containers: [], nodesByName: new Map([['worker-1', node()]]), findings: [], samples: [], nodeState: 'ok' })).toBeUndefined();
-  });
-  test('no rows on an unsupported node → muted status, no gauges', () => {
-    const d = buildPodComputeData({ containers: [], nodesByName: new Map(), findings: [], samples: [], nodeState: 'unsupported' })!;
-    expect(d.status).toBe('unsupported');
+  test('no rows on a reporting node → the shared PENDING constant (fix #4)', () => {
+    const d = buildPodComputeData({ containers: [], nodesByName: new Map([['worker-1', node()]]), findings: [], samples: [], nodeState: 'ok' });
+    expect(d).toBe(COMPUTE_STATE_PENDING);
+    expect(d.status).toBe('pending');
     expect(hasComputeGauges(d)).toBe(false);
-    expect(d.cpuPct).toBeNull();
+  });
+  test('no rows, node unknown → pending, never off', () => {
+    expect(buildPodComputeData({ containers: [], nodesByName: new Map(), findings: [], samples: [] })).toBe(COMPUTE_STATE_PENDING);
+  });
+  test('no rows on an off / unsupported node → the shared constants, same identity every tick (fix #8)', () => {
+    const off1 = buildPodComputeData({ containers: [], nodesByName: new Map(), findings: [], samples: [], nodeState: 'off' });
+    const off2 = buildPodComputeData({ containers: [], nodesByName: new Map(), findings: [], samples: [], nodeState: 'off' });
+    expect(off1).toBe(COMPUTE_STATE_OFF);
+    expect(off1).toBe(off2);
+    expect(Object.isFrozen(off1)).toBe(true);
+    const u = buildPodComputeData({ containers: [], nodesByName: new Map(), findings: [], samples: [], nodeState: 'unsupported' });
+    expect(u).toBe(COMPUTE_STATE_UNSUPPORTED);
+    expect(u.status).toBe('unsupported');
+    expect(hasComputeGauges(u)).toBe(false);
+    expect(u.cpuPct).toBeNull();
   });
   test('percentages against the picked denominator, sparklines from the samples', () => {
     const rows = [container({ cpu_limit_millis: 500, mem_limit: null, mem_request: 2000 })];
@@ -161,9 +179,11 @@ describe('buildPodComputeData', () => {
     expect(d.memDenominator).toBe('node');
     expect(d.memPct).toBe(50);
   });
-  test('an off node overrides findings on the dot', () => {
-    const d = buildPodComputeData({ containers: [container()], nodesByName: new Map(), findings: [finding('critical')], samples: [], nodeState: 'off' })!;
+  test('an off node overrides findings on the dot; rows on an unknown node are ok, not pending', () => {
+    const d = buildPodComputeData({ containers: [container()], nodesByName: new Map(), findings: [finding('critical')], samples: [], nodeState: 'off' });
     expect(d.status).toBe('off');
+    const p = buildPodComputeData({ containers: [container()], nodesByName: new Map(), findings: [], samples: [] });
+    expect(p.status).toBe('ok');
   });
 });
 

@@ -285,16 +285,20 @@ const DataTable: React.FC<DataTableProps> = ({ selectedPod, allPodsLookup, servi
   // the live rows usePodData merged onto the node. Only for gauged pods.
   const compute = selectedPod?.compute;
   const hasCompute = hasComputeGauges(compute);
-  const blameRows = useMemo(() => {
-    if (!compute) return [];
-    // One list across the pod's containers, largest wait first.
-    const rows: Array<ComputeBlame & { victim: string }> = [];
+  const blame = useMemo(() => {
+    if (!compute) return { rows: [] as Array<ComputeBlame & { victim: string }>, totalWaitNs: 0 };
+    // One list across the pod's containers, largest wait first. The share is
+    // over EVERY blame entry, not the ten shown, so the visible rows never
+    // sum to 100% when a long tail was cut off.
+    const all: Array<ComputeBlame & { victim: string }> = [];
     for (const c of compute.containers) {
-      for (const b of c.blame ?? []) rows.push({ ...b, victim: c.container });
+      for (const b of c.blame ?? []) all.push({ ...b, victim: c.container });
     }
-    return rows.sort((a, b) => b.wait_ns - a.wait_ns).slice(0, 10);
+    const totalWaitNs = all.reduce((sum, b) => sum + b.wait_ns, 0);
+    return { rows: all.sort((a, b) => b.wait_ns - a.wait_ns).slice(0, 10), totalWaitNs };
   }, [compute]);
-  const totalWaitNs = useMemo(() => blameRows.reduce((sum, b) => sum + b.wait_ns, 0), [blameRows]);
+  const blameRows = blame.rows;
+  const totalWaitNs = blame.totalWaitNs;
 
   // Memoize filtered traffic to avoid recalculation on every render
   const filteredTraffic = useMemo(() => {

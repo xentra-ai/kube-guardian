@@ -16,6 +16,7 @@ import PodNode from './PodNode';
 import ContentionEdge from './ContentionEdge';
 import { EDGE_COLOR_CONTENTION, buildContentionEdges } from '../utils/contentionEdges';
 import { hasComputeGauges, nodeHeight } from '../utils/compute';
+import { mergeNodeData, placeNodes } from '../utils/graphNodes';
 import type { ComputeFinding } from '../types/compute';
 import { shouldExitFocus } from '../utils/graphFocus';
 import { EDGE_COLOR_DAEMONSET, edgeStrokeColor, isDaemonSetPeer, partitionDaemonSetPeers, shouldAutoShowDaemonSets } from '../utils/daemonSetPeers';
@@ -636,26 +637,27 @@ const NetworkGraphInner: React.FC<NetworkGraphProps> = ({
     });
   }, [displayNodes, displayEdges, layoutDirection, layoutSignature]);
 
-  // Merge ELK positions into nodes — hide nodes until ELK has run for the current set
-  const positionedNodes: Node[] = useMemo(() => {
-    // Check if ELK has computed positions for these specific nodes
-    const hasPositions = displayNodes.length > 0 && displayNodes.some((n) => elkPositions.has(n.id));
-    if (!hasPositions) return [];
-    return displayNodes.map((node) => ({
-      ...node,
-      position: elkPositions.get(node.id) ?? { x: -9999, y: -9999 },
-    }));
-  }, [displayNodes, elkPositions]);
-
-  const [nodes, setNodes, onNodesChange] = useNodesState(positionedNodes);
+  const [nodes, setNodes, onNodesChange] = useNodesState([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState(displayEdges);
 
-  // Force-replace nodes when ELK positions or data changes.
-  // Using a function updater that ignores previous state ensures React Flow
-  // doesn't merge stale dragged positions with new layout positions.
+  // Two reconciliations, deliberately separate (utils/graphNodes):
+  //  1. A LAYOUT result replaces every node at its ELK position — this is the
+  //     only place a position is written, so a card the user dragged stays
+  //     put until the layout signature actually changes.
+  //  2. A DATA tick (the 5 s compute poll, selection, a gauge) merges `data`
+  //     / `selected` into the existing nodes in place, positions untouched.
+  // The latest display nodes are read through a ref by (1) so it does not
+  // re-run on every tick.
+  const displayNodesRef = React.useRef<Node[]>(displayNodes);
   useEffect(() => {
-    setNodes(positionedNodes);
-  }, [positionedNodes, setNodes]);
+    displayNodesRef.current = displayNodes;
+  }, [displayNodes]);
+  useEffect(() => {
+    setNodes(placeNodes(displayNodesRef.current, elkPositions));
+  }, [elkPositions, setNodes]);
+  useEffect(() => {
+    setNodes((prev) => mergeNodeData(prev, displayNodes));
+  }, [displayNodes, setNodes]);
 
   // Update edges when traffic changes
   useEffect(() => {

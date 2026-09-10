@@ -105,13 +105,17 @@ export function statusFromFindings(findings: readonly ComputeFinding[]): Extract
   return 'ok';
 }
 
+export type NodeComputeState = 'ok' | 'unsupported' | 'off' | 'pending';
+
 /**
- * Node-level gate (D10): a node with `compute_enabled=false` renders its pods
- * as `off`; one with `compute_supported=false` (cgroup v1 / no PSI) as
- * `unsupported`. No node row at all = feature off or an older controller.
+ * Node-level gate (D10): a node row with `compute_enabled=false` renders its
+ * pods as `off`; `compute_supported=false` (cgroup v1 / no PSI) as
+ * `unsupported`. No node row at all is `pending` — the node has not
+ * reported (yet); it is NOT evidence the feature is off.
  */
-export function nodeComputeState(node: ComputeNode | undefined): 'ok' | 'unsupported' | 'off' {
-  if (!node || !node.compute_enabled) return 'off';
+export function nodeComputeState(node: ComputeNode | undefined): NodeComputeState {
+  if (!node) return 'pending';
+  if (!node.compute_enabled) return 'off';
   if (!node.compute_supported) return 'unsupported';
   return 'ok';
 }
@@ -123,6 +127,8 @@ export function statusTooltip(status: ComputeStatus, findings: readonly ComputeF
       return 'Compute gauges off: compute.enabled is false on this node, or the controller predates the feature';
     case 'unsupported':
       return 'Compute gauges unsupported on this node (cgroup v1 or no PSI)';
+    case 'pending':
+      return 'No compute sample yet for this pod';
     case 'ok':
       return 'Compute: no active findings';
     default: {
@@ -174,29 +180,42 @@ export interface BuildPodComputeInput {
   /** Oldest-first client-side samples for this pod. */
   samples: readonly ComputeSample[];
   /** Whether the pod's node reported compute at all (see nodeComputeState). */
-  nodeState?: 'ok' | 'unsupported' | 'off';
+  nodeState?: NodeComputeState;
 }
 
+const frozenArray = <T,>(): T[] => Object.freeze([]) as unknown as T[];
+const emptyState = (status: ComputeStatus): PodComputeData =>
+  Object.freeze({
+    cpuPct: null, memPct: null, cpuDenominator: null, memDenominator: null,
+    status, findings: frozenArray<ComputeFinding>(), sparkCpu: frozenArray<number>(), sparkMem: frozenArray<number>(),
+    cpuMillis: null, memBytes: null, cpuCapacityMillis: null, memCapacityBytes: null,
+    containers: frozenArray<ComputeContainer>(),
+  });
+
+// Shared, frozen "no rows" states. Returned by identity so a pod without
+// rows keeps the same `compute` object across polls and PodNode's memo
+// (which compares by identity) does not repaint it every 5 s.
+export const COMPUTE_STATE_OFF: PodComputeData = emptyState('off');
+export const COMPUTE_STATE_UNSUPPORTED: PodComputeData = emptyState('unsupported');
+export const COMPUTE_STATE_PENDING: PodComputeData = emptyState('pending');
+
 /**
- * Everything PodNode needs, from a pod's rows. Returns `undefined` when there
- * is nothing to show AND the node is not reporting — so a node without
- * compute data renders exactly as before this feature.
+ * Everything PodNode needs, from a pod's rows. Without rows the result is
+ * one of the shared constants above: `off` / `unsupported` only when the
+ * node row says so, `pending` when the node has not reported or the pod has
+ * no sample yet. Callers leave `compute` undefined entirely when the feature
+ * is off cluster-wide (hook `enabled=false`).
  */
-export function buildPodComputeData(input: BuildPodComputeInput): PodComputeData | undefined {
+export function buildPodComputeData(input: BuildPodComputeInput): PodComputeData {
   const { containers, nodesByName, findings, samples } = input;
   const nodeName = containers[0]?.node;
   const nodeRow = nodeName ? nodesByName.get(nodeName) : undefined;
   const nodeState = input.nodeState ?? nodeComputeState(nodeRow);
 
   if (containers.length === 0) {
-    if (nodeState === 'ok') return undefined;
-    // The pod's node told us why there is nothing: render the muted dot.
-    return {
-      cpuPct: null, memPct: null, cpuDenominator: null, memDenominator: null,
-      status: nodeState, findings: [], sparkCpu: [], sparkMem: [],
-      cpuMillis: null, memBytes: null, cpuCapacityMillis: null, memCapacityBytes: null,
-      containers: [],
-    };
+    if (nodeState === 'off') return COMPUTE_STATE_OFF;
+    if (nodeState === 'unsupported') return COMPUTE_STATE_UNSUPPORTED;
+    return COMPUTE_STATE_PENDING;
   }
 
   const latest = samples[samples.length - 1] ?? podLevelSample(containers, Date.now());
@@ -211,7 +230,8 @@ export function buildPodComputeData(input: BuildPodComputeInput): PodComputeData
     nodeRow?.memory_bytes ?? null,
   );
 
-  const status: ComputeStatus = nodeState !== 'ok' ? nodeState : statusFromFindings(findings);
+  // Rows exist, so the node is reporting: `pending` cannot apply here.
+  const status: ComputeStatus = nodeState === 'off' || nodeState === 'unsupported' ? nodeState : statusFromFindings(findings);
 
   return {
     cpuPct: percentOf(latest.cpuMillis, cpuDen),
@@ -256,7 +276,23 @@ export const COMPUTE_DOT_CLASS: Record<ComputeStatus, string> = {
   critical: 'bg-hubble-error',
   unsupported: 'bg-hubble-border-strong',
   off: 'bg-hubble-border',
+  pending: 'bg-hubble-border animate-pulse',
 };
+
+/**
+ * What a culprit's `blame_share` is a share OF — it differs by kind (see the
+ * type comment on `ComputeFindingCulprit.blame_share`).
+ */
+export function blameShareLabel(kind: ComputeFindingKind, share: number): string {
+  const pct = `${Math.round(share * 100)}%`;
+  return kind === 'memory-pressure' ? `${pct} of node memory overage` : `${pct} of its CPU wait`;
+}
+
+/** Culprit usage for labels; an opted-out culprit has none. */
+export const CULPRIT_USAGE_UNKNOWN = 'usage unknown (opted out of sampling)';
+export function culpritUsageLabel(usageMillis: number | null): string {
+  return usageMillis === null ? CULPRIT_USAGE_UNKNOWN : `using ${formatMillicores(usageMillis)}`;
+}
 
 export const COMPUTE_KIND_LABEL: Record<ComputeFindingKind, string> = {
   'noisy-neighbor': 'Noisy neighbour',

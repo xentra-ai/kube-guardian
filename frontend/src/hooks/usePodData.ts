@@ -158,7 +158,9 @@ export const usePodData = (namespace: string) => {
       const uid = containers[0]?.pod_uid;
       const samples = uid ? compute.history.get(uid)?.values() ?? [] : [];
       const data = buildPodComputeData({ containers, nodesByName: compute.nodesByName, findings, samples, nodeState });
-      return data ? { ...pod, compute: data } : pod;
+      // Same shared constant as last tick ⇒ same pod object, so PodNode's
+      // identity memo holds for pods without rows.
+      return pod.compute === data ? pod : { ...pod, compute: data };
     });
     // `history` is a fresh Map per poll over the in-place ring buffers, so it
     // is the dependency that re-reads the sparklines.

@@ -408,6 +408,7 @@ function App() {
             onOpenAudit={() => setIsAuditPanelOpen(true)}
             computeFindings={compute.findings}
             computeEnabled={compute.enabled}
+            computeMeta={compute.findingsMeta}
             onViewWorkload={handleViewWorkload}
           />
         ) : (

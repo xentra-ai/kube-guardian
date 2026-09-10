@@ -2,7 +2,8 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 import { act, cleanup, renderHook } from '@testing-library/react';
 import { useComputeData } from './useComputeData';
-import type { ComputeContainer, ComputeFinding, ComputeLatestResponse, ComputeNode } from '../types/compute';
+import { ComputeUnsupportedError } from '../services/api';
+import type { ComputeContainer, ComputeFindingsResponse, ComputeLatestResponse, ComputeNode } from '../types/compute';
 
 // Contract (design D8 / wire contract): 5 s poll of latest, 15 s poll of
 // findings, paused while the tab is hidden, a 60-sample ring buffer per pod
@@ -29,10 +30,11 @@ const container = (over: Partial<ComputeContainer> = {}): ComputeContainer => ({
   ...over,
 });
 
-function fakeApi(latest: () => ComputeLatestResponse, findings: () => ComputeFinding[] = () => []) {
+function fakeApi(latest: () => ComputeLatestResponse, findings: () => ComputeFindingsResponse = () => ({ findings: [] }), nodes: () => ComputeNode[] = () => []) {
   return {
     getComputeLatest: vi.fn(async () => latest()),
     getComputeFindings: vi.fn(async () => findings()),
+    getComputeNodes: vi.fn(async () => nodes()),
   };
 }
 
@@ -170,20 +172,122 @@ describe('useComputeData', () => {
     expect(result.current.history.get('uid-a')!.length).toBe(1);
   });
 
-  test('surfaces an API error without dropping the last good data', async () => {
+  test('surfaces a transient API error without dropping the last good data, keeps polling, clears on recovery', async () => {
     let fail = false;
     const api = {
       getComputeLatest: vi.fn(async () => {
         if (fail) throw new Error('boom');
         return { containers: [container()], nodes: [node()] };
       }),
-      getComputeFindings: vi.fn(async () => []),
+      getComputeFindings: vi.fn(async () => ({ findings: [] })),
+      getComputeNodes: vi.fn(async () => []),
     };
     const { result } = renderHook(() => useComputeData('payments', { api }));
     await flush();
     fail = true;
     await act(async () => { await vi.advanceTimersByTimeAsync(5_000); });
     expect(result.current.error).toBe('boom');
+    expect(result.current.supported).toBe(true);
     expect(result.current.containersByPodUid.size).toBe(1);
+    fail = false;
+    await act(async () => { await vi.advanceTimersByTimeAsync(5_000); });
+    expect(api.getComputeLatest).toHaveBeenCalledTimes(3);
+    expect(result.current.error).toBeNull();
+  });
+
+  // Fix #2: an older broker (404 on /compute/*) must not be hammered every
+  // 5 s / 15 s with a console.error each time.
+  test('404 on a compute endpoint: supported=false, both polls stop, one debug line, no error', async () => {
+    const debug = vi.spyOn(console, 'debug').mockImplementation(() => {});
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const api = {
+      getComputeLatest: vi.fn(async () => { throw new ComputeUnsupportedError('/compute/latest'); }),
+      getComputeFindings: vi.fn(async () => { throw new ComputeUnsupportedError('/compute/findings'); }),
+      getComputeNodes: vi.fn(async () => { throw new ComputeUnsupportedError('/compute/nodes'); }),
+    };
+    const { result } = renderHook(() => useComputeData('payments', { api }));
+    await flush();
+    expect(result.current.supported).toBe(false);
+    expect(result.current.enabled).toBe(false);
+    expect(result.current.error).toBeNull();
+    const latestCalls = api.getComputeLatest.mock.calls.length;
+    const findingsCalls = api.getComputeFindings.mock.calls.length;
+    await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
+    expect(api.getComputeLatest).toHaveBeenCalledTimes(latestCalls);
+    expect(api.getComputeFindings).toHaveBeenCalledTimes(findingsCalls);
+    expect(debug).toHaveBeenCalledTimes(1);
+    expect(debug.mock.calls[0][0]).toMatch(/compute polling stopped/);
+    expect(error).not.toHaveBeenCalled();
+  });
+
+  test('a namespace change after 404 tries once more (a cheap retry signal)', async () => {
+    vi.spyOn(console, 'debug').mockImplementation(() => {});
+    const api = fakeApi(() => { throw new ComputeUnsupportedError('/compute/latest'); });
+    const { result, rerender } = renderHook(({ ns }) => useComputeData(ns, { api }), { initialProps: { ns: 'payments' } });
+    await flush();
+    expect(result.current.supported).toBe(false);
+    const calls = api.getComputeLatest.mock.calls.length;
+    rerender({ ns: 'batch' });
+    await flush();
+    expect(api.getComputeLatest.mock.calls.length).toBe(calls + 1);
+    expect(result.current.supported).toBe(false);
+  });
+
+  // Fix #5: a response from the previous namespace that lands after the
+  // switch must be discarded, and the new namespace's first poll must not be
+  // blocked by the old in-flight one.
+  test('stale response from the previous namespace is discarded', async () => {
+    const pending: Array<(r: ComputeLatestResponse) => void> = [];
+    const api = {
+      getComputeLatest: vi.fn((ns: string) => new Promise<ComputeLatestResponse>((resolve) => {
+        if (ns === 'payments') pending.push(resolve);
+        else resolve({ containers: [container({ pod_uid: 'uid-batch', namespace: 'batch', pod_name: 'etl-1' })], nodes: [node()] });
+      })),
+      getComputeFindings: vi.fn(async () => ({ findings: [] })),
+      getComputeNodes: vi.fn(async () => []),
+    };
+    const { result, rerender } = renderHook(({ ns }) => useComputeData(ns, { api }), { initialProps: { ns: 'payments' } });
+    await flush();
+    expect(pending).toHaveLength(1); // payments' first poll is still in flight
+    rerender({ ns: 'batch' });
+    await flush();
+    // batch's poll was not blocked by payments' in-flight one and has landed.
+    expect(result.current.containersByPodUid.has('uid-batch')).toBe(true);
+    // Now the old payments response arrives — and changes nothing.
+    await act(async () => { pending[0]({ containers: [container()], nodes: [node()] }); await Promise.resolve(); });
+    expect(result.current.containersByPodUid.has('uid-a')).toBe(false);
+    expect(result.current.containersByPodUid.has('uid-batch')).toBe(true);
+    expect(result.current.history.has('uid-a')).toBe(false);
+  });
+
+  // Fix #4: /compute/nodes once per namespace load, so a node with no pod
+  // rows in this namespace still has a known state; live rows win.
+  test('findings metadata (truncated / victims_evaluated / history_disabled) is normalised and reset per namespace', async () => {
+    let meta: ComputeFindingsResponse = { findings: [], truncated: true, victims_evaluated: 500 };
+    const api = fakeApi(() => ({ containers: [], nodes: [node()] }), () => meta);
+    const { result, rerender } = renderHook(({ ns }) => useComputeData(ns, { api }), { initialProps: { ns: 'payments' } });
+    await flush();
+    expect(result.current.findingsMeta).toEqual({ truncated: true, victimsEvaluated: 500, historyDisabled: false });
+    meta = { findings: [], history_disabled: true }; // optional fields absent on the wire
+    rerender({ ns: 'batch' });
+    await flush();
+    expect(result.current.findingsMeta).toEqual({ truncated: false, victimsEvaluated: null, historyDisabled: true });
+  });
+
+  test('merges the one-shot /compute/nodes rows under the namespace-scoped live rows', async () => {
+    const api = fakeApi(
+      () => ({ containers: [], nodes: [node({ node: 'worker-1', cpu_cores: 16 })] }),
+      () => ({ findings: [] }),
+      () => [node({ node: 'worker-1', cpu_cores: 8 }), node({ node: 'worker-9', compute_supported: false })],
+    );
+    const { result } = renderHook(() => useComputeData('payments', { api }));
+    await flush();
+    expect(api.getComputeNodes).toHaveBeenCalledTimes(1);
+    expect(result.current.nodesByName.get('worker-1')?.cpu_cores).toBe(16); // live row wins
+    expect(result.current.nodesByName.get('worker-9')?.compute_supported).toBe(false);
+    expect(result.current.enabled).toBe(true);
+    await act(async () => { await vi.advanceTimersByTimeAsync(5_000); });
+    expect(api.getComputeNodes).toHaveBeenCalledTimes(1); // once, not polled
+    expect(result.current.nodesByName.has('worker-9')).toBe(true); // survives the poll
   });
 });

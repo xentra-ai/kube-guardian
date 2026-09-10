@@ -108,9 +108,14 @@ export interface ComputeFindingCulprit {
   namespace: string | null;
   pod_name: string | null;
   container_uid: string | null;
-  /** Share of the victim's wait time attributed to this culprit (0..1). */
+  /** 0..1. Kind-dependent: for `noisy-neighbor` / `cpu-contended` the
+   *  culprit's share of the victim's CPU run-queue wait; for
+   *  `memory-pressure` its share of the node's memory overage
+   *  (utils/compute `blameShareLabel`). */
   blame_share: number;
-  cpu_usage_millis: number;
+  /** Null when the culprit opted out of sampling (`kguardian.dev/compute: off`):
+   *  it can still be blamed, but its usage is unknown. */
+  cpu_usage_millis: number | null;
   cpu_request_millis: number | null;
 }
 
@@ -217,6 +222,23 @@ export interface ComputeLatestResponse {
   nodes: ComputeNode[];
 }
 
+/** `GET /compute/findings`. The metadata fields are optional on the wire. */
+export interface ComputeFindingsResponse {
+  findings: ComputeFinding[];
+  /** The engine's victim cap was hit; only the first `victims_evaluated` were scored. */
+  truncated?: boolean;
+  victims_evaluated?: number;
+  /** `COMPUTE_HISTORY_RETENTION_DAYS=0`: no history rows ⇒ no findings can be computed. */
+  history_disabled?: boolean;
+}
+
+/** Normalised findings metadata (hooks/useComputeData). */
+export interface ComputeFindingsMeta {
+  truncated: boolean;
+  victimsEvaluated: number | null;
+  historyDisabled: boolean;
+}
+
 /** One client-side sample of a pod's summed containers (utils/compute). */
 export interface ComputeSample {
   /** `Date.now()` when the poll landed (samples are keyed by poll, not by row `ts`). */
@@ -228,7 +250,8 @@ export interface ComputeSample {
 /** Which capacity a gauge percentage is normalised against (D8: limit → request → node). */
 export type ComputeDenominator = 'limit' | 'request' | 'node';
 
-export type ComputeStatus = 'ok' | 'warning' | 'critical' | 'unsupported' | 'off';
+/** `pending`: no sample for this pod yet (fresh pod, or its node has not reported). */
+export type ComputeStatus = 'ok' | 'warning' | 'critical' | 'unsupported' | 'off' | 'pending';
 
 /** Per-node compute state on `PodNodeData.compute` (see utils/compute). */
 export interface PodComputeData {

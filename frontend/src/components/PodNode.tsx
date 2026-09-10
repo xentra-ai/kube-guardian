@@ -14,6 +14,7 @@ import {
   formatMillicores,
   formatPercent,
   hasComputeGauges,
+  culpritUsageLabel,
   starvedBy,
   statusTooltip,
   throttledFinding,
@@ -51,7 +52,7 @@ const ComputeMicroBar: React.FC<{ compute: PodComputeData }> = ({ compute }) => 
   const cpuTitle = gaugeTitle('CPU', formatMillicores(compute.cpuMillis), compute.cpuPct, compute.cpuDenominator, formatMillicores(compute.cpuCapacityMillis));
   const memTitle = gaugeTitle('Memory', formatBytes(compute.memBytes), compute.memPct, compute.memDenominator, formatBytes(compute.memCapacityBytes));
   const seg = (pct: number | null, title: string, testId: string) => (
-    <div className="flex-1 h-1.5 rounded-full bg-hubble-border/60 overflow-hidden" title={title} data-testid={testId}>
+    <div className="flex-1 h-1.5 rounded-full bg-hubble-border/60 overflow-hidden" title={title} role="img" aria-label={title} data-testid={testId}>
       <div
         className={`h-full rounded-full ${gaugeFillClass(pct)} transition-[width] duration-500`}
         style={{ width: `${pct === null ? 0 : Math.min(100, Math.max(0, pct))}%` }}
@@ -78,6 +79,12 @@ const ComputeDetail: React.FC<{ compute: PodComputeData }> = ({ compute }) => {
       ? `${culprit.namespace ?? ''}/${culprit.pod_name}`
       : culprit.ref
     : null;
+  // The sparkline's ceiling is the same denominator as the micro bar when it
+  // is the pod's own limit or request. Against NODE capacity (a request-less
+  // pod on a 32-core node) that would flatten every line to the baseline, so
+  // those auto-scale to the buffer's own maximum instead.
+  const cpuMax = compute.cpuDenominator === 'node' ? null : compute.cpuCapacityMillis;
+  const memMax = compute.memDenominator === 'node' ? null : compute.memCapacityBytes;
   return (
     <div className="space-y-2" data-testid="compute-detail">
       <div>
@@ -92,7 +99,7 @@ const ComputeDetail: React.FC<{ compute: PodComputeData }> = ({ compute }) => {
         </div>
         <Sparkline
           values={compute.sparkCpu}
-          max={compute.cpuCapacityMillis}
+          max={cpuMax}
           capacity={COMPUTE_HISTORY_SAMPLES}
           height={26}
           title={`CPU, last ${COMPUTE_HISTORY_SAMPLES} samples`}
@@ -110,7 +117,7 @@ const ComputeDetail: React.FC<{ compute: PodComputeData }> = ({ compute }) => {
         </div>
         <Sparkline
           values={compute.sparkMem}
-          max={compute.memCapacityBytes}
+          max={memMax}
           capacity={COMPUTE_HISTORY_SAMPLES}
           height={26}
           color="var(--color-hubble-info)"
@@ -122,7 +129,7 @@ const ComputeDetail: React.FC<{ compute: PodComputeData }> = ({ compute }) => {
           {starved && culpritLabel && (
             <span
               className="inline-flex items-center gap-1 rounded-full border border-hubble-error/30 bg-hubble-error/15 text-hubble-error px-2 py-0.5 text-[10px] font-medium"
-              title={starved.message}
+              title={culprit?.cpu_usage_millis === null ? `${starved.message} — ${culpritUsageLabel(null)}` : starved.message}
               data-testid="compute-starved-chip"
             >
               <Zap className="w-3 h-3" />
@@ -221,6 +228,8 @@ const PodNode: React.FC<PodNodeProps> = React.memo(({ data, selected }) => {
                 <span
                   className={`shrink-0 w-2 h-2 rounded-full ${COMPUTE_DOT_CLASS[compute.status]}`}
                   title={statusTooltip(compute.status, compute.findings)}
+                  role="img"
+                  aria-label={statusTooltip(compute.status, compute.findings)}
                   data-testid="compute-status-dot"
                   data-status={compute.status}
                 />

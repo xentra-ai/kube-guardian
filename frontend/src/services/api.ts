@@ -3,12 +3,30 @@ import type { AxiosInstance } from 'axios';
 import type { PodInfo, NetworkTraffic, SyscallInfo, ServiceInfo, AuditVerdict, ClusterEnvironment } from '../types';
 import { UNKNOWN_CLUSTER_ENVIRONMENT } from '../types';
 import type {
-  ComputeFinding,
+  ComputeFindingsResponse,
   ComputeHistoryRow,
   ComputeLatestResponse,
   ComputeNode,
   ContentionPair,
 } from '../types/compute';
+
+/**
+ * The broker has no compute endpoints (404 / 501): a broker predating the
+ * feature. Consumers stop polling for the session instead of retrying.
+ */
+export class ComputeUnsupportedError extends Error {
+  constructor(path: string) {
+    super(`compute endpoints unsupported by this broker (${path})`);
+    this.name = 'ComputeUnsupportedError';
+  }
+}
+
+function rethrowCompute(error: unknown, path: string): never {
+  if (axios.isAxiosError(error) && (error.response?.status === 404 || error.response?.status === 501)) {
+    throw new ComputeUnsupportedError(path);
+  }
+  throw error;
+}
 
 class BrokerAPIClient {
   private client: AxiosInstance;
@@ -254,9 +272,10 @@ class BrokerAPIClient {
   }
 
   // ── Compute gauges / contention (docs/design/compute-contention-monitoring.md) ──
-  // Every method degrades to an empty result on failure, like the traffic
-  // getters above: a broker predating the feature 404s these and the map
-  // must render exactly as before.
+  // Unlike the traffic getters these do NOT swallow failures: a 404/501
+  // becomes ComputeUnsupportedError (the hook stops polling for the
+  // session, so an older broker is not hammered every 5 s) and anything else
+  // propagates so the hook can surface a real error and retry next tick.
 
   /** Live per-container rows + node rows for the namespace (`GET /compute/latest`). */
   async getComputeLatest(namespace: string): Promise<ComputeLatestResponse> {
@@ -268,8 +287,7 @@ class BrokerAPIClient {
         nodes: Array.isArray(data?.nodes) ? data.nodes : [],
       };
     } catch (error) {
-      console.error('Error fetching compute latest:', error);
-      return { containers: [], nodes: [] };
+      return rethrowCompute(error, '/compute/latest');
     }
   }
 
@@ -282,8 +300,7 @@ class BrokerAPIClient {
       );
       return Array.isArray(response.data?.rows) ? response.data.rows : [];
     } catch (error) {
-      console.error('Error fetching compute history:', error);
-      return [];
+      return rethrowCompute(error, '/compute/history');
     }
   }
 
@@ -297,22 +314,26 @@ class BrokerAPIClient {
       const response = await this.client.get<{ pairs: ContentionPair[] }>('/compute/contention', { params });
       return Array.isArray(response.data?.pairs) ? response.data.pairs : [];
     } catch (error) {
-      console.error('Error fetching compute contention:', error);
-      return [];
+      return rethrowCompute(error, '/compute/contention');
     }
   }
 
-  /** Broker-computed compute findings (`GET /compute/findings`); no filter = cluster. */
-  async getComputeFindings(opts: { namespace?: string; node?: string } = {}): Promise<ComputeFinding[]> {
+  /** Broker-computed compute findings + metadata (`GET /compute/findings`); no filter = cluster. */
+  async getComputeFindings(opts: { namespace?: string; node?: string } = {}): Promise<ComputeFindingsResponse> {
     try {
       const params: Record<string, string> = {};
       if (opts.namespace) params.namespace = opts.namespace;
       if (opts.node) params.node = opts.node;
-      const response = await this.client.get<{ findings: ComputeFinding[] }>('/compute/findings', { params });
-      return Array.isArray(response.data?.findings) ? response.data.findings : [];
+      const response = await this.client.get<ComputeFindingsResponse>('/compute/findings', { params });
+      const data = response.data;
+      return {
+        findings: Array.isArray(data?.findings) ? data.findings : [],
+        truncated: data?.truncated === true,
+        victims_evaluated: typeof data?.victims_evaluated === 'number' ? data.victims_evaluated : undefined,
+        history_disabled: data?.history_disabled === true,
+      };
     } catch (error) {
-      console.error('Error fetching compute findings:', error);
-      return [];
+      return rethrowCompute(error, '/compute/findings');
     }
   }
 
@@ -322,8 +343,7 @@ class BrokerAPIClient {
       const response = await this.client.get<{ nodes: ComputeNode[] }>('/compute/nodes');
       return Array.isArray(response.data?.nodes) ? response.data.nodes : [];
     } catch (error) {
-      console.error('Error fetching compute nodes:', error);
-      return [];
+      return rethrowCompute(error, '/compute/nodes');
     }
   }
 

@@ -11,9 +11,9 @@ import {
   ExternalLink,
 } from 'lucide-react';
 import type { PodNodeData, AuditVerdict } from '../types';
-import type { ComputeFinding, ComputeFindingKind } from '../types/compute';
+import type { ComputeFinding, ComputeFindingKind, ComputeFindingsMeta } from '../types/compute';
 import { findingAction, type FindingKind } from '../utils/findingPolicyType';
-import { COMPUTE_KIND_LABEL } from '../utils/compute';
+import { COMPUTE_KIND_LABEL, blameShareLabel, culpritUsageLabel, formatMillicores } from '../utils/compute';
 import api from '../services/api';
 import { Button } from './ui/Button';
 import { EmptyState } from './ui/EmptyState';
@@ -30,6 +30,8 @@ interface FindingsViewProps {
   computeFindings?: ComputeFinding[];
   /** False when no node reports compute — the section is then not offered. */
   computeEnabled?: boolean;
+  /** Truncation / history flags from the findings endpoint. */
+  computeMeta?: ComputeFindingsMeta;
   /** "View workload" for a `resources` finding: jump to the pod on the map. */
   onViewWorkload?: (namespace: string, podName: string) => void;
 }
@@ -119,6 +121,7 @@ export function FindingsView({
   onOpenAudit,
   computeFindings = [],
   computeEnabled = false,
+  computeMeta,
   onViewWorkload,
 }: FindingsViewProps) {
   const workloads = useMemo(() => pods.filter((p) => !p.isExternal), [pods]);
@@ -126,11 +129,17 @@ export function FindingsView({
   // Compute findings (design D7) come from the broker, already ranked by
   // severity there; a node filter narrows them because a noisy neighbour is
   // a per-node problem.
-  const [nodeFilter, setNodeFilter] = useState<string>('all');
+  // The filter is stored WITH the namespace it was picked in and is derived
+  // back to "all" when the namespace changes or the node no longer has a
+  // finding — so a stale filter can never leave the list empty with no way
+  // out (and no effect is needed to reset it).
+  const [nodePick, setNodePick] = useState<{ namespace: string; node: string } | null>(null);
   const computeNodes = useMemo(
     () => [...new Set(computeFindings.map((f) => f.victim.node))].sort(),
     [computeFindings],
   );
+  const nodeFilter = nodePick && nodePick.namespace === namespace && computeNodes.includes(nodePick.node) ? nodePick.node : 'all';
+  const setNodeFilter = (node: string) => setNodePick(node === 'all' ? null : { namespace, node });
   const filteredCompute = useMemo(() => {
     const rows = nodeFilter === 'all' ? computeFindings : computeFindings.filter((f) => f.victim.node === nodeFilter);
     return [...rows].sort(
@@ -271,7 +280,11 @@ export function FindingsView({
             <EmptyState
               icon={ShieldCheck}
               title="No standout findings"
-              description={`No blocked connections, sensitive syscalls,${computeEnabled ? ' compute contention,' : ''} or unusual egress fan-out in this namespace. Keep an eye on the map for changes.`}
+              description={
+                computeMeta?.historyDisabled
+                  ? 'No blocked connections, sensitive syscalls, or unusual egress fan-out in this namespace. Compute findings cannot be computed: history retention is disabled on the broker (compute.history.retentionDays is 0).'
+                  : `No blocked connections, sensitive syscalls,${computeEnabled ? ' compute contention,' : ''} or unusual egress fan-out in this namespace. Keep an eye on the map for changes.`
+              }
             />
           </div>
         ) : (
@@ -361,24 +374,40 @@ export function FindingsView({
                 title="Compute contention"
                 hint="Pods starved of CPU or memory, and the pod on the same node starving them. Fix is the workload's resources, not a policy"
                 action={
-                  computeNodes.length > 1 ? (
-                    <label className="flex items-center gap-2 text-xs text-tertiary">
-                      Node
-                      <select
-                        value={nodeFilter}
-                        onChange={(e) => setNodeFilter(e.target.value)}
-                        aria-label="Filter compute findings by node"
-                        className="bg-hubble-dark border border-hubble-border rounded px-2 py-1 text-xs text-secondary focus:outline-none focus:border-hubble-accent"
-                      >
-                        <option value="all">All nodes</option>
-                        {computeNodes.map((n) => (
-                          <option key={n} value={n}>{n}</option>
-                        ))}
-                      </select>
-                    </label>
+                  computeNodes.length > 1 || nodeFilter !== 'all' ? (
+                    <div className="flex items-center gap-2 text-xs text-tertiary">
+                      <label className="flex items-center gap-2">
+                        Node
+                        <select
+                          value={nodeFilter}
+                          onChange={(e) => setNodeFilter(e.target.value)}
+                          aria-label="Filter compute findings by node"
+                          className="bg-hubble-dark border border-hubble-border rounded px-2 py-1 text-xs text-secondary focus:outline-none focus:border-hubble-accent"
+                        >
+                          <option value="all">All nodes</option>
+                          {computeNodes.map((n) => (
+                            <option key={n} value={n}>{n}</option>
+                          ))}
+                        </select>
+                      </label>
+                      {nodeFilter !== 'all' && (
+                        <button
+                          type="button"
+                          onClick={() => setNodeFilter('all')}
+                          className="text-hubble-accent hover:text-hubble-accent/80 underline"
+                        >
+                          Clear
+                        </button>
+                      )}
+                    </div>
                   ) : undefined
                 }
               >
+                {computeMeta?.truncated && (
+                  <p className="px-4 py-2 text-xs text-hubble-warning border-b border-hubble-border" data-testid="compute-truncated">
+                    Findings evaluated for the first {computeMeta.victimsEvaluated ?? 'N'} victims; narrow by namespace or node.
+                  </p>
+                )}
                 {filteredCompute.length === 0 ? (
                   <p className="px-4 py-3 text-xs text-tertiary">No compute findings on this node.</p>
                 ) : (
@@ -409,8 +438,11 @@ export function FindingsView({
                               <span>{f.message}</span>
                               <span className="ml-2 font-mono">node {f.victim.node}</span>
                               {culpritLabel && f.culprit && (
-                                <span className="ml-2 font-mono text-hubble-error" title={`${Math.round(f.culprit.blame_share * 100)}% of the victim's wait`}>
-                                  ← {culpritLabel} ({Math.round(f.culprit.blame_share * 100)}%)
+                                <span
+                                  className="ml-2 font-mono text-hubble-error"
+                                  title={`${blameShareLabel(kind, f.culprit.blame_share)}; ${culpritUsageLabel(f.culprit.cpu_usage_millis)}`}
+                                >
+                                  ← {culpritLabel} ({Math.round(f.culprit.blame_share * 100)}%, {formatMillicores(f.culprit.cpu_usage_millis)})
                                 </span>
                               )}
                             </div>

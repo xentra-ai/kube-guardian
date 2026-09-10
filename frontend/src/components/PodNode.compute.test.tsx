@@ -103,12 +103,55 @@ test('expanded: "Starved by <ns/pod>" chip when a noisy-neighbour finding names 
   expect(dot.getAttribute('title')).toContain('noisy-neighbor');
 });
 
+test('Starved-by chip: an opted-out culprit (null usage) says so in the tooltip', () => {
+  const f = finding();
+  f.culprit = { ...f.culprit!, cpu_usage_millis: null };
+  const { container } = renderNode(base({ isExpanded: true, compute: compute({ status: 'warning', findings: [f] }) }));
+  const chip = container.querySelector('[data-testid="compute-starved-chip"]')!;
+  expect(chip.textContent).toBe('Starved by batch/etl-1');
+  expect(chip.getAttribute('title')).toBe(`${f.message} — usage unknown (opted out of sampling)`);
+});
+
 test('expanded: "Throttled NN%" chip for cpu-throttled; a critical finding paints the dot red', () => {
   const f = finding({ kind: 'cpu-throttled', severity: 'critical', culprit: null, evidence: { ...finding().evidence, throttled_ratio: 0.34 } });
   const { container } = renderNode(base({ isExpanded: true, compute: compute({ status: 'critical', findings: [f] }) }));
   expect(container.querySelector('[data-testid="compute-throttled-chip"]')!.textContent).toBe('Throttled 34%');
   expect(container.querySelector('[data-testid="compute-starved-chip"]')).toBeNull();
   expect(container.querySelector('[data-testid="compute-status-dot"]')!.className).toContain(COMPUTE_DOT_CLASS.critical);
+});
+
+// Fix #7: the sparkline ceiling follows the micro bar's denominator, except
+// that a node-capacity denominator auto-scales (a 100m pod on a 32-core node
+// would otherwise be a flat line on the baseline).
+test('sparkline auto-scales when the denominator is node capacity, and follows the limit otherwise', () => {
+  const nodeScaled = renderNode(base({ isExpanded: true, compute: compute({ cpuDenominator: 'node', cpuCapacityMillis: 32_000, sparkCpu: [100, 200, 150] }) }));
+  const cpuSpark = nodeScaled.container.querySelectorAll('[data-testid="sparkline"]')[0]; // first = CPU, second = memory
+  const d = cpuSpark.querySelector('path[fill="none"]')!.getAttribute('d')!;
+  const ys = [...d.matchAll(/,([\d.]+)/g)].map((m) => Number(m[1]));
+  expect(Math.max(...ys) - Math.min(...ys)).toBeGreaterThan(10); // not flat
+  expect(cpuSpark.querySelector('line')).toBeNull(); // no capacity line against node capacity
+  cleanup();
+  const limitScaled = renderNode(base({ isExpanded: true, compute: compute({ cpuDenominator: 'limit', cpuCapacityMillis: 500, sparkCpu: [100, 200, 150] }) }));
+  expect(limitScaled.container.querySelectorAll('[data-testid="sparkline"]')[0].querySelector('line')).not.toBeNull(); // limit reference line
+});
+
+// Fix #9: the dot and bars are images with an accessible name mirroring the tooltip.
+test('status dot and micro bars carry role=img and an aria-label equal to their title', () => {
+  const { container } = renderNode(base({ compute: compute() }));
+  for (const id of ['compute-status-dot', 'compute-cpu-bar', 'compute-mem-bar']) {
+    const el = container.querySelector(`[data-testid="${id}"]`)!;
+    expect(el.getAttribute('role')).toBe('img');
+    expect(el.getAttribute('aria-label')).toBe(el.getAttribute('title'));
+    expect(el.getAttribute('aria-label')).toBeTruthy();
+  }
+});
+
+test('pending: muted pulsing dot, "no sample yet" tooltip, no bar', () => {
+  const { container } = renderNode(base({ compute: compute({ status: 'pending', containers: [], cpuPct: null, memPct: null }) }));
+  const dot = container.querySelector('[data-testid="compute-status-dot"]')!;
+  expect(dot.className).toContain(COMPUTE_DOT_CLASS.pending);
+  expect(dot.getAttribute('title')).toBe('No compute sample yet for this pod');
+  expect(container.querySelector('[data-testid="compute-microbar"]')).toBeNull();
 });
 
 test('unsupported vs off: muted dot, no bar, tooltips read apart', () => {
