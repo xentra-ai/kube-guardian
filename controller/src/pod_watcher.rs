@@ -1,4 +1,9 @@
 use crate::capture_tiers::CaptureLevel;
+use crate::compute_config::COMPUTE_ANNOTATION;
+use crate::compute_registry::{
+    cgroup_id_for_path, cgroup_path_for_pid, parse_cpu_millis, parse_memory_bytes, pod_cgroup_path,
+    ComputeMap, ContainerCompute, PodCompute, ResourceSpec,
+};
 use crate::models::{pod_flags, ContainerMap, PodRegistration};
 use crate::network::canonicalize_ip;
 use crate::supervisor::{Draining, Subsystem, Supervisor};
@@ -7,7 +12,7 @@ use crate::{api_post_call, Error, PodDetail, PodInfo, PodInspect};
 use chrono::Utc;
 use k8s_openapi::api::apps::v1::{DaemonSet, Deployment, ReplicaSet, StatefulSet};
 use k8s_openapi::api::batch::v1::Job;
-use k8s_openapi::api::core::v1::{Pod, PodIP};
+use k8s_openapi::api::core::v1::{Pod, PodIP, ResourceRequirements};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use kube::{
     api::ListParams,
@@ -16,6 +21,7 @@ use kube::{
 };
 use serde_json::json;
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
@@ -31,6 +37,19 @@ use tokio::sync::mpsc;
 /// `try_join!` in the first place (#1346). An `Arc<[String]>` inside
 /// gives the two halves below a cheap shared handle without cloning
 /// the list per pod event.
+/// What the pod watcher needs to keep the per-container compute
+/// registry (design D1) in step with the pods on this node. `None` in
+/// `watch_pods` means the feature is off: no containerd lookups beyond
+/// the one the netns path already makes, nothing registered.
+#[derive(Clone)]
+pub struct ComputeContext {
+    pub map: ComputeMap,
+    pub cgroup_root: PathBuf,
+    pub host_proc: PathBuf,
+    pub node: String,
+}
+
+#[allow(clippy::too_many_arguments)]
 pub async fn watch_pods(
     node_name: String,
     tx: mpsc::Sender<PodRegistration>,
@@ -39,6 +58,7 @@ pub async fn watch_pods(
     sender_ip: mpsc::Sender<String>,
     ignore_daemonset_traffic: bool,
     cluster_capture_level: CaptureLevel,
+    compute: Option<ComputeContext>,
 ) -> Result<(), Error> {
     let excluded_namespaces: Arc<[String]> = excluded_namespaces.into();
     let c = Client::try_default().await?;
@@ -67,6 +87,7 @@ pub async fn watch_pods(
         ignore_daemonset_traffic,
         c.clone(),
         cluster_capture_level,
+        compute.clone(),
     );
 
     // `.default_backoff()` wraps the RAW watcher stream, BEFORE
@@ -106,6 +127,7 @@ pub async fn watch_pods(
                 let excluded_namespaces = Arc::clone(&excluded_namespaces);
                 let node_name = node_name.clone();
                 let c = c.clone();
+                let compute = compute.clone();
                 async move {
                     if let Some(reg) = process_pod(
                         &p,
@@ -116,6 +138,7 @@ pub async fn watch_pods(
                         &node_name,
                         &c,
                         cluster_capture_level,
+                        compute.as_ref(),
                     )
                     .await
                     {
@@ -185,6 +208,7 @@ async fn resync_pods(
     ignore_daemonset_traffic: bool,
     client: Client,
     cluster_capture_level: CaptureLevel,
+    compute: Option<ComputeContext>,
 ) -> Result<(), Error> {
     const RESYNC_INTERVAL: Duration = Duration::from_secs(60);
     let lp = ListParams::default().fields(&format!("spec.nodeName={}", node_name));
@@ -207,6 +231,7 @@ async fn resync_pods(
                         &node_name,
                         &client,
                         cluster_capture_level,
+                        compute.as_ref(),
                     )
                     .await
                     {
@@ -217,6 +242,25 @@ async fn resync_pods(
                     }
                 }
                 debug!("Pod resync pass processed {} on-node pods", processed);
+                // The streaming watch decodes deletions away
+                // (`applied_objects`), so a pod that vanished between
+                // resyncs is retired here: the compute registry must
+                // not keep sampling a cgroup that no longer exists, and
+                // the contention probe must stop tracking its id.
+                if let Some(ctx) = compute.as_ref() {
+                    let live: std::collections::HashSet<String> = list
+                        .items
+                        .iter()
+                        .filter_map(|p| p.metadata.uid.clone())
+                        .collect();
+                    let stale = prune_compute_registry(&ctx.map, &live);
+                    if stale > 0 {
+                        debug!(
+                            stale,
+                            "compute registry: retired pods absent from the resync list"
+                        );
+                    }
+                }
             }
             // Transient list failures (apiserver blip) are non-fatal —
             // the next tick retries. Only the watch task failing restarts.
@@ -235,6 +279,7 @@ async fn process_pod(
     node_name: &str,
     client: &Client,
     cluster_capture_level: CaptureLevel,
+    compute: Option<&ComputeContext>,
 ) -> Option<PodRegistration> {
     // A Succeeded/Failed or deleting pod no longer owns its IP, but its
     // object lingers in the API server and shows up in every resync.
@@ -248,6 +293,12 @@ async fn process_pod(
             pod.metadata.namespace.as_deref().unwrap_or(""),
             pod.name_any()
         );
+        // Its cgroups are going or gone: stop sampling them. This is
+        // the deletion path the watch does deliver (a deletionTimestamp
+        // is a modification); the resync prune covers the rest.
+        if let (Some(ctx), Some(uid)) = (compute, pod.metadata.uid.as_deref()) {
+            ctx.map.remove_pod(uid);
+        }
         return None;
     }
     if let Some(con_ids) = pod_unready(pod) {
@@ -274,8 +325,15 @@ async fn process_pod(
                 IgnoreMapAction::None => {}
             }
             if should_process_pod(&pod.metadata.namespace, excluded_namespaces) {
-                return process_container_ids(&con_ids, pod, &pod_ip, container_map, capture_level)
-                    .await;
+                return process_container_ids(
+                    &con_ids,
+                    pod,
+                    &pod_ip,
+                    container_map,
+                    capture_level,
+                    compute,
+                )
+                .await;
             }
         }
     }
@@ -622,7 +680,30 @@ fn pod_registration_flags(pod: &Pod, level: CaptureLevel) -> u32 {
     )
 }
 
+/// Register a pod's netns (unchanged behaviour, see [`register_netns`])
+/// and then, when compute is on, every one of its containers in the
+/// compute registry. The compute walk runs *after* the netns
+/// registration and never alters its result: a pod the netns path
+/// could not resolve is still not registered for traffic, whatever the
+/// compute walk finds.
 async fn process_container_ids(
+    con_ids: &[String],
+    pod: &Pod,
+    pod_ip: &str,
+    container_map: ContainerMap,
+    capture_level: CaptureLevel,
+    compute: Option<&ComputeContext>,
+) -> Option<PodRegistration> {
+    let reg = register_netns(con_ids, pod, pod_ip, container_map, capture_level).await;
+    if let Some(ctx) = compute {
+        register_compute(pod, ctx).await;
+    }
+    reg
+}
+
+/// The netns registration: the first container whose network namespace
+/// resolves registers the pod, and the loop stops there.
+async fn register_netns(
     con_ids: &[String],
     pod: &Pod,
     pod_ip: &str,
@@ -661,6 +742,172 @@ async fn process_container_ids(
         }
     }
     None
+}
+
+/// `kguardian.dev/compute: "off"` on the pod opts it out of sampling
+/// and of `tracked_cgroups`. Any other value, or no annotation, is on;
+/// there is no opt-in mode (design D9).
+pub fn compute_opted_out(pod: &Pod) -> bool {
+    pod.metadata
+        .annotations
+        .as_ref()
+        .and_then(|a| a.get(COMPUTE_ANNOTATION))
+        .is_some_and(|v| v.trim().eq_ignore_ascii_case("off"))
+}
+
+/// Requests and limits from a `resources:` block, normalised to
+/// millicores and bytes. An unparseable quantity is treated as unset —
+/// a wrong denominator is worse than none.
+pub fn resource_spec_from(r: Option<&ResourceRequirements>) -> ResourceSpec {
+    type Quantities = BTreeMap<String, k8s_openapi::apimachinery::pkg::api::resource::Quantity>;
+    let Some(r) = r else {
+        return ResourceSpec::default();
+    };
+    let get = |m: &Option<Quantities>, k: &str| -> Option<String> {
+        m.as_ref().and_then(|m| m.get(k)).map(|q| q.0.clone())
+    };
+    ResourceSpec {
+        cpu_request_millis: get(&r.requests, "cpu").and_then(|q| parse_cpu_millis(&q)),
+        cpu_limit_millis: get(&r.limits, "cpu").and_then(|q| parse_cpu_millis(&q)),
+        memory_request_bytes: get(&r.requests, "memory").and_then(|q| parse_memory_bytes(&q)),
+        memory_limit_bytes: get(&r.limits, "memory").and_then(|q| parse_memory_bytes(&q)),
+    }
+}
+
+/// The effective resources of one container: the status' `resources`
+/// when the kubelet reports them (in-place resize, 1.27+), else the
+/// spec's.
+pub fn container_resources(pod: &Pod, container_name: &str) -> ResourceSpec {
+    let from_status = pod
+        .status
+        .as_ref()
+        .and_then(|s| s.container_statuses.as_ref())
+        .and_then(|cs| cs.iter().find(|c| c.name == container_name))
+        .and_then(|c| c.resources.as_ref());
+    if from_status.is_some() {
+        return resource_spec_from(from_status);
+    }
+    let from_spec = pod
+        .spec
+        .as_ref()
+        .and_then(|s| s.containers.iter().find(|c| c.name == container_name))
+        .and_then(|c| c.resources.as_ref());
+    resource_spec_from(from_spec)
+}
+
+/// Retire every registered pod whose uid is not in `live`. Returns how
+/// many were removed.
+pub fn prune_compute_registry(map: &ComputeMap, live: &std::collections::HashSet<String>) -> usize {
+    let mut removed = 0;
+    for uid in map.pod_uids() {
+        if !live.contains(&uid) {
+            map.remove_pod(&uid);
+            removed += 1;
+        }
+    }
+    removed
+}
+
+/// Walk EVERY container of the pod (not just the first that resolves),
+/// resolve its host pid through the existing containerd path, read its
+/// cgroup v2 path and id, and record it with its requests and limits.
+/// The pod's own cgroup (the parent of the container scopes) is
+/// recorded once per pod.
+///
+/// Containers already registered under the same containerd id are
+/// skipped, so the 60 s resync costs no containerd RPC for a steady
+/// pod. Every failure is per container and logged at debug: a pod that
+/// cannot be sampled must not stop its neighbours from being.
+async fn register_compute(pod: &Pod, ctx: &ComputeContext) {
+    let Some(uid) = pod.metadata.uid.clone() else {
+        return;
+    };
+    if compute_opted_out(pod) {
+        ctx.map.remove_pod(&uid);
+        return;
+    }
+    let namespace = pod.metadata.namespace.clone().unwrap_or_default();
+    let pod_name = pod.name_any();
+    let Some(statuses) = pod
+        .status
+        .as_ref()
+        .and_then(|s| s.container_statuses.as_ref())
+    else {
+        return;
+    };
+    let mut pod_cgroup: Option<String> = None;
+    for status in statuses {
+        let Some(raw_id) = status.container_id.as_deref() else {
+            continue;
+        };
+        if let Some(existing) = ctx.map.container_for(&uid, &status.name) {
+            if existing.container_id == raw_id {
+                if pod_cgroup.is_none() {
+                    pod_cgroup = pod_cgroup_path(&existing.cgroup_path);
+                }
+                continue;
+            }
+        }
+        // Same containerd lookup (and the same connect / RPC ceilings)
+        // the netns registration uses.
+        let Some(inspect) = PodInspect::default().get_pod_inspect(raw_id).await else {
+            continue;
+        };
+        let Some(pid) = inspect.pid else {
+            continue;
+        };
+        let cgroup_path = match cgroup_path_for_pid(&ctx.host_proc, pid) {
+            Ok(p) => p,
+            Err(e) => {
+                debug!(pod = %pod_name, container = %status.name, pid, error = %e, "no cgroup v2 path for pid");
+                continue;
+            }
+        };
+        let cgroup_id = match cgroup_id_for_path(&ctx.cgroup_root, &cgroup_path) {
+            Ok(id) => id,
+            Err(e) => {
+                debug!(pod = %pod_name, container = %status.name, cgroup = %cgroup_path, error = %e, "cgroup id lookup failed");
+                continue;
+            }
+        };
+        if pod_cgroup.is_none() {
+            pod_cgroup = pod_cgroup_path(&cgroup_path);
+        }
+        debug!(
+            pod = %pod_name,
+            container = %status.name,
+            pid,
+            cgroup = %cgroup_path,
+            cgroup_id,
+            "compute: registered container cgroup"
+        );
+        ctx.map.insert_container(ContainerCompute {
+            pod_uid: uid.clone(),
+            namespace: namespace.clone(),
+            pod_name: pod_name.clone(),
+            container_name: status.name.clone(),
+            container_id: raw_id.to_string(),
+            pid,
+            cgroup_path,
+            cgroup_id,
+            resources: container_resources(pod, &status.name),
+            node: ctx.node.clone(),
+        });
+    }
+    if let Some(path) = pod_cgroup {
+        match cgroup_id_for_path(&ctx.cgroup_root, &path) {
+            Ok(pod_cgroup_id) => ctx.map.insert_pod(PodCompute {
+                pod_uid: uid,
+                namespace,
+                pod_name,
+                pod_cgroup_path: path,
+                pod_cgroup_id,
+            }),
+            Err(e) => {
+                debug!(pod = %pod_name, cgroup = %path, error = %e, "pod cgroup id lookup failed")
+            }
+        }
+    }
 }
 
 fn create_pod_info(pod: &Pod, pod_ip: &str) -> PodInfo {
@@ -1615,6 +1862,124 @@ mod tests {
             status: Some(status),
             ..Pod::default()
         }
+    }
+
+    #[test]
+    fn compute_opt_out_annotation_is_off_only() {
+        let mut p = Pod::default();
+        assert!(!compute_opted_out(&p));
+        p.metadata.annotations = Some(
+            [(COMPUTE_ANNOTATION.to_string(), " OFF ".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        assert!(compute_opted_out(&p));
+        p.metadata.annotations = Some(
+            [(COMPUTE_ANNOTATION.to_string(), "on".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        assert!(!compute_opted_out(&p));
+    }
+
+    #[test]
+    fn container_resources_come_from_status_then_spec() {
+        use k8s_openapi::api::core::v1::{Container, PodSpec};
+        use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
+        let q = |s: &str| Quantity(s.to_string());
+        let spec_res = ResourceRequirements {
+            requests: Some(
+                [
+                    ("cpu".to_string(), q("250m")),
+                    ("memory".to_string(), q("128Mi")),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+            limits: Some(
+                [
+                    ("cpu".to_string(), q("1")),
+                    ("memory".to_string(), q("1Gi")),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+            ..Default::default()
+        };
+        let mut pod = Pod {
+            spec: Some(PodSpec {
+                containers: vec![Container {
+                    name: "api".into(),
+                    resources: Some(spec_res),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            status: Some(PodStatus {
+                container_statuses: Some(vec![ContainerStatus {
+                    name: "api".into(),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }),
+            ..Pod::default()
+        };
+        assert_eq!(
+            container_resources(&pod, "api"),
+            ResourceSpec {
+                cpu_request_millis: Some(250),
+                cpu_limit_millis: Some(1000),
+                memory_request_bytes: Some(128 << 20),
+                memory_limit_bytes: Some(1 << 30),
+            }
+        );
+        // Unknown container: nothing set.
+        assert_eq!(container_resources(&pod, "nope"), ResourceSpec::default());
+        // An in-place resize shows up in status.resources and wins.
+        pod.status
+            .as_mut()
+            .unwrap()
+            .container_statuses
+            .as_mut()
+            .unwrap()[0]
+            .resources = Some(ResourceRequirements {
+            limits: Some([("cpu".to_string(), q("2"))].into_iter().collect()),
+            ..Default::default()
+        });
+        let r = container_resources(&pod, "api");
+        assert_eq!(r.cpu_limit_millis, Some(2000));
+        assert_eq!(r.cpu_request_millis, None);
+        // Garbage quantities are unset, not zero.
+        let bad = ResourceRequirements {
+            requests: Some([("cpu".to_string(), q("lots"))].into_iter().collect()),
+            ..Default::default()
+        };
+        assert_eq!(resource_spec_from(Some(&bad)), ResourceSpec::default());
+    }
+
+    #[test]
+    fn prune_retires_pods_missing_from_the_list() {
+        use crate::compute_registry::ComputeRegistry;
+        let map: ComputeMap = Arc::new(ComputeRegistry::new());
+        for (uid, id) in [("a", 1u64), ("b", 2)] {
+            map.insert_container(ContainerCompute {
+                pod_uid: uid.into(),
+                namespace: "n".into(),
+                pod_name: "p".into(),
+                container_name: "c".into(),
+                container_id: "x".into(),
+                pid: 1,
+                cgroup_path: "x".into(),
+                cgroup_id: id,
+                resources: ResourceSpec::default(),
+                node: "n".into(),
+            });
+        }
+        let live = ["b".to_string()].into_iter().collect();
+        assert_eq!(prune_compute_registry(&map, &live), 1);
+        assert!(map.lookup_cgroup(1).is_none());
+        assert!(map.lookup_cgroup(2).is_some());
+        assert_eq!(prune_compute_registry(&map, &live), 0);
     }
 
     #[test]

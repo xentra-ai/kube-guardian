@@ -1483,6 +1483,7 @@ dependencies = [
  "libbpf-cargo",
  "libbpf-rs",
  "libbpf-sys",
+ "libc",
  "libseccomp",
  "moka",
  "openssl",

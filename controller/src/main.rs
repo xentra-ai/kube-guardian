@@ -6,8 +6,12 @@ use tokio::sync::mpsc;
 use tracing::info;
 
 use kguardian::bpf::ebpf_handle;
+use kguardian::compute_config::ComputeConfig;
+use kguardian::compute_registry::{ComputeMap, ComputeRegistry};
+use kguardian::compute_sampler::{run as run_compute_sampler, ContentionSource};
 use kguardian::log::init_logger;
 use kguardian::network::{handle_network_events, handle_policy_drop_events, PolicyDropEvent};
+use kguardian::pod_watcher::ComputeContext;
 use kguardian::seccomp_distributor::run as run_seccomp_distributor;
 use kguardian::service_watcher::watch_service;
 use kguardian::supervisor::{report, shut_down, Draining, Subsystem, Supervisor};
@@ -86,6 +90,54 @@ async fn main() -> Result<(), Error> {
     let cluster_capture_level = capture_config.level;
     let resolved_tiers = capture_config.resolve();
 
+    // Compute gauges (COMPUTE_*). Off means nothing is built, spawned
+    // or registered; the pod watcher gets `None` and never makes the
+    // extra containerd lookups. The registry is shared between the pod
+    // watcher (writer) and the sampler (reader); its registration
+    // channel feeds the contention probe's `tracked_cgroups` map, so
+    // it is subscribed BEFORE the watcher can emit anything.
+    let compute_config = ComputeConfig::from_env();
+    info!(
+        enabled = compute_config.enabled,
+        interval_secs = compute_config.sample_interval.as_secs(),
+        contention = compute_config.contention_enabled,
+        min_runq_latency_us = compute_config.min_runq_latency_us,
+        "compute gauges"
+    );
+    let compute_map: Option<ComputeMap> = compute_config
+        .enabled
+        .then(|| Arc::new(ComputeRegistry::new()));
+    let compute_events = compute_map.as_ref().map(|m| m.subscribe());
+    let compute_ctx = compute_map.as_ref().map(|m| ComputeContext {
+        map: Arc::clone(m),
+        cgroup_root: compute_config.cgroup_root.clone(),
+        host_proc: compute_config.host_proc.clone(),
+        node: node_name.clone(),
+    });
+    // The scheduler-contention probe is a second switch beneath
+    // compute.enabled (D9). A load failure is not fatal: the gauges
+    // still run and every node sample says contention_loaded=false so
+    // the UI can explain the missing blame.
+    let contention_probe: Option<Box<dyn ContentionSource>> =
+        if compute_config.enabled && compute_config.contention_enabled {
+            match kguardian::contention::ContentionProbe::load(compute_config.min_runq_latency_us) {
+                Ok(p) => {
+                    info!("scheduler contention probe loaded");
+                    Some(Box::new(p))
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "scheduler contention probe failed to load; compute gauges continue \
+                         without blame (contention_loaded=false)"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
     let (tx, rx) = mpsc::channel(1000); // Use tokio's mpsc channel
 
     let (sender_ip, recv_ip) = mpsc::channel(1000); // Use tokio's mpsc channel
@@ -157,6 +209,7 @@ async fn main() -> Result<(), Error> {
     // marks. Isolating the subsystems from each other's stalls must not
     // isolate the operator from their deaths.
     let mut supervisor = Supervisor::new();
+    let node_name_for_compute = node_name.clone();
 
     supervisor.spawn(
         Subsystem::PodWatcher,
@@ -168,6 +221,7 @@ async fn main() -> Result<(), Error> {
             sender_ip,
             ignore_daemonset_traffic,
             cluster_capture_level,
+            compute_ctx,
         ),
     );
     supervisor.spawn(Subsystem::ServiceWatch, watch_service());
@@ -202,6 +256,21 @@ async fn main() -> Result<(), Error> {
     // unreachable; if you add one, that is the behaviour you are
     // choosing, and "best-effort" will no longer describe it.
     supervisor.spawn(Subsystem::SeccompDistributor, run_seccomp_distributor());
+    // Compute sampler: spawned only when COMPUTE_ENABLED, and `MayRetire`
+    // for the same reason as the distributor — `run` returns `Ok` when
+    // the feature is off. An `Err` is still fatal.
+    if let (Some(map), Some(events)) = (compute_map, compute_events) {
+        supervisor.spawn(
+            Subsystem::ComputeSampler,
+            run_compute_sampler(
+                compute_config,
+                node_name_for_compute,
+                map,
+                contention_probe,
+                events,
+            ),
+        );
+    }
     supervisor.spawn(Subsystem::EbpfLoader, async move { ebpf_handle.await? });
 
     // Graceful shutdown on SIGTERM/SIGINT
