@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'vitest';
 import type { Node } from 'reactflow';
-import { UNPLACED, mergeNodeData, placeNodes } from './graphNodes';
+import { UNPLACED, mergeNodeData, placeNodes, pruneNodes } from './graphNodes';
 
 // Fix #1: the 5 s compute poll rebuilds every node object with new gauge
 // data. That must repaint the cards and NEVER move them — a card the user
@@ -18,6 +18,21 @@ describe('placeNodes (a layout result)', () => {
   test('places every node; an unplaced one is parked off-canvas', () => {
     const out = placeNodes([node('a'), node('b')], new Map([['a', { x: 10, y: 20 }]]));
     expect(out.map((n) => n.position)).toEqual([{ x: 10, y: 20 }, UNPLACED]);
+  });
+});
+
+describe('pruneNodes (a layout-signature change)', () => {
+  test('namespace switch: a wholly new id set blanks the graph until ELK lands', () => {
+    const laid = placeNodes([node('payments-api')], new Map([['payments-api', { x: 1, y: 1 }]]));
+    expect(pruneNodes(laid, new Set(['batch-etl']))).toEqual([]);
+  });
+  test('expansion toggle / node added: surviving cards keep their (dragged) positions', () => {
+    let laid = placeNodes([node('a'), node('b')], new Map([['a', { x: 1, y: 1 }], ['b', { x: 2, y: 2 }]]));
+    laid = laid.map((n) => (n.id === 'a' ? { ...n, position: { x: 99, y: 99 } } : n));
+    const pruned = pruneNodes(laid, new Set(['a', 'b', 'c']));
+    expect(pruned).toBe(laid);
+    expect(pruned[0].position).toEqual({ x: 99, y: 99 });
+    expect(pruneNodes(laid, new Set(['a'])).map((n) => n.id)).toEqual(['a']);
   });
 });
 

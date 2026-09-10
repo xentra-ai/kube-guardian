@@ -146,11 +146,19 @@ test('status dot and micro bars carry role=img and an aria-label equal to their 
   }
 });
 
+test('dropped BPF inserts on the node: warning dot, tooltip names the counts', () => {
+  const { container } = renderNode(base({ compute: compute({ status: 'warning', probeDrops: { hist: 3, pair: 5 } }) }));
+  const dot = container.querySelector('[data-testid="compute-status-dot"]')!;
+  expect(dot.className).toContain(COMPUTE_DOT_CLASS.warning);
+  expect(dot.getAttribute('title')).toBe('Compute warning: active findings; probe map full: 3 histogram / 5 pair inserts dropped');
+  expect(dot.getAttribute('aria-label')).toBe(dot.getAttribute('title'));
+});
+
 test('pending: muted pulsing dot, "no sample yet" tooltip, no bar', () => {
   const { container } = renderNode(base({ compute: compute({ status: 'pending', containers: [], cpuPct: null, memPct: null }) }));
   const dot = container.querySelector('[data-testid="compute-status-dot"]')!;
   expect(dot.className).toContain(COMPUTE_DOT_CLASS.pending);
-  expect(dot.getAttribute('title')).toBe('No compute sample yet for this pod');
+  expect(dot.getAttribute('title')).toBe('No compute sample for this pod (not yet sampled, or opted out with kguardian.dev/compute: off)');
   expect(container.querySelector('[data-testid="compute-microbar"]')).toBeNull();
 });
 

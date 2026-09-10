@@ -78,6 +78,15 @@ test('truncated: one-line notice naming the victim cap', () => {
   expect(screen.queryByTestId('compute-truncated')).toBeNull();
 });
 
+test('history disabled: the Compute stat tile carries the hint even when other findings exist', () => {
+  render(view({ computeMeta: { truncated: false, victimsEvaluated: null, historyDisabled: true } }));
+  expect(screen.getByText('Compute (history off)')).not.toBeNull();
+  cleanup();
+  render(view());
+  expect(screen.queryByText('Compute (history off)')).toBeNull();
+  expect(screen.getByText('Compute')).not.toBeNull();
+});
+
 test('history disabled: the empty state says findings cannot be computed', async () => {
   render(view({ computeFindings: [], computeMeta: { truncated: false, victimsEvaluated: null, historyDisabled: true } }));
   // The empty state appears once the audit-verdict fetch has settled.

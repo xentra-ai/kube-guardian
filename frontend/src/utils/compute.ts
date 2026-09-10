@@ -13,6 +13,7 @@ import type {
   ComputeSeverity,
   ComputeStatus,
   PodComputeData,
+  ProbeDrops,
 } from '../types/compute';
 import { podUid } from './peerResolution';
 
@@ -120,15 +121,31 @@ export function nodeComputeState(node: ComputeNode | undefined): NodeComputeStat
   return 'ok';
 }
 
+/** Dropped BPF map inserts on a node, or null when none / not reported. */
+export function probeDropsFor(node: ComputeNode | undefined): ProbeDrops | null {
+  const hist = node?.bpf_hist_update_failures ?? 0;
+  const pair = node?.bpf_pair_update_failures ?? 0;
+  return hist > 0 || pair > 0 ? { hist, pair } : null;
+}
+
+export const probeDropsText = (d: ProbeDrops): string => `probe map full: ${d.hist} histogram / ${d.pair} pair inserts dropped`;
+
 /** Tooltip copy for the header dot, so `unsupported` and `off` read apart. */
-export function statusTooltip(status: ComputeStatus, findings: readonly ComputeFinding[] = []): string {
+export function statusTooltip(status: ComputeStatus, findings: readonly ComputeFinding[] = [], probeDrops?: ProbeDrops | null): string {
+  const base = statusTooltipBase(status, findings);
+  return probeDrops ? `${base}; ${probeDropsText(probeDrops)}` : base;
+}
+
+function statusTooltipBase(status: ComputeStatus, findings: readonly ComputeFinding[]): string {
   switch (status) {
     case 'off':
       return 'Compute gauges off: compute.enabled is false on this node, or the controller predates the feature';
     case 'unsupported':
       return 'Compute gauges unsupported on this node (cgroup v1 or no PSI)';
     case 'pending':
-      return 'No compute sample yet for this pod';
+      // The broker does not expose the opt-out annotation, so an opted-out
+      // pod is indistinguishable from one not sampled yet: say both.
+      return 'No compute sample for this pod (not yet sampled, or opted out with kguardian.dev/compute: off)';
     case 'ok':
       return 'Compute: no active findings';
     default: {
@@ -230,8 +247,15 @@ export function buildPodComputeData(input: BuildPodComputeInput): PodComputeData
     nodeRow?.memory_bytes ?? null,
   );
 
-  // Rows exist, so the node is reporting: `pending` cannot apply here.
-  const status: ComputeStatus = nodeState === 'off' || nodeState === 'unsupported' ? nodeState : statusFromFindings(findings);
+  // Rows exist, so the node is reporting: `pending` cannot apply here. A
+  // node dropping BPF inserts cannot be trusted for blame, so it is at
+  // least a warning even with no finding.
+  const probeDrops = probeDropsFor(nodeRow);
+  const fromFindings = statusFromFindings(findings);
+  const status: ComputeStatus =
+    nodeState === 'off' || nodeState === 'unsupported' ? nodeState
+    : probeDrops && fromFindings === 'ok' ? 'warning'
+    : fromFindings;
 
   return {
     cpuPct: percentOf(latest.cpuMillis, cpuDen),
@@ -247,6 +271,7 @@ export function buildPodComputeData(input: BuildPodComputeInput): PodComputeData
     cpuCapacityMillis: cpuDen?.value ?? null,
     memCapacityBytes: memDen?.value ?? null,
     containers: [...containers],
+    probeDrops,
   };
 }
 

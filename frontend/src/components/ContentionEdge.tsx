@@ -1,5 +1,5 @@
 import { BaseEdge, EdgeLabelRenderer, getBezierPath, type EdgeProps } from 'reactflow';
-import { EDGE_COLOR_CONTENTION, blameShareLabel, type ContentionEdgeData } from '../utils/contentionEdges';
+import { EDGE_COLOR_CONTENTION, edgeShareLabel, type ContentionEdgeData } from '../utils/contentionEdges';
 
 // The culprit → victim edge behind a noisy-neighbour finding (design D8):
 // dashed, error-coloured, labelled with the culprit's share of the victim's
@@ -34,7 +34,7 @@ export default function ContentionEdge({
           title={data?.finding.message}
           data-testid="contention-edge-label"
         >
-          {blameShareLabel(share)}
+          {edgeShareLabel(share)}
         </div>
       </EdgeLabelRenderer>
     </>

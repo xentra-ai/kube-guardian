@@ -71,6 +71,8 @@ export function useComputeData(namespace: string, opts: UseComputeDataOptions = 
   // generation is no longer current (the user switched namespace while it
   // was in flight) is discarded instead of landing on the new namespace.
   const generation = useRef(0);
+  /** Generation whose one-shot /compute/nodes fetch has started (see loadNodes). */
+  const nodesLoadedGen = useRef(-1);
 
   // Ring buffers live in a ref and are mutated in place on every poll; the
   // `history` state is a fresh Map over the same buffers per poll so a memo
@@ -164,6 +166,8 @@ export function useComputeData(namespace: string, opts: UseComputeDataOptions = 
   // can still say `off` / `unsupported` / `pending` from its node's state.
   const loadNodes = useCallback(async () => {
     const gen = generation.current;
+    if (nodesLoadedGen.current === gen) return; // once per namespace session
+    nodesLoadedGen.current = gen;
     try {
       const rows = await api.getComputeNodes();
       if (gen !== generation.current) return;
@@ -211,6 +215,7 @@ export function useComputeData(namespace: string, opts: UseComputeDataOptions = 
     // the interval, so the gauges never show a stale sample after a resume.
     const onVisibility = () => {
       if (!hidden()) {
+        void loadNodes(); // no-op once it has run for this namespace session
         void refreshLatest();
         void refreshFindings();
       }

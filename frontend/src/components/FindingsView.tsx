@@ -239,7 +239,9 @@ export function FindingsView({
     { label: 'Egress fan-out', value: fanoutFindings.length, icon: Radar, tone: fanoutFindings.length > 0 ? 'text-hubble-warning' : 'text-secondary' },
     ...(computeEnabled
       ? [{
-          label: 'Compute',
+          // Retention off means the engine has nothing to score: say so on
+          // the tile, which is visible whatever other findings exist.
+          label: computeMeta?.historyDisabled ? 'Compute (history off)' : 'Compute',
           value: computeFindings.length,
           icon: Cpu,
           tone: computeWorst === 'critical' ? 'text-hubble-error' : computeFindings.length > 0 ? 'text-hubble-warning' : 'text-secondary',

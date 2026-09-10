@@ -31,6 +31,19 @@ export function placeNodes(displayNodes: readonly Node[], positions: Positions):
 }
 
 /**
+ * A layout-signature change (namespace switch, node added/removed, a card
+ * expanded): drop every card that is no longer in the current set so the
+ * previous namespace's cards do not linger until ELK lands. Cards that are
+ * still present keep their positions (an expansion toggle must not blank the
+ * graph); a wholly new set goes blank, then lays out — the original
+ * behaviour. Returns `prev` itself when nothing was dropped.
+ */
+export function pruneNodes(prev: readonly Node[], currentIds: ReadonlySet<string>): Node[] {
+  const kept = prev.filter((n) => currentIds.has(n.id));
+  return kept.length === prev.length ? (prev as Node[]) : kept;
+}
+
+/**
  * A data tick over an already-laid-out list: same nodes, same positions
  * (dragged or laid out), new `data` / `selected`. Nodes that are not in
  * `prev` are NOT added and nodes missing from `next` are NOT removed here —

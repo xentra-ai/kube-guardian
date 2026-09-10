@@ -22,7 +22,9 @@ export const EDGE_COLOR_CONTENTION = EDGE_COLOR_DENIED;
 export const contentionEdgeId = (culpritPodUid: string, victimPodUid: string): string =>
   `contention:${culpritPodUid}->${victimPodUid}`;
 
-export const blameShareLabel = (share: number): string => `${Math.round(share * 100)}% of wait`;
+/** Edge label: contention edges are CPU (noisy-neighbor) only. For the
+ *  kind-aware sentence used by Findings see utils/compute `blameShareLabel`. */
+export const edgeShareLabel = (share: number): string => `${Math.round(share * 100)}% of wait`;
 
 export interface ContentionEdgeSpec {
   id: string;

@@ -126,7 +126,7 @@ describe('statusFromFindings / nodeComputeState / statusTooltip', () => {
   test('unsupported, off and pending explain themselves differently', () => {
     expect(statusTooltip('unsupported')).toMatch(/cgroup v1/);
     expect(statusTooltip('off')).toMatch(/compute\.enabled/);
-    expect(statusTooltip('pending')).toMatch(/No compute sample yet/);
+    expect(statusTooltip('pending')).toMatch(/not yet sampled, or opted out with kguardian\.dev\/compute: off/);
     expect(new Set([statusTooltip('unsupported'), statusTooltip('off'), statusTooltip('pending')]).size).toBe(3);
     expect(statusTooltip('critical', [finding('critical', 'noisy-neighbor')])).toBe('Compute critical: noisy-neighbor');
   });
@@ -178,6 +178,20 @@ describe('buildPodComputeData', () => {
     expect(d.cpuPct).toBe(10);
     expect(d.memDenominator).toBe('node');
     expect(d.memPct).toBe(50);
+  });
+  test('dropped BPF inserts on the node: probeDrops set, status at least warning, tooltip appended', () => {
+    const nodes = new Map([['worker-1', node({ bpf_hist_update_failures: 3, bpf_pair_update_failures: 5 })]]);
+    const d = buildPodComputeData({ containers: [container()], nodesByName: nodes, findings: [], samples: [] });
+    expect(d.probeDrops).toEqual({ hist: 3, pair: 5 });
+    expect(d.status).toBe('warning');
+    expect(statusTooltip(d.status, d.findings, d.probeDrops)).toBe('Compute warning: active findings; probe map full: 3 histogram / 5 pair inserts dropped');
+    // A critical finding is not downgraded; zero / absent counters mean no drops.
+    const c = buildPodComputeData({ containers: [container()], nodesByName: nodes, findings: [finding('critical')], samples: [] });
+    expect(c.status).toBe('critical');
+    const clean = buildPodComputeData({ containers: [container()], nodesByName: new Map([['worker-1', node({ bpf_hist_update_failures: 0, bpf_pair_update_failures: null })]]), findings: [], samples: [] });
+    expect(clean.probeDrops).toBeNull();
+    expect(clean.status).toBe('ok');
+    expect(buildPodComputeData({ containers: [container()], nodesByName: new Map([['worker-1', node()]]), findings: [], samples: [] }).probeDrops).toBeNull();
   });
   test('an off node overrides findings on the dot; rows on an unknown node are ok, not pending', () => {
     const d = buildPodComputeData({ containers: [container()], nodesByName: new Map(), findings: [finding('critical')], samples: [], nodeState: 'off' });

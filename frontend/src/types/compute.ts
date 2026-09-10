@@ -79,6 +79,11 @@ export interface ComputeNode {
   bpf_runq_enqueued: number;
   bpf_runq_hist: number;
   bpf_pair: number;
+  /** BPF map inserts dropped because the map was full (design D4: a leak or
+   *  undersized map shows up as a number, not as a phantom p99). Absent from
+   *  an older controller. */
+  bpf_hist_update_failures?: number | null;
+  bpf_pair_update_failures?: number | null;
   unknown_blame_share: number;
   updated_at: string;
 }
@@ -273,4 +278,11 @@ export interface PodComputeData {
   memCapacityBytes: number | null;
   /** The pod's containers, for the detail panel. */
   containers: ComputeContainer[];
+  /** Dropped BPF map inserts on the pod's node (either > 0 ⇒ status ≥ warning). */
+  probeDrops?: ProbeDrops | null;
+}
+
+export interface ProbeDrops {
+  hist: number;
+  pair: number;
 }

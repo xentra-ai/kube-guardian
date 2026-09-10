@@ -16,7 +16,7 @@ import PodNode from './PodNode';
 import ContentionEdge from './ContentionEdge';
 import { EDGE_COLOR_CONTENTION, buildContentionEdges } from '../utils/contentionEdges';
 import { hasComputeGauges, nodeHeight } from '../utils/compute';
-import { mergeNodeData, placeNodes } from '../utils/graphNodes';
+import { mergeNodeData, placeNodes, pruneNodes } from '../utils/graphNodes';
 import type { ComputeFinding } from '../types/compute';
 import { shouldExitFocus } from '../utils/graphFocus';
 import { EDGE_COLOR_DAEMONSET, edgeStrokeColor, isDaemonSetPeer, partitionDaemonSetPeers, shouldAutoShowDaemonSets } from '../utils/daemonSetPeers';
@@ -652,6 +652,13 @@ const NetworkGraphInner: React.FC<NetworkGraphProps> = ({
   useEffect(() => {
     displayNodesRef.current = displayNodes;
   }, [displayNodes]);
+  // A layout-signature change drops the cards that left the set at once (a
+  // namespace switch goes blank until the new layout lands, as it always
+  // did); survivors keep their positions until ELK places them.
+  useEffect(() => {
+    const currentIds = new Set(displayNodesRef.current.map((n) => n.id));
+    setNodes((prev) => pruneNodes(prev, currentIds));
+  }, [layoutSignature, setNodes]);
   useEffect(() => {
     setNodes(placeNodes(displayNodesRef.current, elkPositions));
   }, [elkPositions, setNodes]);

@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'vitest';
-import { blameShareLabel, buildContentionEdges, contentionEdgeId, externalCulpritId } from './contentionEdges';
+import { buildContentionEdges, contentionEdgeId, edgeShareLabel, externalCulpritId } from './contentionEdges';
 import type { PodInfo, PodNodeData } from '../types';
 import type { ComputeFinding } from '../types/compute';
 
@@ -66,6 +66,6 @@ describe('buildContentionEdges', () => {
   });
 
   test('label rounds the share to a percent', () => {
-    expect(blameShareLabel(0.714)).toBe('71% of wait');
+    expect(edgeShareLabel(0.714)).toBe('71% of wait');
   });
 });

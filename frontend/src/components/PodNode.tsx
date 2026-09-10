@@ -227,9 +227,9 @@ const PodNode: React.FC<PodNodeProps> = React.memo(({ data, selected }) => {
               {compute && (
                 <span
                   className={`shrink-0 w-2 h-2 rounded-full ${COMPUTE_DOT_CLASS[compute.status]}`}
-                  title={statusTooltip(compute.status, compute.findings)}
+                  title={statusTooltip(compute.status, compute.findings, compute.probeDrops)}
                   role="img"
-                  aria-label={statusTooltip(compute.status, compute.findings)}
+                  aria-label={statusTooltip(compute.status, compute.findings, compute.probeDrops)}
                   data-testid="compute-status-dot"
                   data-status={compute.status}
                 />

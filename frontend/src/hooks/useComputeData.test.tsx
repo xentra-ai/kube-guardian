@@ -260,6 +260,22 @@ describe('useComputeData', () => {
     expect(result.current.history.has('uid-a')).toBe(false);
   });
 
+  test('a tab opened in the background loads /compute/nodes on first show, once', async () => {
+    hiddenValue = true;
+    const api = fakeApi(() => ({ containers: [], nodes: [node()] }), () => ({ findings: [] }), () => [node({ node: 'worker-9', compute_enabled: false })]);
+    const { result } = renderHook(() => useComputeData('payments', { api }));
+    await flush();
+    expect(api.getComputeNodes).not.toHaveBeenCalled();
+    hiddenValue = false;
+    await act(async () => { document.dispatchEvent(new Event('visibilitychange')); });
+    await flush();
+    expect(api.getComputeNodes).toHaveBeenCalledTimes(1);
+    expect(result.current.nodesByName.get('worker-9')?.compute_enabled).toBe(false);
+    await act(async () => { document.dispatchEvent(new Event('visibilitychange')); });
+    await flush();
+    expect(api.getComputeNodes).toHaveBeenCalledTimes(1); // one-shot per namespace session
+  });
+
   // Fix #4: /compute/nodes once per namespace load, so a node with no pod
   // rows in this namespace still has a known state; live rows win.
   test('findings metadata (truncated / victims_evaluated / history_disabled) is normalised and reset per namespace', async () => {
