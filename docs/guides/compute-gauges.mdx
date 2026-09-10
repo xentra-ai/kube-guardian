@@ -81,8 +81,9 @@ Traffic and syscalls stay on manual refresh.
     Next to the dot, a two-segment bar: CPU on the left, memory on the right,
     each as a percentage of the container's limit, else its request, else
     the node. The tooltip names the denominator, because 80 % of a limit and
-    80 % of a node are different situations. A multi-container pod is drawn
-    from its pod-level cgroup; the worst container drives the dot.
+    80 % of a node are different situations. A multi-container pod's bar is
+    the sum of its container rows (usage and denominator alike); the worst
+    container drives the dot.
   </Step>
   <Step title="Sparklines">
     Expand the pod and the bar becomes two sparklines — the last 60 samples
@@ -110,14 +111,16 @@ Traffic and syscalls stay on manual refresh.
   <Step title="Findings">
     The Findings view lists the five compute kinds with the same rows as the
     policy findings, plus a node filter. Where a policy finding offers a
-    *Generate policy* action, a compute finding offers **Resources**, which
+    **Policy** button, a compute finding offers **View workload**, which
     takes you to the victim's or the culprit's workload. Nothing is applied.
   </Step>
 </Steps>
 
-A node whose pods have no gauge at all is one of three things, and the node
-tooltip says which: the feature is off on that node, the node is cgroup v1 or
-has no PSI (unsupported), or its controller predates the feature.
+A pod with no gauge shows a muted dot instead, and the dot's tooltip says
+why: **pending** (`no compute sample yet` — the pod is registered but its
+first sample has not arrived), **off** (the feature is disabled on that
+node, or the controller predates it), or **unsupported** (the node is
+cgroup v1 or has no PSI).
 
 ## From the CLI
 

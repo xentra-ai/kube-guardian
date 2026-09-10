@@ -214,6 +214,8 @@ render "compute-defaults" && {
   assert_has "compute-defaults" "path: /sys/fs/cgroup"
   assert_has "compute-defaults" "name: COMPUTE_HISTORY_RETENTION_DAYS"
   assert_has "compute-defaults" "name: COMPUTE_THRESHOLD_BLAME_SHARE"
+  grep -A1 'name: COMPUTE_THRESHOLD_REFAULT_PER_MIN' <<<"$OUT" | grep -q 'value: "1000"' || \
+    { echo "FAIL [compute-defaults]: COMPUTE_THRESHOLD_REFAULT_PER_MIN must default to 1000"; fail=1; }
   grep -q 'name: COMPUTE_CONTENTION_ENABLED' <<<"$OUT" && \
     grep -A1 'name: COMPUTE_CONTENTION_ENABLED' <<<"$OUT" | grep -q 'value: "false"' || \
     { echo "FAIL [compute-defaults]: COMPUTE_CONTENTION_ENABLED must default to false"; fail=1; }

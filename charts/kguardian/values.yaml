@@ -291,8 +291,8 @@ compute:
   # mount, the sampler and every `COMPUTE_*` setting below.
   enabled: true
   # -- Seconds between cgroup samples. Drives the live gauges and the
-  # `pod_compute_latest` upsert; the controller folds twelve samples into one
-  # minute row for history regardless of this value.
+  # `pod_compute_latest` upsert; the controller folds one minute of samples
+  # into one history row regardless of this value.
   sampleInterval: 5
   contention:
     # -- Load the `sched_contention` eBPF probe (`sched_wakeup`,
@@ -338,6 +338,10 @@ compute:
     # avg10` is at or above this percentage while the node itself is under
     # memory pressure. Memory blame is a heuristic and is labelled as one.
     memStallSome: 10
+    # -- Workingset refaults per minute that count as thrashing for
+    # `memory-pressure`: the second way (besides `memStallSome`) a container
+    # qualifies as a memory victim while the node is under pressure.
+    refaultPerMin: 1000
   history:
     # -- Days of per-pod compute and contention history the broker keeps.
     # Minute rows are downsampled to 5-minute rows after

@@ -30,14 +30,19 @@ Global flags (`--kubeconfig`, `--context`, `--broker-namespace`,
 The table has one row per finding:
 
 ```
-SEVERITY  KIND            VICTIM                 CULPRIT                 SHARE  MESSAGE
-high      noisy-neighbor  payments/api-7c9d…/api  batch/etl-1-x/worker    71%    payments/api is starved for CPU by batch/etl-1-x (71% of its wait); etl-1-x is using 1.9 cores against a 0.5-core request.
-medium    cpu-throttled   payments/worker-5f…/w   -                       -      payments/worker is throttled 34% of the time by its own 500m limit.
+SEVERITY  KIND            VICTIM                       CULPRIT                 SHARE  MESSAGE
+high      noisy-neighbor  payments/api-7c9d8f6b5-x2k4q  batch/etl-1-x           71%    payments/api is starved for CPU by batch/etl-1-x (71% of its wait); etl-1-x is using 1.9 cores against a 0.5-core request.
+high      noisy-neighbor  logging/fluentd-4m2pq         system:kubelet.service  55%    logging/fluentd is starved for CPU by kubelet.service (55% of its wait).
+medium    cpu-throttled   payments/worker-5f7c9-b8n3d   -                       -      payments/worker is throttled 34% of the time by its own 500m limit.
 ```
 
-`CULPRIT` and `SHARE` are `-` for the kinds that never name one
-(`cpu-throttled`, `cpu-contended`, `memory-limit-thrash`). A `system` or
-`kernel` culprit prints its `ref` (for example `system.slice/kubelet.service`).
+`VICTIM` and `CULPRIT` are printed as `namespace/pod`; the container is in
+the JSON output. A `system` culprit prints as `system:<unit>` (for example
+`system:kubelet.service`), a `kernel` culprit as `kernel`. `CULPRIT` and
+`SHARE` are `-` for the kinds that never name one (`cpu-throttled`,
+`cpu-contended`, `memory-limit-thrash`). `SHARE` is the culprit's share of
+the victim's scheduler wait for `noisy-neighbor`, and its share of the
+node's memory overage for `memory-pressure`.
 
 `-o json` prints the broker's `{ "findings": [...] }` response unchanged;
 the schema is in the [compute reference](/reference/compute#finding).

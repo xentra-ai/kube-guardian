@@ -21,6 +21,7 @@ feature. Operational steps are in the [guide](/guides/compute-gauges).
 | `compute.thresholds.throttledRatioMax` | float | `0.10` | Hard gate: above this ratio a container is never a `noisy-neighbor` victim. |
 | `compute.thresholds.blameShare` | float | `0.40` | Share of the victim's wait time one cgroup must hold to be named the culprit. |
 | `compute.thresholds.memStallSome` | int | `10` | `memory.pressure some avg10` (percent) at or above which `memory-pressure` can fire (while the node is also under pressure). |
+| `compute.thresholds.refaultPerMin` | int | `1000` | Workingset refaults per minute at or above which a container counts as thrashing for `memory-pressure` (the alternative to `memStallSome`; the node must also be under pressure). |
 | `compute.history.retentionDays` | int | `7` | Days of history kept. `0` disables history inserts and pruning; the live table still works. |
 | `compute.history.minuteResolutionHours` | int | `24` | Hours kept at one-minute resolution before rows are folded into 5-minute rows. |
 
@@ -61,6 +62,7 @@ it collected.
 | `COMPUTE_THRESHOLD_THROTTLED_RATIO_MAX` | `compute.thresholds.throttledRatioMax` | `0.10` |
 | `COMPUTE_THRESHOLD_BLAME_SHARE` | `compute.thresholds.blameShare` | `0.40` |
 | `COMPUTE_THRESHOLD_MEM_STALL_SOME` | `compute.thresholds.memStallSome` | `10` |
+| `COMPUTE_THRESHOLD_REFAULT_PER_MIN` | `compute.thresholds.refaultPerMin` | `1000` |
 
 ## Pod annotation
 
@@ -71,8 +73,9 @@ it collected.
 ## Broker endpoints
 
 All read endpoints return JSON and are metered by the broker's read budget.
-The two `POST`s are for the controller and require the bearer token when
-`broker.auth.enabled` is set.
+The two `POST`s are for the controller. When `broker.auth.enabled` is set,
+every broker endpoint — these included — requires the bearer token; the
+auth middleware is global, not per route.
 
 | Endpoint | Returns |
 |---|---|
@@ -131,7 +134,7 @@ The two `POST`s are for the controller and require the bearer token when
 | `kind` | `noisy-neighbor`, `cpu-throttled`, `cpu-contended`, `memory-pressure`, `memory-limit-thrash`. What each means and its remediation: [finding kinds](/concepts/compute-contention#finding-kinds). |
 | `severity` | `critical`, `high`, `medium`. |
 | `victim` | The stalled container. `container_uid` is `<pod_uid>/<container>`. |
-| `culprit` | `null` for `cpu-throttled`, `cpu-contended` and `memory-limit-thrash`. `kind` is `pod`, `system` or `kernel`; the `pod_*` fields are `null` unless `kind` is `pod`. `blame_share` is the culprit's share of the victim's wait time over the window; `cpu_usage_millis` and `cpu_request_millis` are the numbers behind "running beyond its request" (`cpu_request_millis` is `null` when the culprit has none). |
+| `culprit` | `null` for `cpu-throttled`, `cpu-contended` and `memory-limit-thrash`. `kind` is `pod`, `system` or `kernel`; the `pod_*` fields are `null` unless `kind` is `pod`. `blame_share` is the culprit's share of the victim's scheduler wait time over the window for `noisy-neighbor`; for `memory-pressure` it is the culprit's share of the **node's memory overage** (usage beyond requests), not a wait share. `cpu_usage_millis` and `cpu_request_millis` are the numbers behind "running beyond its request"; `cpu_request_millis` is `null` when the culprit has none, and `cpu_usage_millis` is `null` when the culprit is opted out (`kguardian.dev/compute: "off"`) and therefore not sampled. |
 | `evidence` | The values that fired the rule, as maxima over the window. `runq_p99_us_max` is `null` when the probe is not loaded. |
 | `first_seen` / `last_seen` | RFC 3339 UTC. |
 | `message` | One sentence, safe to show verbatim. |

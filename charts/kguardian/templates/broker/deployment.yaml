@@ -213,6 +213,10 @@ spec:
             - name: COMPUTE_THRESHOLD_MEM_STALL_SOME
               value: {{ $thresholds.memStallSome | quote }}
             {{- end }}
+            {{- if hasKey $thresholds "refaultPerMin" }}
+            - name: COMPUTE_THRESHOLD_REFAULT_PER_MIN
+              value: {{ $thresholds.refaultPerMin | quote }}
+            {{- end }}
             # Anonymous version check-in (see docs/telemetry). CHART_VERSION
             # and KUBE_VERSION are captured at install/upgrade time and ride
             # the daily check-in; disable with telemetry.enabled=false.

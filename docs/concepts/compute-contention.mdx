@@ -68,8 +68,8 @@ fired it, not just the verdict.
 | `cpu-throttled` | the container's CFS throttled time over the window is ≥ `throttledRatio` (default 25 %) of its quota time | never | raise or remove `resources.limits.cpu` on the victim |
 | `noisy-neighbor` | the victim is stalled, is *not* self-throttled, and one cgroup on the same node dominates its wait time and is running beyond its own request | a pod, a systemd unit, or the kernel | lower the culprit's usage or give it a request that reflects it; move one of the two |
 | `cpu-contended` | the victim is stalled and not self-throttled, but no single cgroup passes the culprit test | none — the node is oversubscribed | the blame list shows who shares the CPU; add capacity or spread the workload |
-| `memory-pressure` | the container's `memory.pressure some avg10` ≥ `memStallSome` (default 10 %) or its refault rate is rising, **while** the node itself is under memory pressure (`/proc/pressure/memory some` ≥ 5 %) | the container on the node with the largest growth beyond its memory request, if it accounts for ≥ 40 % of the node's overage; labelled as a heuristic | set or raise memory requests on the culprit; add memory to the node |
-| `memory-limit-thrash` | the container is refaulting under its **own** `memory.max` (`memory.events high` rising) and the node is not under pressure | never | raise `resources.limits.memory` on the victim |
+| `memory-pressure` | the container's `memory.pressure some avg10` ≥ `memStallSome` (default 10 %) or its workingset refault rate is ≥ `refaultPerMin` (default 1000 per minute), **while** the node itself is under memory pressure (`/proc/pressure/memory some` ≥ 5 %) | the container on the node with the largest growth beyond its memory request, if it accounts for ≥ 40 % of the node's overage; labelled as a heuristic | set or raise memory requests on the culprit; add memory to the node |
+| `memory-limit-thrash` | the container is refaulting under its **own** `memory.max` (`memory.events` `high` + `max` hits rising) and the node is not under pressure | never | raise `resources.limits.memory` on the victim |
 
 Severity for the CPU kinds: `critical` when `cpu.pressure full avg10` ≥ 10 %
 or run-queue p99 ≥ 200 ms; `high` when both stall signals fired; `medium`
@@ -138,8 +138,14 @@ ran instead of the victim. There is no equivalent for memory: reclaim is
 node-wide and the kernel does not record which cgroup's growth pushed which
 other cgroup's pages out. The `memory-pressure` culprit is therefore a
 heuristic — the container whose usage grew most beyond its request during
-the window — and the finding is labelled as such. Treat it as a strong lead,
+the window — and the finding is labelled as such. Its `blame_share` is
+that container's share of the node's memory overage (usage beyond
+requests), not a share of anyone's wait time. Treat it as a strong lead,
 not a verdict.
+
+A culprit that is opted out (`kguardian.dev/compute: "off"`) is not sampled,
+so its `cpu_usage_millis` is `null` in the finding even though it can still
+be named.
 
 ## Cross-namespace visibility
 
@@ -149,8 +155,11 @@ in another namespace, and a contention edge on the map can point at a pod
 outside the namespace you selected (drawn as an external node, the same way
 cross-namespace traffic peers are). kguardian is a cluster-scoped operator
 tool and already lists cluster-wide traffic peers; this is documented
-behaviour, not hidden. The findings endpoint honours the same namespace
-exclusions as traffic (`controller.excludedNamespaces`).
+behaviour, not hidden. The broker does not filter findings by namespace
+policy: a namespace in `controller.excludedNamespaces` never registers with
+the controller, so its pods are never sampled and never appear as victims.
+They can still appear as culprits, but only as an untracked `pod:<uid8>`
+reference, never by name.
 
 Per-pod opt-out is the annotation `kguardian.dev/compute: "off"`. An
 opted-out pod is not sampled and has no gauge, but it can still be named as a

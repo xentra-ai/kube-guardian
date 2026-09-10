@@ -155,10 +155,11 @@ privilege: `/sys/fs/cgroup` mounted **read-only** as a new hostPath, only
 rendered when `compute.enabled`. `hostPID` stays off; host `/proc` is
 already mounted.
 
-Pod-level rollup: the pod's own cgroup (the `pod<uid>.slice` parent) is also
-recorded so pause-container and init-container time is not lost, and so the
-graph node (which is a pod / workload) can show a single gauge. Per-container
-rows are kept in the broker because limits and throttling are per container.
+Pod-level rollup: the graph node (a pod / workload) shows a single gauge
+that is the sum of its container rows; the pod-level cgroup is not sampled
+(pause-container time is negligible and init containers have exited).
+Per-container rows are kept in the broker because limits and throttling are
+per container.
 
 ### D2 — Usage and stall come from cgroup files, not eBPF
 
@@ -209,17 +210,28 @@ Both are computed broker-side (D7) so the CLI, MCP tools and UI agree.
 
 ### D4 — Blame comes from an in-kernel run-queue latency histogram plus a preemption-pair matrix
 
-New source `controller/src/bpf/sched_contention.bpf.c`, three programs on
-`tp_btf` tracepoints with `raw_tp` fallback, using the `BPF_PROG()` macro so
-arguments are typed (`prev`, `next`) rather than a hand-cast `ctx` array —
-the exact bug that invalidated the reference's headline number.
+New source `controller/src/bpf/sched_contention.bpf.c`, four programs on
+`tp_btf` tracepoints, using the `BPF_PROG()` macro so arguments are typed
+(`prev`, `next`) rather than a hand-cast `ctx` array — the exact bug that
+invalidated the reference's headline number. BTF (`/sys/kernel/btf/vmlinux`)
+is required: CO-RE relocation needs it for any program type, so there is no
+`raw_tp` fallback; without BTF the probe reports `contention_loaded=false`
+and the gauge layers continue. The object is compiled with `-mcpu=v2` so the
+atomics encode as legacy `lock xadd` and load on 5.10+ x86 and 5.15 arm64
+regardless of the builder's clang.
 
 ```
-tp_btf/sched_wakeup       → runq_enqueued[next.pid] = now      (BPF_NOEXIST)
+tp_btf/sched_wakeup       → if p.on_cpu: return   # a wakeup can target a task that is
+                                                  # still running (ttwu_runnable / self-wake);
+                                                  # stamping it would fold run + sleep time
+                                                  # into the next wait
+                            runq_enqueued[p.pid] = now   (BPF_ANY: latest wakeup wins)
 tp_btf/sched_wakeup_new   → same (forked tasks; the reference missed these)
 tp_btf/sched_switch(preempt, prev, next):
-    if prev.state == TASK_RUNNING:            # preempted, still runnable
-        runq_enqueued[prev.pid] = now         # bcc runqlat semantics;
+    if preempt or prev.state == TASK_RUNNING: # still runnable: preempted, or preempted
+        runq_enqueued[prev.pid] = now         # between set_current_state() and schedule()
+                                              # (__schedule only deactivates when not
+                                              # preempting); bcc runqlat semantics —
                                               # Netflix's published snippet omits this
                                               # and it is the noisy-neighbour case
     ts = runq_enqueued.pop(next.pid) or return
@@ -244,10 +256,11 @@ Design points:
   and `pair{victim,culprit}` (LRU, 16 384) keeps the histogram exact and lets
   pair churn evict safely. This is Netflix's `runq.latency` +
   `sched.switch.out` split.
-- **`tracked_cgroups`** is a plain `HASH<u64 cgroup_id, u32 flags>` with the
-  same generation discipline as `inode_num` (`helper.h:44-66`): a cgroup id
-  is recycled by the kernel far less often than a netns inode, but the
-  userspace side still folds the generation in before trusting a delta.
+- **`tracked_cgroups`** is a plain `HASH<u64 cgroup_id, u32 flags>`. Unlike
+  `inode_num` (`helper.h:44-66`) it needs no separate generation field: a
+  cgroup v2 id is the 64-bit kernfs id, whose high 32 bits are already a
+  generation counter, so a recycled directory gets a new key and a stale
+  delta cannot be attributed to the wrong pod.
 - **Cgroup reads use `BPF_CORE_READ(task, cgroups, dfl_cgrp, kn, id)`**, not
   the `bpf_rcu_read_lock` kfunc path. The kfunc route needs ≥ 6.2 and is what
   made the reference 6.x-only; the probe-read route costs 20–30 ns more per
@@ -255,8 +268,11 @@ Design points:
   requirement. Revisit if profiling shows it matters.
 - **Map sizes:** `runq_enqueued` HASH 65 536 (pid churn headroom — Netflix
   found plain HASH beat LRU by 40–50 ns and chose a large one),
-  `runq_hist` HASH 8 192, `pair` LRU_HASH 16 384. A `map_stats` array
-  exports occupancy so a leak shows up as a number, not as a phantom p99.
+  `runq_hist` HASH 65 536 (24 buckets × ~2 700 tracked cgroups; the map is
+  exact, not LRU, so a full map means silent loss), `pair` LRU_HASH 16 384.
+  Occupancy and update-failure counters are exported every sample so a leak
+  or a full map shows up as a number, not as a phantom p99; `untrack`
+  deletes the victim's histogram rows and `snapshot` sweeps orphans.
 - **No ring buffer.** Userspace reads the maps every sample interval,
   computes deltas against the previous read, and ships summaries. Per-event
   delivery is the expensive part in every published implementation.
@@ -721,7 +737,7 @@ payments/api slow?" from the tools alone.
 
 | Question | Decision |
 |---|---|
-| Per-container vs per-pod blame in the UI | **Pod-level** on the graph node (worst container drives the status dot, pod cgroup drives the gauge); **per-container breakdown** in the Compute section of the detail panel. |
+| Per-container vs per-pod blame in the UI | **Pod-level** on the graph node (worst container drives the status dot; the gauge is the sum of the pod's container rows, so the controller does not sample the pod-level cgroup); **per-container breakdown** in the Compute section of the detail panel. |
 | History retention default | **7 days**, configurable as `compute.history.retentionDays`; minute rows downsampled to 5-minute rows after 24 h so the default stays under 10 M rows (D5). |
 | Default-on | **Gauges on by default** (`compute.enabled: true`), configurable; scheduler probe (`contention.enabled`) off until Phase 4 measures it (D9). |
 | Opt-out annotation | **Yes**, `kguardian.dev/compute: "off"` on the pod; opted-out pods are not sampled but can still be named as culprits (D9). |
