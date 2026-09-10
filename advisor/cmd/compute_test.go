@@ -156,6 +156,46 @@ func TestFormatShare(t *testing.T) {
 	}
 }
 
+func TestFormatMillis_NullIsDash(t *testing.T) {
+	if got := formatMillis(nil); got != "-" {
+		t.Errorf("nil: want -, got %q", got)
+	}
+	if got := formatMillis(f64p(1900.4)); got != "1900m" {
+		t.Errorf("1900.4: want 1900m, got %q", got)
+	}
+}
+
+func TestComputeFinding_DecodesNullCulpritUsage(t *testing.T) {
+	// The broker sends cpu_usage_millis: null for a culprit that opted out of
+	// sampling. It must decode to nil (not 0, not an error) so the CLI never
+	// reports a fabricated usage figure.
+	var resp api.ComputeFindingsResponse
+	if err := json.Unmarshal([]byte(brokerFindingsBody), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	var nullUsage *api.ComputeFindingCulprit
+	for _, f := range resp.Findings {
+		if f.Victim.PodName == "checkout-1" {
+			nullUsage = f.Culprit
+		}
+	}
+	if nullUsage == nil {
+		t.Fatal("fixture lost the null-usage culprit")
+	}
+	if nullUsage.CPUUsageMillis != nil {
+		t.Errorf("cpu_usage_millis null must decode to nil, got %v", *nullUsage.CPUUsageMillis)
+	}
+	if nullUsage.CPURequestMillis != nil {
+		t.Errorf("cpu_request_millis null must decode to nil")
+	}
+	if nullUsage.BlameShare == nil || *nullUsage.BlameShare != 0.9 {
+		t.Errorf("blame_share must still decode alongside null usage")
+	}
+	if got := formatMillis(nullUsage.CPUUsageMillis); got != "-" {
+		t.Errorf("null usage must render as -, got %q", got)
+	}
+}
+
 func TestRenderComputeFindingsTable_Empty(t *testing.T) {
 	var buf bytes.Buffer
 	if err := renderComputeFindingsTable(&buf, nil); err != nil {
@@ -179,7 +219,13 @@ const brokerFindingsBody = `{"findings":[
    "culprit":{"kind":"system","ref":"system.slice/kubelet.service","pod_uid":null,"namespace":null,"pod_name":null,"container_uid":null,"blame_share":0.58,"cpu_usage_millis":900.0,"cpu_request_millis":null},
    "evidence":{"window_minutes":5},
    "first_seen":"2026-09-10T02:36:05Z","last_seen":"2026-09-10T02:41:05Z",
-   "message":"payments/api is starved for CPU by kubelet.service (58% of its wait)"}
+   "message":"payments/api is starved for CPU by kubelet.service (58% of its wait)"},
+  {"kind":"noisy-neighbor","severity":"critical",
+   "victim":{"pod_uid":"u3","namespace":"payments","pod_name":"checkout-1","container":"web","container_uid":"u3/web","node":"worker-3"},
+   "culprit":{"kind":"pod","ref":"batch/etl-1/worker","pod_uid":"u9","namespace":"batch","pod_name":"etl-1","container_uid":"u9/worker","blame_share":0.9,"cpu_usage_millis":null,"cpu_request_millis":null},
+   "evidence":{"window_minutes":5},
+   "first_seen":"2026-09-10T02:36:05Z","last_seen":"2026-09-10T02:41:05Z",
+   "message":"payments/checkout-1 is starved for CPU by batch/etl-1 (90% of its wait); etl-1 opted out of compute sampling so its usage is unknown"}
 ],"future_top_level":"kept"}`
 
 func newBrokerFixture(t *testing.T) (*httptest.Server, *string) {
@@ -238,15 +284,19 @@ func TestFetchAndRenderComputeFindings_TableFromBroker(t *testing.T) {
 		t.Errorf("cluster scope must send no query, got %q", *gotQuery)
 	}
 	rows := tableRows(t, buf.String())
-	if len(rows) != 2 {
-		t.Fatalf("want 2 rows, got %d:\n%s", len(rows), buf.String())
+	if len(rows) != 3 {
+		t.Fatalf("want 3 rows, got %d:\n%s", len(rows), buf.String())
 	}
-	// high before medium; system culprit rendered as system:<unit> with share.
-	if rows[0][0] != "high" || rows[0][3] != "system:kubelet.service" || rows[0][4] != "58%" {
+	// critical (null cpu_usage_millis culprit) first: share still renders, nothing panics.
+	if rows[0][0] != "critical" || rows[0][3] != "batch/etl-1" || rows[0][4] != "90%" {
 		t.Errorf("row 0: %v", rows[0])
 	}
-	if rows[1][0] != "medium" || rows[1][3] != "-" || rows[1][4] != "-" {
+	// high before medium; system culprit rendered as system:<unit> with share.
+	if rows[1][0] != "high" || rows[1][3] != "system:kubelet.service" || rows[1][4] != "58%" {
 		t.Errorf("row 1: %v", rows[1])
+	}
+	if rows[2][0] != "medium" || rows[2][3] != "-" || rows[2][4] != "-" {
+		t.Errorf("row 2: %v", rows[2])
 	}
 }
 

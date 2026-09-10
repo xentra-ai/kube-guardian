@@ -31,6 +31,7 @@ export interface ComputeHistoryRow {
   cpu_nr_periods?: number | null;
   cpu_nr_throttled?: number | null;
   cpu_throttled_usec?: number | null;
+  cpu_period_usec?: number | null;
   cpu_psi_some10_max?: number | null;
   cpu_psi_full10_max?: number | null;
   mem_working_set_avg?: number | null;
@@ -57,7 +58,9 @@ export interface ContainerComputeSummary {
   cpu_usage_millis: { avg: number | null; max: number | null; p99: number | null };
   cpu_request_millis: number | null;
   cpu_limit_millis: number | null;
-  /** Fraction of CFS periods that were throttled over the window (null when unlimited / no periods). */
+  /** Broker / design D3 definition: Σ throttled_usec ÷ Σ (nr_periods × period_usec) over the
+   *  window — the share of quota-time lost to throttling. null when unlimited (no CFS
+   *  periods) or when the period is unknown. */
   cpu_throttled_ratio: number | null;
   cpu_psi_some10_max: number | null;
   cpu_psi_full10_max: number | null;
@@ -122,8 +125,18 @@ export function summariseComputeHistory(rows: unknown): ContainerComputeSummary[
     const pick = (f: (r: ComputeHistoryRow) => unknown): number[] =>
       sorted.map(f).map(num).filter((v): v is number => v !== null);
 
-    const periods = sum(pick((r) => r.cpu_nr_periods));
-    const throttled = sum(pick((r) => r.cpu_nr_throttled));
+    // Denominator is accumulated per row so a mid-window period change
+    // (limit edited in place) is weighted correctly rather than assuming
+    // one period for the whole window.
+    let quotaTimeUsec = 0;
+    let throttledUsec = 0;
+    for (const r of sorted) {
+      const periods = num(r.cpu_nr_periods);
+      const period = num(r.cpu_period_usec);
+      if (periods === null || periods <= 0 || period === null || period <= 0) continue;
+      quotaTimeUsec += periods * period;
+      throttledUsec += num(r.cpu_throttled_usec) ?? 0;
+    }
     const runqP99s = pick((r) => r.runq_p99_us);
     const runqLoaded = runqP99s.length > 0 || pick((r) => r.runq_count).length > 0;
 
@@ -139,7 +152,7 @@ export function summariseComputeHistory(rows: unknown): ContainerComputeSummary[
       },
       cpu_request_millis: num(newest.cpu_request_millis),
       cpu_limit_millis: num(newest.cpu_limit_millis),
-      cpu_throttled_ratio: periods > 0 ? round(throttled / periods) : null,
+      cpu_throttled_ratio: quotaTimeUsec > 0 ? round(throttledUsec / quotaTimeUsec) : null,
       cpu_psi_some10_max: max(pick((r) => r.cpu_psi_some10_max)),
       cpu_psi_full10_max: max(pick((r) => r.cpu_psi_full10_max)),
       mem_working_set_bytes: {

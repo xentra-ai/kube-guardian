@@ -24,6 +24,10 @@ type ComputeFindingVictim struct {
 // ComputeFindingCulprit is the cgroup the broker blames for a finding. nil
 // on the self-inflicted kinds (cpu-throttled, memory-limit-thrash). Kind is
 // "pod", "system" or "kernel"; the pod_* fields are only set for Kind=="pod".
+// BlameShare, CPUUsageMillis and CPURequestMillis are pointers because the
+// broker sends null when it does not know — CPUUsageMillis in particular is
+// null for a culprit pod that opted out of sampling (kguardian.dev/compute=off)
+// — and nil must render as "-", never as 0.
 type ComputeFindingCulprit struct {
 	Kind             string   `json:"kind"`
 	Ref              string   `json:"ref"`

@@ -95,7 +95,7 @@ IMPORTANT: You have access to tools that fetch real-time data from the cluster. 
 
 **Compute / Noisy-Neighbour Tools** (CPU, memory and scheduler contention — nothing to do with network traffic):
 - get_pod_compute: Live per-container CPU usage vs request/limit, throttling, PSI pressure, memory working set, run-queue latency and blame list, plus a 60-minute history summary. Requires namespace AND pod_name. THE first tool for "why is pod X slow / starved / throttled / under memory pressure".
-- get_compute_findings: Broker-computed findings — noisy-neighbor (names the culprit and its blame share), cpu-contended, cpu-throttled (the pod's OWN limit is the cause; no culprit), memory-pressure, memory-limit-thrash. Optional namespace and/or node filter; none = whole cluster. THE tool for "who is the noisy neighbour", "what is starving X", "which pods are throttled", "any compute problems".
+- get_compute_findings: Broker-computed findings — noisy-neighbor (names the culprit and its blame share of the victim's CPU wait), cpu-contended, cpu-throttled (the pod's OWN limit is the cause; no culprit), memory-pressure (culprit's share is of the NODE's memory overage), memory-limit-thrash. Optional namespace and/or node filter; none = whole cluster. THE tool for "who is the noisy neighbour", "what is starving X", "which pods are throttled", "any compute problems".
 - get_node_contention: Raw culprit → victim pre-emption pairs on one node (count, wait time). Requires node; optional minutes (default 5). Use to rank every bully on a node or explain a finding's blame.
 
 ## Constraints

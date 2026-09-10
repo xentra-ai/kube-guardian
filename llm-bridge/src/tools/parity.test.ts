@@ -52,7 +52,7 @@ const COMPUTE_FIXTURES: Record<string, unknown> = {
     containers: [{ container_uid: "uid-web-1/web", pod_uid: "uid-web-1", pod_name: "web-1", namespace: "default", container: "web", node: "node-a", cpu_usage_millis: 120.5, blame: [] }],
     nodes: [{ node: "node-a", cpu_cores: 8, contention_loaded: true }],
   },
-  "/compute/history/uid-web-1": { rows: [{ container_uid: "uid-web-1/web", container: "web", ts: "2026-09-10T02:41:00", cpu_usage_millis_avg: 100, cpu_usage_millis_max: 150, cpu_nr_periods: 600, cpu_nr_throttled: 6 }] },
+  "/compute/history/uid-web-1": { rows: [{ container_uid: "uid-web-1/web", container: "web", ts: "2026-09-10T02:41:00", cpu_usage_millis_avg: 100, cpu_usage_millis_max: 150, cpu_nr_periods: 600, cpu_period_usec: 100000, cpu_nr_throttled: 6, cpu_throttled_usec: 8100 }] },
   "/compute/findings": { findings: [] },
   "/compute/contention": { pairs: [] },
 };

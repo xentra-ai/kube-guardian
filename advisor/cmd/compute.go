@@ -47,8 +47,9 @@ var computeFindingsCmd = &cobra.Command{
 	Long: `List the broker's current compute findings.
 
 Each finding names a VICTIM container, a KIND, and — for the cross-container
-kinds — the CULPRIT cgroup the broker blames and the SHARE of the victim's
-scheduler wait it caused:
+kinds — the CULPRIT cgroup the broker blames and its SHARE: the culprit's
+share of the victim's CPU wait (noisy-neighbor), or of the node's memory
+overage (memory-pressure). Self-inflicted kinds have no culprit and no share:
 
   noisy-neighbor       victim starved for CPU by a named pod or system unit
   cpu-contended        victim starved, no single dominant culprit
@@ -215,7 +216,20 @@ func formatCulprit(c *api.ComputeFindingCulprit) string {
 	}
 }
 
+// formatMillis renders an optional millicore value (e.g. culprit
+// cpu_usage_millis) as "1900m", or `-` when the broker sent null — an
+// opted-out culprit has a blame share but no usage figure. Used by the
+// debug log line; the table has no usage column by contract.
+func formatMillis(v *float64) string {
+	if v == nil || math.IsNaN(*v) {
+		return "-"
+	}
+	return fmt.Sprintf("%dm", int(math.Round(*v)))
+}
+
 // formatShare renders blame_share (a 0..1 fraction) as a whole percent, or `-`.
+// What the fraction is a share OF depends on the kind: the victim's CPU wait
+// for noisy-neighbor, the node's memory overage for memory-pressure.
 func formatShare(c *api.ComputeFindingCulprit) string {
 	if c == nil || c.BlameShare == nil || math.IsNaN(*c.BlameShare) {
 		return "-"
@@ -239,6 +253,10 @@ func renderComputeFindingsTable(w io.Writer, findings []api.ComputeFinding) erro
 		return err
 	}
 	for _, f := range rows {
+		if f.Culprit != nil {
+			log.Debug().Str("victim", formatVictim(f.Victim)).Str("culprit", formatCulprit(f.Culprit)).
+				Str("culprit_cpu", formatMillis(f.Culprit.CPUUsageMillis)).Msg("compute finding")
+		}
 		msg := strings.ReplaceAll(strings.ReplaceAll(f.Message, "\n", " "), "\t", " ")
 		if _, err := fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n",
 			f.Severity, f.Kind, formatVictim(f.Victim), formatCulprit(f.Culprit), formatShare(f.Culprit), msg); err != nil {

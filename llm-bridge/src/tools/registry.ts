@@ -119,7 +119,7 @@ export const TOOL_DEFS: ToolDef[] = [
   {
     name: "get_compute_findings",
     description:
-      "Get the broker's compute findings: noisy-neighbor (victim starved by a named culprit pod/system unit, with blame share), cpu-contended (starved, no dominant culprit), cpu-throttled (victim hitting its own CPU limit — raise the limit, no culprit), memory-pressure (node memory pressure with a culprit), memory-limit-thrash (victim thrashing under its own memory limit). Each finding carries victim, culprit (or null), evidence and a human-readable message. Filters optional: namespace (victim's namespace), node; omit both for the whole cluster. THE tool for 'who is the noisy neighbour', 'what is starving X', 'which pods are throttled', 'any compute problems in namespace Y'.",
+      "Get the broker's compute findings: noisy-neighbor (victim starved by a named culprit pod/system unit, with blame share), cpu-contended (starved, no dominant culprit), cpu-throttled (victim hitting its own CPU limit — raise the limit, no culprit), memory-pressure (node memory pressure with a culprit), memory-limit-thrash (victim thrashing under its own memory limit). Each finding carries victim, culprit (or null), evidence and a human-readable message. culprit.blame_share is the culprit's share of the victim's CPU wait for noisy-neighbor, or of the node's memory overage for memory-pressure. Filters optional: namespace (victim's namespace), node; omit both for the whole cluster. THE tool for 'who is the noisy neighbour', 'what is starving X', 'which pods are throttled', 'any compute problems in namespace Y'.",
     parameters: {
       type: "object",
       properties: {
@@ -146,12 +146,5 @@ export const TOOL_DEFS: ToolDef[] = [
 
 /** Build the system-prompt tool guide from the registry — one source of truth. */
 export function toolSelectionGuide(): string {
-  const list = TOOL_DEFS.map((t) => `- ${t.name}: ${t.description}`).join("\n");
-  return `${list}
-
-Routing hints:
-- "Why is pod X slow / starved / throttled / under pressure?" → get_pod_compute(namespace, pod_name) first, then get_compute_findings(namespace) to see whether the broker already names a culprit.
-- "Who is the noisy neighbour?" / "what is starving X?" / "any compute problems?" → get_compute_findings (namespace and/or node filter, or none for the cluster). A noisy-neighbor finding names the culprit and its blame share; cpu-throttled means the pod's own limit is the cause, not a neighbour.
-- "Who is hogging node N?" / rank every bully on a node → get_node_contention(node).
-- Network questions (connections, drops, policies) stay with the traffic / audit tools; compute tools say nothing about traffic.`;
+  return TOOL_DEFS.map((t) => `- ${t.name}: ${t.description}`).join("\n");
 }
