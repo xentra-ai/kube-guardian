@@ -795,7 +795,7 @@ impl MinuteAcc {
         let cpu = self.cpu();
         let memory = self.memory();
         let mut blame: Vec<BlameEntry> = self.blame.into_values().collect();
-        blame.sort_by(|a, b| b.wait_ns.cmp(&a.wait_ns));
+        blame.sort_by_key(|a| std::cmp::Reverse(a.wait_ns));
         blame.truncate(HISTORY_BLAME_LIMIT);
         HistoryContainer {
             container_uid: format!("{}/{}", self.pod_uid, self.container),
@@ -1079,7 +1079,7 @@ fn blame_for(
             }
         })
         .collect();
-    out.sort_by(|a, b| b.wait_ns.cmp(&a.wait_ns));
+    out.sort_by_key(|a| std::cmp::Reverse(a.wait_ns));
     out.truncate(limit);
     out
 }
@@ -1723,11 +1723,7 @@ pub fn compute_supported(cgroup_root: &Path, host_proc: &Path) -> bool {
 /// Post every pending batch in order; stop at the first failure and
 /// hold the rest. Returns the number dropped by the cap.
 async fn flush_pending(pending: &mut VecDeque<PendingPost>) -> usize {
-    loop {
-        let (path, body) = match pending.front() {
-            Some(p) => (p.path, p.body.clone()),
-            None => break,
-        };
+    while let Some((path, body)) = pending.front().map(|p| (p.path, p.body.clone())) {
         match api_post_call(body, path).await {
             Ok(()) => {
                 pending.pop_front();

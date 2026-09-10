@@ -451,7 +451,7 @@ fn cpu_finding(
             pct(unknown_share)
         )));
     }
-    totals.sort_by(|a, b| b.wait_ns.cmp(&a.wait_ns));
+    totals.sort_by_key(|a| std::cmp::Reverse(a.wait_ns));
     let Some(top) = totals.iter().find(|b| b.kind != "unknown") else {
         return Some(contended(format!(
             "{who} is starved for CPU on node {} and no neighbour dominates its wait; the node is oversubscribed.",

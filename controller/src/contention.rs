@@ -368,11 +368,14 @@ impl ContentionProbe {
 /// per-key otherwise. Flips `batch_supported` off on the first refusal.
 /// A free function over the one flag (not a method) so `snapshot()` can
 /// hold `&self.skel.maps` across the call.
+/// Raw `(key, value)` byte pairs read from a BPF map.
+type RawEntries = Vec<(Vec<u8>, Vec<u8>)>;
+
 fn read_map(
     batch_supported: &mut bool,
     bufs: &mut BatchBuffers,
     map: &MapMut<'_>,
-) -> Result<Vec<(Vec<u8>, Vec<u8>)>, Error> {
+) -> Result<RawEntries, Error> {
     if *batch_supported {
         match lookup_batch(bufs, map)? {
             Some(rows) => return Ok(rows),
@@ -411,10 +414,7 @@ const ENOTSUPP: i32 = 524;
 /// because it swallows every error other than ENOENT/EINTR by ending the
 /// iteration early, which would make an unsupported kernel look exactly
 /// like an empty map and turn the next snapshot's deltas into garbage.
-fn lookup_batch(
-    bufs: &mut BatchBuffers,
-    map: &MapMut<'_>,
-) -> Result<Option<Vec<(Vec<u8>, Vec<u8>)>>, Error> {
+fn lookup_batch(bufs: &mut BatchBuffers, map: &MapMut<'_>) -> Result<Option<RawEntries>, Error> {
     let key_size = map.key_size() as usize;
     let value_size = map.value_size() as usize;
     let batch = map.max_entries().max(1);
@@ -489,7 +489,7 @@ fn lookup_batch(
 
 /// Per-key fallback: `get_next_key` walk plus one `lookup` per key. A key
 /// that disappears between the two calls is skipped.
-fn read_map_per_key(map: &MapMut<'_>) -> Result<Vec<(Vec<u8>, Vec<u8>)>, Error> {
+fn read_map_per_key(map: &MapMut<'_>) -> Result<RawEntries, Error> {
     let mut rows = Vec::new();
     for key in map.keys() {
         if let Some(value) = map
