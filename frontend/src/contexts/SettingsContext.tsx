@@ -15,6 +15,9 @@ export interface AppSettings {
    *  generation ignores this — those peers stay in the generated rules. */
   showDaemonSetNodes: boolean;
   showTraffic: boolean;
+  /** Draw culprit → victim contention edges from noisy-neighbour findings
+   *  (design D8). On by default; the toggle only appears when there is one. */
+  showContention: boolean;
   layoutDirection: 'LR' | 'TB';
 }
 
@@ -23,6 +26,7 @@ const DEFAULT_SETTINGS: AppSettings = {
   showExternalNodes: true,
   showDaemonSetNodes: false,
   showTraffic: true,
+  showContention: true,
   layoutDirection: 'LR',
 };
 

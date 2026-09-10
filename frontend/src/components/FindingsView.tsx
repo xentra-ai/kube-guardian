@@ -7,9 +7,13 @@ import {
   ArrowUpRight,
   FileCode,
   ChevronRight,
+  Cpu,
+  ExternalLink,
 } from 'lucide-react';
 import type { PodNodeData, AuditVerdict } from '../types';
-import type { FindingKind } from '../utils/findingPolicyType';
+import type { ComputeFinding, ComputeFindingKind } from '../types/compute';
+import { findingAction, type FindingKind } from '../utils/findingPolicyType';
+import { COMPUTE_KIND_LABEL } from '../utils/compute';
 import api from '../services/api';
 import { Button } from './ui/Button';
 import { EmptyState } from './ui/EmptyState';
@@ -22,6 +26,12 @@ interface FindingsViewProps {
   /** Opens the Policy Builder on the tab relevant to the finding kind. */
   onBuildPolicy: (pod: PodNodeData, kind: FindingKind) => void;
   onOpenAudit: () => void;
+  /** Broker-computed compute findings for the namespace (hooks/useComputeData). */
+  computeFindings?: ComputeFinding[];
+  /** False when no node reports compute — the section is then not offered. */
+  computeEnabled?: boolean;
+  /** "View workload" for a `resources` finding: jump to the pod on the map. */
+  onViewWorkload?: (namespace: string, podName: string) => void;
 }
 
 type Severity = 'critical' | 'high' | 'medium';
@@ -101,8 +111,33 @@ function podLabel(pod: PodNodeData): string {
  * would-deny summary pulled from the audit evaluator. No invented scores: each
  * section is a concrete, explainable signal that links back into the map.
  */
-export function FindingsView({ pods, namespace, onSelectPod, onBuildPolicy, onOpenAudit }: FindingsViewProps) {
+export function FindingsView({
+  pods,
+  namespace,
+  onSelectPod,
+  onBuildPolicy,
+  onOpenAudit,
+  computeFindings = [],
+  computeEnabled = false,
+  onViewWorkload,
+}: FindingsViewProps) {
   const workloads = useMemo(() => pods.filter((p) => !p.isExternal), [pods]);
+
+  // Compute findings (design D7) come from the broker, already ranked by
+  // severity there; a node filter narrows them because a noisy neighbour is
+  // a per-node problem.
+  const [nodeFilter, setNodeFilter] = useState<string>('all');
+  const computeNodes = useMemo(
+    () => [...new Set(computeFindings.map((f) => f.victim.node))].sort(),
+    [computeFindings],
+  );
+  const filteredCompute = useMemo(() => {
+    const rows = nodeFilter === 'all' ? computeFindings : computeFindings.filter((f) => f.victim.node === nodeFilter);
+    return [...rows].sort(
+      (a, b) => SEVERITY_RANK[b.severity] - SEVERITY_RANK[a.severity] || a.victim.pod_name.localeCompare(b.victim.pod_name),
+    );
+  }, [computeFindings, nodeFilter]);
+  const computeWorst = filteredCompute[0]?.severity;
 
   const dropFindings = useMemo<DropFinding[]>(() => {
     return workloads
@@ -186,13 +221,21 @@ export function FindingsView({ pods, namespace, onSelectPod, onBuildPolicy, onOp
   }, [wouldDeny]);
 
   const totalDrops = dropFindings.reduce((sum, f) => sum + f.drops, 0);
-  const findingCount = dropFindings.length + syscallFindings.length + fanoutFindings.length;
+  const findingCount = dropFindings.length + syscallFindings.length + fanoutFindings.length + computeFindings.length;
 
   const stats = [
     { label: 'Workloads', value: workloads.length, icon: ShieldCheck, tone: 'text-hubble-accent' },
     { label: 'Blocked connections', value: totalDrops, icon: ShieldAlert, tone: totalDrops > 0 ? 'text-hubble-error' : 'text-secondary' },
     { label: 'Sensitive syscalls', value: syscallFindings.length, icon: Terminal, tone: syscallFindings.length > 0 ? 'text-hubble-warning' : 'text-secondary' },
     { label: 'Egress fan-out', value: fanoutFindings.length, icon: Radar, tone: fanoutFindings.length > 0 ? 'text-hubble-warning' : 'text-secondary' },
+    ...(computeEnabled
+      ? [{
+          label: 'Compute',
+          value: computeFindings.length,
+          icon: Cpu,
+          tone: computeWorst === 'critical' ? 'text-hubble-error' : computeFindings.length > 0 ? 'text-hubble-warning' : 'text-secondary',
+        }]
+      : []),
   ];
 
   return (
@@ -208,7 +251,7 @@ export function FindingsView({ pods, namespace, onSelectPod, onBuildPolicy, onOp
         </div>
 
         {/* Stat row */}
-        <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+        <div className={`grid grid-cols-2 sm:grid-cols-4 gap-3 ${stats.length === 5 ? 'lg:grid-cols-5' : ''}`}>
           {stats.map((s) => {
             const Icon = s.icon;
             return (
@@ -228,7 +271,7 @@ export function FindingsView({ pods, namespace, onSelectPod, onBuildPolicy, onOp
             <EmptyState
               icon={ShieldCheck}
               title="No standout findings"
-              description="No blocked connections, sensitive syscalls, or unusual egress fan-out in this namespace. Keep an eye on the map for changes."
+              description={`No blocked connections, sensitive syscalls,${computeEnabled ? ' compute contention,' : ''} or unusual egress fan-out in this namespace. Keep an eye on the map for changes.`}
             />
           </div>
         ) : (
@@ -310,6 +353,88 @@ export function FindingsView({ pods, namespace, onSelectPod, onBuildPolicy, onOp
               </Section>
             )}
 
+            {/* Compute: noisy neighbours, throttling, memory pressure (design D7) */}
+            {computeFindings.length > 0 && (
+              <Section
+                icon={Cpu}
+                tone={computeWorst === 'critical' ? 'text-hubble-error' : 'text-hubble-warning'}
+                title="Compute contention"
+                hint="Pods starved of CPU or memory, and the pod on the same node starving them. Fix is the workload's resources, not a policy"
+                action={
+                  computeNodes.length > 1 ? (
+                    <label className="flex items-center gap-2 text-xs text-tertiary">
+                      Node
+                      <select
+                        value={nodeFilter}
+                        onChange={(e) => setNodeFilter(e.target.value)}
+                        aria-label="Filter compute findings by node"
+                        className="bg-hubble-dark border border-hubble-border rounded px-2 py-1 text-xs text-secondary focus:outline-none focus:border-hubble-accent"
+                      >
+                        <option value="all">All nodes</option>
+                        {computeNodes.map((n) => (
+                          <option key={n} value={n}>{n}</option>
+                        ))}
+                      </select>
+                    </label>
+                  ) : undefined
+                }
+              >
+                {filteredCompute.length === 0 ? (
+                  <p className="px-4 py-3 text-xs text-tertiary">No compute findings on this node.</p>
+                ) : (
+                  <ul className="divide-y divide-hubble-border">
+                    {filteredCompute.slice(0, 12).map((f) => {
+                      const key = `${f.kind}:${f.victim.container_uid}`;
+                      const kind: ComputeFindingKind = f.kind;
+                      const culpritLabel = f.culprit
+                        ? f.culprit.kind === 'pod' && f.culprit.pod_name
+                          ? `${f.culprit.namespace ?? ''}/${f.culprit.pod_name}`
+                          : f.culprit.ref
+                        : null;
+                      // A `resources` finding links to the workload, never the Policy Builder
+                      // (every compute kind is one; asserted rather than assumed).
+                      const action = findingAction(kind);
+                      return (
+                        <FindingRow
+                          key={key}
+                          title={`${f.victim.pod_name} · ${f.victim.container}`}
+                          badge={
+                            <>
+                              <Badge className={SEVERITY_CLASS[f.severity]}>{f.severity}</Badge>
+                              <Badge className="bg-hubble-border/30 text-secondary border-hubble-border">{COMPUTE_KIND_LABEL[kind] ?? kind}</Badge>
+                            </>
+                          }
+                          detail={
+                            <div className="mt-1 text-xs text-tertiary">
+                              <span>{f.message}</span>
+                              <span className="ml-2 font-mono">node {f.victim.node}</span>
+                              {culpritLabel && f.culprit && (
+                                <span className="ml-2 font-mono text-hubble-error" title={`${Math.round(f.culprit.blame_share * 100)}% of the victim's wait`}>
+                                  ← {culpritLabel} ({Math.round(f.culprit.blame_share * 100)}%)
+                                </span>
+                              )}
+                            </div>
+                          }
+                          onView={() => onViewWorkload?.(f.victim.namespace, f.victim.pod_name)}
+                          onViewWorkload={
+                            action === 'resources' && onViewWorkload
+                              ? () => {
+                                  // The culprit is what an operator fixes (its requests); fall back to the victim.
+                                  const target = f.culprit?.kind === 'pod' && f.culprit.pod_name
+                                    ? { ns: f.culprit.namespace ?? f.victim.namespace, name: f.culprit.pod_name }
+                                    : { ns: f.victim.namespace, name: f.victim.pod_name };
+                                  onViewWorkload(target.ns, target.name);
+                                }
+                              : undefined
+                          }
+                        />
+                      );
+                    })}
+                  </ul>
+                )}
+              </Section>
+            )}
+
             {/* Egress fan-out */}
             {fanoutFindings.length > 0 && (
               <Section icon={Radar} tone="text-hubble-warning" title="High egress fan-out" hint={`Workloads reaching ${EGRESS_FANOUT_THRESHOLD}+ distinct destinations`}>
@@ -379,12 +504,16 @@ function FindingRow({
   detail,
   onView,
   onBuildPolicy,
+  onViewWorkload,
 }: {
   title: string;
   badge: React.ReactNode;
   detail?: React.ReactNode;
   onView: () => void;
-  onBuildPolicy: () => void;
+  /** `policy` findings: opens the Policy Builder. */
+  onBuildPolicy?: () => void;
+  /** `resources` findings (design D7): links to the workload instead of a policy. */
+  onViewWorkload?: () => void;
 }) {
   return (
     <li className="group flex items-start justify-between gap-3 px-4 py-3 hover:bg-hubble-hover/40 transition-colors">
@@ -396,9 +525,15 @@ function FindingRow({
         {detail}
       </div>
       <div className="flex items-center gap-1 shrink-0 opacity-70 group-hover:opacity-100 transition-opacity">
-        <Button variant="ghost" size="sm" leftIcon={FileCode} onClick={onBuildPolicy} title="Build a policy for this workload">
-          Policy
-        </Button>
+        {onViewWorkload ? (
+          <Button variant="ghost" size="sm" leftIcon={ExternalLink} onClick={onViewWorkload} title="Open the workload to fix its resources">
+            View workload
+          </Button>
+        ) : onBuildPolicy ? (
+          <Button variant="ghost" size="sm" leftIcon={FileCode} onClick={onBuildPolicy} title="Build a policy for this workload">
+            Policy
+          </Button>
+        ) : null}
         <Button variant="ghost" size="sm" iconOnly rightIcon={ChevronRight} onClick={onView} aria-label="View in map" title="View in map" />
       </div>
     </li>

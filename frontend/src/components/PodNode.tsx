@@ -1,9 +1,23 @@
 import React from 'react';
 import { Handle, Position } from 'reactflow';
-import { ChevronDown, ChevronRight, Network, Server, Globe, FileCode, Crosshair } from 'lucide-react';
+import { ChevronDown, ChevronRight, Network, Server, Globe, FileCode, Crosshair, Cpu, MemoryStick, Zap, Gauge } from 'lucide-react';
 import { isDaemonSetOrHostNetworkPod } from '../utils/daemonSetPeers';
 import type { PodNodeData } from '../types';
+import type { PodComputeData } from '../types/compute';
 import { Button } from './ui/Button';
+import { Sparkline } from './ui/Sparkline';
+import {
+  COMPUTE_DOT_CLASS,
+  COMPUTE_HISTORY_SAMPLES,
+  denominatorLabel,
+  formatBytes,
+  formatMillicores,
+  formatPercent,
+  hasComputeGauges,
+  starvedBy,
+  statusTooltip,
+  throttledFinding,
+} from '../utils/compute';
 
 interface PodNodeProps {
   data: PodNodeData & {
@@ -18,6 +32,118 @@ interface PodNodeProps {
 
 // Pseudo-namespaces of the nodes that aggregate bare IPs rather than pods.
 const AGGREGATE_NAMESPACES = new Set(['internet', 'cluster', 'unattributed']);
+
+/** Bar fill colour by how full the gauge is: past the denominator is an error. */
+function gaugeFillClass(pct: number | null): string {
+  if (pct === null) return 'bg-hubble-border';
+  if (pct >= 100) return 'bg-hubble-error';
+  if (pct >= 80) return 'bg-hubble-warning';
+  return 'bg-hubble-accent';
+}
+
+const gaugeTitle = (label: string, value: string, pct: number | null, den: PodComputeData['cpuDenominator'], capacity: string) =>
+  pct === null
+    ? `${label} ${value} (${denominatorLabel(den)})`
+    : `${label} ${value} — ${formatPercent(pct)} of ${capacity} ${denominatorLabel(den)}`;
+
+/** Two-segment micro bar (CPU %, memory %) under the title. */
+const ComputeMicroBar: React.FC<{ compute: PodComputeData }> = ({ compute }) => {
+  const cpuTitle = gaugeTitle('CPU', formatMillicores(compute.cpuMillis), compute.cpuPct, compute.cpuDenominator, formatMillicores(compute.cpuCapacityMillis));
+  const memTitle = gaugeTitle('Memory', formatBytes(compute.memBytes), compute.memPct, compute.memDenominator, formatBytes(compute.memCapacityBytes));
+  const seg = (pct: number | null, title: string, testId: string) => (
+    <div className="flex-1 h-1.5 rounded-full bg-hubble-border/60 overflow-hidden" title={title} data-testid={testId}>
+      <div
+        className={`h-full rounded-full ${gaugeFillClass(pct)} transition-[width] duration-500`}
+        style={{ width: `${pct === null ? 0 : Math.min(100, Math.max(0, pct))}%` }}
+      />
+    </div>
+  );
+  return (
+    <div className="mt-1.5 flex items-center gap-1.5" data-testid="compute-microbar">
+      <Cpu className="w-3 h-3 text-tertiary shrink-0" />
+      {seg(compute.cpuPct, cpuTitle, 'compute-cpu-bar')}
+      <MemoryStick className="w-3 h-3 text-tertiary shrink-0" />
+      {seg(compute.memPct, memTitle, 'compute-mem-bar')}
+    </div>
+  );
+};
+
+/** Expanded-body sparklines + finding chips. */
+const ComputeDetail: React.FC<{ compute: PodComputeData }> = ({ compute }) => {
+  const starved = starvedBy(compute.findings);
+  const throttled = throttledFinding(compute.findings);
+  const culprit = starved?.culprit;
+  const culpritLabel = culprit
+    ? culprit.kind === 'pod' && culprit.pod_name
+      ? `${culprit.namespace ?? ''}/${culprit.pod_name}`
+      : culprit.ref
+    : null;
+  return (
+    <div className="space-y-2" data-testid="compute-detail">
+      <div>
+        <div className="flex items-center justify-between text-[11px]">
+          <span className="text-tertiary flex items-center gap-1"><Cpu className="w-3 h-3" />CPU</span>
+          <span className="font-mono tabular-nums text-secondary">
+            {formatMillicores(compute.cpuMillis)}
+            {compute.cpuCapacityMillis !== null && (
+              <span className="text-tertiary"> / {formatMillicores(compute.cpuCapacityMillis)} {denominatorLabel(compute.cpuDenominator)}</span>
+            )}
+          </span>
+        </div>
+        <Sparkline
+          values={compute.sparkCpu}
+          max={compute.cpuCapacityMillis}
+          capacity={COMPUTE_HISTORY_SAMPLES}
+          height={26}
+          title={`CPU, last ${COMPUTE_HISTORY_SAMPLES} samples`}
+        />
+      </div>
+      <div>
+        <div className="flex items-center justify-between text-[11px]">
+          <span className="text-tertiary flex items-center gap-1"><MemoryStick className="w-3 h-3" />Memory</span>
+          <span className="font-mono tabular-nums text-secondary">
+            {formatBytes(compute.memBytes)}
+            {compute.memCapacityBytes !== null && (
+              <span className="text-tertiary"> / {formatBytes(compute.memCapacityBytes)} {denominatorLabel(compute.memDenominator)}</span>
+            )}
+          </span>
+        </div>
+        <Sparkline
+          values={compute.sparkMem}
+          max={compute.memCapacityBytes}
+          capacity={COMPUTE_HISTORY_SAMPLES}
+          height={26}
+          color="var(--color-hubble-info)"
+          title={`Working set, last ${COMPUTE_HISTORY_SAMPLES} samples`}
+        />
+      </div>
+      {(starved || throttled) && (
+        <div className="flex flex-wrap gap-1">
+          {starved && culpritLabel && (
+            <span
+              className="inline-flex items-center gap-1 rounded-full border border-hubble-error/30 bg-hubble-error/15 text-hubble-error px-2 py-0.5 text-[10px] font-medium"
+              title={starved.message}
+              data-testid="compute-starved-chip"
+            >
+              <Zap className="w-3 h-3" />
+              Starved by {culpritLabel}
+            </span>
+          )}
+          {throttled && (
+            <span
+              className="inline-flex items-center gap-1 rounded-full border border-hubble-warning/30 bg-hubble-warning/15 text-hubble-warning px-2 py-0.5 text-[10px] font-medium"
+              title={throttled.message}
+              data-testid="compute-throttled-chip"
+            >
+              <Gauge className="w-3 h-3" />
+              Throttled {formatPercent(throttled.evidence.throttled_ratio * 100)}
+            </span>
+          )}
+        </div>
+      )}
+    </div>
+  );
+};
 
 const PodNode: React.FC<PodNodeProps> = React.memo(({ data, selected }) => {
   const trafficCount = data.traffic?.length || 0;
@@ -35,6 +161,10 @@ const PodNode: React.FC<PodNodeProps> = React.memo(({ data, selected }) => {
   }, 0) || 0;
 
   const IconComponent = isExternal ? Globe : Server;
+  // Compute gauges (design D8). `compute` absent ⇒ the card is exactly the
+  // pre-feature card; present without rows ⇒ just the muted dot + tooltip.
+  const compute = data.compute;
+  const gauged = compute !== undefined && hasComputeGauges(compute);
   // DaemonSet / host-network peers (see utils/daemonSetPeers) take the same
   // teal as their toolbar toggle and their edges — colour alone carries the
   // association, no tag text on the card.
@@ -86,8 +216,18 @@ const PodNode: React.FC<PodNodeProps> = React.memo(({ data, selected }) => {
           <IconComponent className={`w-5 h-5 ${accentColor}`} />
 
           <div className="flex-1 min-w-0">
-            <div className="font-semibold text-sm text-primary truncate" title={data.tooltip ?? identityName}>
-              {identityName}
+            <div className="flex items-center gap-1.5 min-w-0">
+              {compute && (
+                <span
+                  className={`shrink-0 w-2 h-2 rounded-full ${COMPUTE_DOT_CLASS[compute.status]}`}
+                  title={statusTooltip(compute.status, compute.findings)}
+                  data-testid="compute-status-dot"
+                  data-status={compute.status}
+                />
+              )}
+              <div className="font-semibold text-sm text-primary truncate" title={data.tooltip ?? identityName}>
+                {identityName}
+              </div>
             </div>
             {data.externalNamespace && !AGGREGATE_NAMESPACES.has(data.externalNamespace) && (
               <div className="text-xs text-tertiary truncate" title={data.externalNamespace}>
@@ -100,6 +240,7 @@ const PodNode: React.FC<PodNodeProps> = React.memo(({ data, selected }) => {
                 {podCount} {isExternal ? (AGGREGATE_NAMESPACES.has(data.externalNamespace ?? '') ? 'IPs' : 'pods') : 'replicas'}
               </div>
             )}
+            {gauged && <ComputeMicroBar compute={compute} />}
           </div>
         </div>
 
@@ -121,6 +262,7 @@ const PodNode: React.FC<PodNodeProps> = React.memo(({ data, selected }) => {
 
       {data.isExpanded && (
         <div className="mt-3 pt-3 border-t border-hubble-border space-y-2">
+          {gauged && <ComputeDetail compute={compute} />}
           {trafficCount === 0 && syscallCount === 0 ? (
             <div className="text-xs text-tertiary italic">
               No traffic or syscalls recorded yet
@@ -176,7 +318,10 @@ const PodNode: React.FC<PodNodeProps> = React.memo(({ data, selected }) => {
     prevProps.data.traffic?.length === nextProps.data.traffic?.length &&
     prevProps.data.syscalls?.length === nextProps.data.syscalls?.length &&
     prevProps.data.isExternal === nextProps.data.isExternal &&
-    prevProps.data.layoutDirection === nextProps.data.layoutDirection
+    prevProps.data.layoutDirection === nextProps.data.layoutDirection &&
+    // A new compute object arrives with every 5 s poll; identity is the
+    // cheapest correct signal (usePodData builds a fresh one per gauged pod).
+    prevProps.data.compute === nextProps.data.compute
   );
 });
 

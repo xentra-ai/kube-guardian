@@ -1,3 +1,5 @@
+import type { PodComputeData } from './compute';
+
 // Partial Kubernetes object metadata used for label extraction
 export interface KubeObjectMetadata {
   labels?: Record<string, string>;
@@ -122,6 +124,10 @@ export interface PodNodeData {
   /** Hover text for the node title when the label alone is misleading — set
    *  on the "Unattributed" node (guarded-out former IP holders). */
   tooltip?: string;
+  /** Live compute gauges + findings (hooks/useComputeData, utils/compute).
+   *  Absent when the pod's node reports no compute rows — the card then
+   *  renders exactly as it did before the feature. */
+  compute?: PodComputeData;
 }
 
 // Matches broker's SvcDetail type

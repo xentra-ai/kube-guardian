@@ -13,6 +13,10 @@ import 'reactflow/dist/style.css';
 import ELK from 'elkjs/lib/elk.bundled.js';
 import { Activity, ShieldAlert, Server, Crosshair, X } from 'lucide-react';
 import PodNode from './PodNode';
+import ContentionEdge from './ContentionEdge';
+import { EDGE_COLOR_CONTENTION, buildContentionEdges } from '../utils/contentionEdges';
+import { hasComputeGauges, nodeHeight } from '../utils/compute';
+import type { ComputeFinding } from '../types/compute';
 import { shouldExitFocus } from '../utils/graphFocus';
 import { EDGE_COLOR_DAEMONSET, edgeStrokeColor, isDaemonSetPeer, partitionDaemonSetPeers, shouldAutoShowDaemonSets } from '../utils/daemonSetPeers';
 import { GraphControls } from './GraphControls';
@@ -23,9 +27,10 @@ import { UI_TIMING } from '../constants/ui';
 
 const elk = new ELK();
 
-// Estimated node dimensions for ELK layout
+// Estimated node dimensions for ELK layout. Height is a function of the
+// card's state — see utils/compute `nodeHeight` — and is applied at BOTH
+// call sites (the ELK graph and the ELK-failure fallback grid).
 const NODE_WIDTH = 240;
-const NODE_HEIGHT = 100;
 
 interface NetworkGraphProps {
   pods: PodNodeData[];
@@ -38,6 +43,11 @@ interface NetworkGraphProps {
   onToggleDaemonSetNodes: () => void;
   showTraffic: boolean;
   onToggleTraffic: () => void;
+  /** Draw culprit → victim contention edges from noisy-neighbour findings (design D8). */
+  showContention?: boolean;
+  onToggleContention?: () => void;
+  /** Broker-computed compute findings for the namespace (hooks/useComputeData). */
+  computeFindings?: ComputeFinding[];
   layoutDirection: 'LR' | 'TB';
   onToggleLayoutDirection: () => void;
   onPodToggle: (podId: string) => void;
@@ -50,10 +60,15 @@ interface NetworkGraphProps {
   onFocusChange: (id: string | null) => void;
 }
 
-// Define nodeTypes outside component to prevent recreation
+// Define nodeTypes / edgeTypes outside component to prevent recreation
 const nodeTypes = {
   podNode: PodNode,
 } as const;
+const edgeTypes = {
+  contention: ContentionEdge,
+} as const;
+
+const NO_FINDINGS: ComputeFinding[] = [];
 
 // Noop toggle for external nodes (they don't expand)
 const noopToggle = () => {};
@@ -68,6 +83,9 @@ const NetworkGraphInner: React.FC<NetworkGraphProps> = ({
   onToggleDaemonSetNodes,
   showTraffic,
   onToggleTraffic,
+  showContention = true,
+  onToggleContention,
+  computeFindings = NO_FINDINGS,
   layoutDirection,
   onToggleLayoutDirection,
   onPodToggle,
@@ -224,12 +242,26 @@ const NetworkGraphInner: React.FC<NetworkGraphProps> = ({
     }
   }, [focusedNodeId, externalNodes, showDaemonSetNodes, onToggleDaemonSetNodes]);
 
+  // Contention edges (design D8): culprit → victim from the noisy-neighbour
+  // findings. Built against every external node (hidden DaemonSet peers
+  // included) so a culprit that already is a traffic peer reuses its node;
+  // edges to a node that is not drawn are dropped below.
+  const contention = useMemo(
+    () => buildContentionEdges(computeFindings, pods, externalNodes, allPodsLookup),
+    [computeFindings, pods, externalNodes, allPodsLookup],
+  );
+  const contentionCount = contention.edges.length;
+
   const allDisplayPods = useMemo(() => {
+    // A pod with an active contention edge stays on the map even when the
+    // traffic filter would hide it: an edge to nothing explains nothing.
+    const contentionIds = showContention ? new Set(contention.edges.flatMap((e) => [e.source, e.target])) : null;
     const visiblePods = showTraffic
-      ? pods.filter((pod) => pod.traffic && pod.traffic.length > 0)
+      ? pods.filter((pod) => (pod.traffic && pod.traffic.length > 0) || contentionIds?.has(pod.id))
       : pods;
-    return [...visiblePods, ...daemonSetPartition.visible];
-  }, [pods, daemonSetPartition, showTraffic]);
+    const culprits = showContention ? contention.externalCulprits : [];
+    return [...visiblePods, ...daemonSetPartition.visible, ...culprits];
+  }, [pods, daemonSetPartition, showTraffic, showContention, contention]);
 
   // Focus is only meaningful while the focused node exists in the current
   // node set. Switching namespace (or the pod being deleted) used to leave
@@ -431,17 +463,37 @@ const NetworkGraphInner: React.FC<NetworkGraphProps> = ({
     return edges;
   }, [pods, allDisplayPods, svcIpToLocalPodMap, showTraffic, wellKnownPorts, rowPeers, localPodByName]);
 
+  // Contention edges as React Flow edges: dashed, error-coloured, labelled
+  // with the blame share (components/ContentionEdge). Only between nodes
+  // that are actually drawn.
+  const contentionEdges: Edge[] = useMemo(() => {
+    if (!showContention || contention.edges.length === 0) return [];
+    const drawn = new Set(allDisplayPods.map((p) => p.id));
+    return contention.edges
+      .filter((e) => drawn.has(e.source) && drawn.has(e.target))
+      .map((e) => ({
+        id: e.id,
+        source: e.source,
+        target: e.target,
+        type: 'contention',
+        data: { blameShare: e.blameShare, finding: e.finding },
+        markerEnd: { type: MarkerType.ArrowClosed, color: EDGE_COLOR_CONTENTION },
+      }));
+  }, [showContention, contention, allDisplayPods]);
+
+  const allEdges: Edge[] = useMemo(() => [...initialEdges, ...contentionEdges], [initialEdges, contentionEdges]);
+
   // Focus filter: the focused node + everything one hop up/downstream. Applied
   // before ELK so the isolated subset gets its own clean layout.
   const focusNeighborhood = useMemo(() => {
     if (!focusedNodeId) return null;
     const ids = new Set<string>([focusedNodeId]);
-    for (const e of initialEdges) {
+    for (const e of allEdges) {
       if (e.source === focusedNodeId) ids.add(e.target);
       if (e.target === focusedNodeId) ids.add(e.source);
     }
     return ids;
-  }, [focusedNodeId, initialEdges]);
+  }, [focusedNodeId, allEdges]);
 
   const displayNodes: Node[] = useMemo(
     () => (focusNeighborhood ? baseNodes.filter((n) => focusNeighborhood.has(n.id)) : baseNodes),
@@ -449,9 +501,9 @@ const NetworkGraphInner: React.FC<NetworkGraphProps> = ({
   );
   const displayEdges: Edge[] = useMemo(
     () => (focusNeighborhood
-      ? initialEdges.filter((e) => focusNeighborhood.has(e.source) && focusNeighborhood.has(e.target))
-      : initialEdges),
-    [initialEdges, focusNeighborhood],
+      ? allEdges.filter((e) => focusNeighborhood.has(e.source) && focusNeighborhood.has(e.target))
+      : allEdges),
+    [allEdges, focusNeighborhood],
   );
 
   const focusedLabel = useMemo(
@@ -459,8 +511,25 @@ const NetworkGraphInner: React.FC<NetworkGraphProps> = ({
     [focusedNodeId, allDisplayPods],
   );
 
-  // Run ELK layout whenever nodes or edges change
+  // Run ELK layout whenever the LAYOUT inputs change: the node set, a card's
+  // height state (expanded / gauged) or the edge set. The compute poll
+  // rebuilds the node objects every 5 s with new gauge values; those must
+  // repaint the cards but must never re-run ELK (and the fitView that follows
+  // it, which would yank the viewport every 5 s).
+  const layoutSignature = useMemo(() => {
+    const nodes = displayNodes.map((n) => {
+      const d = n.data as PodNodeData;
+      return `${n.id}:${d.isExpanded ? 1 : 0}${hasComputeGauges(d.compute) ? 1 : 0}`;
+    });
+    const edges = displayEdges.map((e) => `${e.source}>${e.target}`);
+    return `${layoutDirection}|${nodes.join(',')}|${edges.join(',')}`;
+  }, [displayNodes, displayEdges, layoutDirection]);
+  const lastLayoutSignature = React.useRef<string | null>(null);
+
   useEffect(() => {
+    if (lastLayoutSignature.current === layoutSignature) return;
+    lastLayoutSignature.current = layoutSignature;
+
     if (displayNodes.length === 0) {
       // eslint-disable-next-line react-hooks/set-state-in-effect
       setElkPositions(new Map());
@@ -497,10 +566,11 @@ const NetworkGraphInner: React.FC<NetworkGraphProps> = ({
           layerOpts['elk.layered.layerConstraint'] = 'LAST';
           if (isInternet) layerOpts['elk.layered.priority.direction'] = '100';
         }
+        const data = node.data as PodNodeData;
         return {
           id: node.id,
           width: NODE_WIDTH,
-          height: NODE_HEIGHT,
+          height: nodeHeight({ isExpanded: !!data.isExpanded, hasCompute: hasComputeGauges(data.compute) }),
           ...(Object.keys(layerOpts).length > 0 ? { layoutOptions: layerOpts } : {}),
         };
       }),
@@ -548,17 +618,23 @@ const NetworkGraphInner: React.FC<NetworkGraphProps> = ({
       console.error('ELK layout error, using fallback grid:', err);
       const positions = new Map<string, { x: number; y: number }>();
       const cols = Math.ceil(Math.sqrt(displayNodes.length));
+      // Rows are as tall as the tallest card so an expanded, gauged card
+      // never overlaps the row beneath it.
+      const rowHeight = displayNodes.reduce((h, node) => {
+        const data = node.data as PodNodeData;
+        return Math.max(h, nodeHeight({ isExpanded: !!data.isExpanded, hasCompute: hasComputeGauges(data.compute) }));
+      }, 0);
       displayNodes.forEach((node, i) => {
         const col = i % cols;
         const row = Math.floor(i / cols);
         positions.set(node.id, {
           x: col * (NODE_WIDTH + 80),
-          y: row * (NODE_HEIGHT + 80),
+          y: row * (rowHeight + 80),
         });
       });
       setElkPositions(positions);
     });
-  }, [displayNodes, displayEdges, layoutDirection]);
+  }, [displayNodes, displayEdges, layoutDirection, layoutSignature]);
 
   // Merge ELK positions into nodes — hide nodes until ELK has run for the current set
   const positionedNodes: Node[] = useMemo(() => {
@@ -572,7 +648,7 @@ const NetworkGraphInner: React.FC<NetworkGraphProps> = ({
   }, [displayNodes, elkPositions]);
 
   const [nodes, setNodes, onNodesChange] = useNodesState(positionedNodes);
-  const [edges, setEdges, onEdgesChange] = useEdgesState(initialEdges);
+  const [edges, setEdges, onEdgesChange] = useEdgesState(displayEdges);
 
   // Force-replace nodes when ELK positions or data changes.
   // Using a function updater that ignores previous state ensures React Flow
@@ -645,6 +721,7 @@ const NetworkGraphInner: React.FC<NetworkGraphProps> = ({
         nodesConnectable={false}
         onPaneClick={onPaneClick}
         nodeTypes={nodeTypes}
+        edgeTypes={edgeTypes}
         fitView
         attributionPosition="bottom-right"
       >
@@ -703,6 +780,9 @@ const NetworkGraphInner: React.FC<NetworkGraphProps> = ({
                 <span className="flex items-center gap-1.5"><span className="w-3.5 h-0 border-t-2 border-dashed" style={{ borderColor: EDGE_COLOR_DAEMONSET }} />DaemonSet</span>
               )}
               <span className="flex items-center gap-1.5"><span className="w-3.5 h-[3px] rounded-full" style={{ background: '#EF4444' }} />Denied</span>
+              {showContention && contentionCount > 0 && (
+                <span className="flex items-center gap-1.5"><span className="w-3.5 h-0 border-t-2 border-dashed" style={{ borderColor: EDGE_COLOR_CONTENTION }} />Contention</span>
+              )}
             </div>
           </Panel>
         )}
@@ -718,6 +798,9 @@ const NetworkGraphInner: React.FC<NetworkGraphProps> = ({
             showDaemonSetNodes={showDaemonSetNodes}
             onToggleDaemonSetNodes={onToggleDaemonSetNodes}
             daemonSetCount={daemonSetCount}
+            showContention={showContention}
+            onToggleContention={onToggleContention}
+            contentionCount={contentionCount}
             layoutDirection={layoutDirection}
             onToggleLayoutDirection={onToggleLayoutDirection}
           />

@@ -1,6 +1,9 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useMemo } from 'react';
 import type { PodInfo, PodNodeData, ServiceInfo } from '../types';
 import { apiClient } from '../services/api';
+import { useComputeData } from './useComputeData';
+import { buildPodComputeData, containersForNode, nodeComputeState } from '../utils/compute';
+import type { ComputeFinding } from '../types/compute';
 
 async function withConcurrencyLimit<T>(tasks: (() => Promise<T>)[], limit: number): Promise<T[]> {
   const results: T[] = new Array(tasks.length);
@@ -19,7 +22,7 @@ async function withConcurrencyLimit<T>(tasks: (() => Promise<T>)[], limit: numbe
 }
 
 export const usePodData = (namespace: string) => {
-  const [pods, setPods] = useState<PodNodeData[]>([]);
+  const [basePods, setPods] = useState<PodNodeData[]>([]);
   const [allPodsLookup, setAllPodsLookup] = useState<PodInfo[]>([]);
   const [services, setServices] = useState<ServiceInfo[]>([]);
   const [loading, setLoading] = useState<boolean>(true);
@@ -116,8 +119,54 @@ export const usePodData = (namespace: string) => {
     fetchPodData();
   }, [fetchPodData]);
 
+  // Live compute gauges (design D8): the only polled data on the map. Merged
+  // here — not fetched with traffic — so the 5 s poll never re-fetches
+  // traffic or syscalls, and a pod without compute rows is left untouched.
+  const compute = useComputeData(namespace);
+  const pods = useMemo<PodNodeData[]>(() => {
+    if (!compute.enabled) return basePods;
+    const findingsByPodKey = new Map<string, ComputeFinding[]>();
+    for (const f of compute.findings) {
+      for (const key of [f.victim.pod_uid, `${f.victim.namespace}/${f.victim.pod_name}`]) {
+        const list = findingsByPodKey.get(key);
+        if (list) list.push(f);
+        else findingsByPodKey.set(key, [f]);
+      }
+    }
+    return basePods.map((pod) => {
+      const containers = containersForNode(pod, compute.containersByPodUid, compute.containersByPodName);
+      const members = pod.pods && pod.pods.length > 0 ? pod.pods : [pod.pod];
+      // Findings for any replica of the identity (by uid, else by name).
+      const seen = new Set<ComputeFinding>();
+      const findings: ComputeFinding[] = [];
+      for (const c of containers) {
+        for (const f of findingsByPodKey.get(c.pod_uid) ?? []) {
+          if (!seen.has(f)) { seen.add(f); findings.push(f); }
+        }
+      }
+      for (const m of members) {
+        for (const f of findingsByPodKey.get(`${m.pod_namespace ?? ''}/${m.pod_name}`) ?? []) {
+          if (!seen.has(f)) { seen.add(f); findings.push(f); }
+        }
+      }
+      // The pod's node state: from the container rows when we have them, else
+      // from the pod record's node so an unsupported/off node still explains itself.
+      const nodeName = containers[0]?.node ?? pod.pod.node_name;
+      const nodeState = nodeComputeState(compute.nodesByName.get(nodeName));
+      // One uid per identity drives the sparkline (replica sums are summed in
+      // podLevelSample per uid; a multi-replica identity shows the first).
+      const uid = containers[0]?.pod_uid;
+      const samples = uid ? compute.history.get(uid)?.values() ?? [] : [];
+      const data = buildPodComputeData({ containers, nodesByName: compute.nodesByName, findings, samples, nodeState });
+      return data ? { ...pod, compute: data } : pod;
+    });
+    // `history` is a fresh Map per poll over the in-place ring buffers, so it
+    // is the dependency that re-reads the sparklines.
+  }, [basePods, compute.enabled, compute.containersByPodUid, compute.containersByPodName, compute.nodesByName, compute.findings, compute.history]);
+
   return {
     pods,
+    compute,
     allPodsLookup,
     services,
     loading,

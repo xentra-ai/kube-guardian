@@ -2,6 +2,13 @@ import axios from 'axios';
 import type { AxiosInstance } from 'axios';
 import type { PodInfo, NetworkTraffic, SyscallInfo, ServiceInfo, AuditVerdict, ClusterEnvironment } from '../types';
 import { UNKNOWN_CLUSTER_ENVIRONMENT } from '../types';
+import type {
+  ComputeFinding,
+  ComputeHistoryRow,
+  ComputeLatestResponse,
+  ComputeNode,
+  ContentionPair,
+} from '../types/compute';
 
 class BrokerAPIClient {
   private client: AxiosInstance;
@@ -243,6 +250,80 @@ class BrokerAPIClient {
     } catch (error) {
       console.error('Error fetching namespaces:', error);
       return ['default'];
+    }
+  }
+
+  // ── Compute gauges / contention (docs/design/compute-contention-monitoring.md) ──
+  // Every method degrades to an empty result on failure, like the traffic
+  // getters above: a broker predating the feature 404s these and the map
+  // must render exactly as before.
+
+  /** Live per-container rows + node rows for the namespace (`GET /compute/latest`). */
+  async getComputeLatest(namespace: string): Promise<ComputeLatestResponse> {
+    try {
+      const response = await this.client.get<ComputeLatestResponse>('/compute/latest', { params: { namespace } });
+      const data = response.data;
+      return {
+        containers: Array.isArray(data?.containers) ? data.containers : [],
+        nodes: Array.isArray(data?.nodes) ? data.nodes : [],
+      };
+    } catch (error) {
+      console.error('Error fetching compute latest:', error);
+      return { containers: [], nodes: [] };
+    }
+  }
+
+  /** Minute / 5-minute history rows for a pod, oldest first (`GET /compute/history/{pod_uid}`). */
+  async getComputeHistory(podUid: string, minutes = 60): Promise<ComputeHistoryRow[]> {
+    try {
+      const response = await this.client.get<{ rows: ComputeHistoryRow[] }>(
+        `/compute/history/${encodeURIComponent(podUid)}`,
+        { params: { minutes } },
+      );
+      return Array.isArray(response.data?.rows) ? response.data.rows : [];
+    } catch (error) {
+      console.error('Error fetching compute history:', error);
+      return [];
+    }
+  }
+
+  /** Victim ↔ culprit pairs for a namespace or node (`GET /compute/contention`). */
+  async getComputeContention(opts: { namespace?: string; node?: string; minutes?: number }): Promise<ContentionPair[]> {
+    try {
+      const params: Record<string, string | number> = {};
+      if (opts.namespace) params.namespace = opts.namespace;
+      if (opts.node) params.node = opts.node;
+      if (opts.minutes) params.minutes = opts.minutes;
+      const response = await this.client.get<{ pairs: ContentionPair[] }>('/compute/contention', { params });
+      return Array.isArray(response.data?.pairs) ? response.data.pairs : [];
+    } catch (error) {
+      console.error('Error fetching compute contention:', error);
+      return [];
+    }
+  }
+
+  /** Broker-computed compute findings (`GET /compute/findings`); no filter = cluster. */
+  async getComputeFindings(opts: { namespace?: string; node?: string } = {}): Promise<ComputeFinding[]> {
+    try {
+      const params: Record<string, string> = {};
+      if (opts.namespace) params.namespace = opts.namespace;
+      if (opts.node) params.node = opts.node;
+      const response = await this.client.get<{ findings: ComputeFinding[] }>('/compute/findings', { params });
+      return Array.isArray(response.data?.findings) ? response.data.findings : [];
+    } catch (error) {
+      console.error('Error fetching compute findings:', error);
+      return [];
+    }
+  }
+
+  /** Every node's compute / contention support row (`GET /compute/nodes`). */
+  async getComputeNodes(): Promise<ComputeNode[]> {
+    try {
+      const response = await this.client.get<{ nodes: ComputeNode[] }>('/compute/nodes');
+      return Array.isArray(response.data?.nodes) ? response.data.nodes : [];
+    } catch (error) {
+      console.error('Error fetching compute nodes:', error);
+      return [];
     }
   }
 

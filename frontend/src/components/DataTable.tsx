@@ -1,7 +1,18 @@
 import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import type { NetworkTraffic, PodInfo, PodNodeData, ServiceInfo } from '../types';
-import { ArrowRight, Activity, ChevronDown, ChevronRight, Filter, MousePointerClick, Inbox } from 'lucide-react';
+import { ArrowRight, Activity, ChevronDown, ChevronRight, Filter, MousePointerClick, Inbox, Cpu } from 'lucide-react';
 import { EmptyState } from './ui/EmptyState';
+import {
+  COMPUTE_KIND_LABEL,
+  denominatorLabel,
+  formatBytes,
+  formatMicros,
+  formatMillicores,
+  formatPercent,
+  hasComputeGauges,
+  throttledRatio,
+} from '../utils/compute';
+import type { ComputeBlame, ComputeContainer } from '../types/compute';
 import { describeDrop, isDrop } from '../utils/dropCause';
 import { displaySyscallList } from '../utils/syscalls';
 import { UNATTRIBUTED_PEER_TOOLTIP, buildPeerIndex, isPlaceholderPod, resolvePeer } from '../utils/peerResolution';
@@ -40,6 +51,7 @@ const DataTable: React.FC<DataTableProps> = ({ selectedPod, allPodsLookup, servi
   const [expandedSyscalls, setExpandedSyscalls] = useState<Set<number>>(new Set());
   const [isTrafficExpanded, setIsTrafficExpanded] = useState(true);
   const [isSyscallsExpanded, setIsSyscallsExpanded] = useState(true);
+  const [isComputeExpanded, setIsComputeExpanded] = useState(true);
 
   // Helper function to render identity with pod name or service name
   const renderIdentity = (identity: TrafficIdentity, ip: string | null | undefined, port: string | null) => {
@@ -268,6 +280,21 @@ const DataTable: React.FC<DataTableProps> = ({ selectedPod, allPodsLookup, servi
     () => selectedPod?.label || selectedPod?.pod.pod_identity || selectedPod?.pod.pod_name || '',
     [selectedPod]
   );
+
+  // Compute section (design D8): per-container rows + the blame list, from
+  // the live rows usePodData merged onto the node. Only for gauged pods.
+  const compute = selectedPod?.compute;
+  const hasCompute = hasComputeGauges(compute);
+  const blameRows = useMemo(() => {
+    if (!compute) return [];
+    // One list across the pod's containers, largest wait first.
+    const rows: Array<ComputeBlame & { victim: string }> = [];
+    for (const c of compute.containers) {
+      for (const b of c.blame ?? []) rows.push({ ...b, victim: c.container });
+    }
+    return rows.sort((a, b) => b.wait_ns - a.wait_ns).slice(0, 10);
+  }, [compute]);
+  const totalWaitNs = useMemo(() => blameRows.reduce((sum, b) => sum + b.wait_ns, 0), [blameRows]);
 
   // Memoize filtered traffic to avoid recalculation on every render
   const filteredTraffic = useMemo(() => {
@@ -732,6 +759,142 @@ const DataTable: React.FC<DataTableProps> = ({ selectedPod, allPodsLookup, servi
           </div>
         )}
       </div>
+
+      {/* Compute Section */}
+      {hasCompute && compute && (
+        <div data-testid="compute-section">
+          <button
+            onClick={() => setIsComputeExpanded(!isComputeExpanded)}
+            className="w-full text-md font-semibold text-primary mb-3 flex items-center gap-2 hover:text-hubble-accent transition-colors"
+          >
+            {isComputeExpanded ? (
+              <ChevronDown className="w-4 h-4 text-hubble-accent" />
+            ) : (
+              <ChevronRight className="w-4 h-4 text-hubble-accent" />
+            )}
+            <Cpu className="w-4 h-4 text-hubble-accent" />
+            Compute ({compute.containers.length} container{compute.containers.length !== 1 ? 's' : ''})
+            {compute.findings.length > 0 && (
+              <span className="ml-1 rounded-full bg-hubble-error/15 text-hubble-error text-xs font-medium px-2 py-0.5 tabular-nums">
+                {compute.findings.length} finding{compute.findings.length !== 1 ? 's' : ''}
+              </span>
+            )}
+          </button>
+
+          {isComputeExpanded && (
+            <div className="space-y-3">
+              {compute.findings.length > 0 && (
+                <ul className="space-y-1">
+                  {compute.findings.map((f) => (
+                    <li
+                      key={`${f.kind}:${f.victim.container_uid}`}
+                      className={`rounded-surface border px-3 py-2 text-xs ${
+                        f.severity === 'critical'
+                          ? 'border-hubble-error/30 bg-hubble-error/10 text-hubble-error'
+                          : 'border-hubble-warning/30 bg-hubble-warning/10 text-hubble-warning'
+                      }`}
+                    >
+                      <span className="font-semibold">{COMPUTE_KIND_LABEL[f.kind] ?? f.kind}</span>
+                      <span className="text-secondary"> · {f.message}</span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+
+              <div className="bg-hubble-card rounded-surface border border-hubble-border overflow-hidden">
+                <div className="overflow-x-auto">
+                  <table className="w-full text-sm">
+                    <thead className="sticky top-0 z-10 bg-hubble-dark border-b border-hubble-border">
+                      <tr className="text-left text-xs font-medium text-tertiary uppercase tracking-wide">
+                        <th className="px-4 py-2">Container</th>
+                        <th className="px-4 py-2">CPU</th>
+                        <th className="px-4 py-2">CPU req / lim</th>
+                        <th className="px-4 py-2" title="Share of CFS periods spent throttled by the container's own limit (design D3)">Throttled</th>
+                        <th className="px-4 py-2" title="cpu.pressure some / full avg10">CPU PSI</th>
+                        <th className="px-4 py-2">Memory</th>
+                        <th className="px-4 py-2">Mem req / lim</th>
+                        <th className="px-4 py-2" title="memory.pressure some / full avg10">Mem PSI</th>
+                        <th className="px-4 py-2" title="Run-queue latency p99 over the sample (scheduler probe)">p99 wait</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {compute.containers.map((c: ComputeContainer) => {
+                        const ratio = throttledRatio(c);
+                        return (
+                          <tr key={c.container_uid} className="border-b border-hubble-border hover:bg-hubble-dark/50 transition-colors">
+                            <td className="px-4 py-2 font-mono text-xs text-primary">
+                              {c.container}
+                              {selectedPod.pods.length > 1 && <div className="text-tertiary">{c.pod_name}</div>}
+                            </td>
+                            <td className="px-4 py-2 font-mono text-xs tabular-nums text-secondary">{formatMillicores(c.cpu_usage_millis)}</td>
+                            <td className="px-4 py-2 font-mono text-xs tabular-nums text-tertiary">
+                              {formatMillicores(c.cpu_request_millis)} / {formatMillicores(c.cpu_limit_millis)}
+                            </td>
+                            <td className={`px-4 py-2 font-mono text-xs tabular-nums ${ratio !== null && ratio >= 0.25 ? 'text-hubble-warning' : 'text-secondary'}`}>
+                              {ratio === null ? '—' : formatPercent(ratio * 100)}
+                            </td>
+                            <td className={`px-4 py-2 font-mono text-xs tabular-nums ${c.cpu_psi_some10 >= 20 ? 'text-hubble-error' : 'text-secondary'}`}>
+                              {formatPercent(c.cpu_psi_some10, 1)} / {formatPercent(c.cpu_psi_full10, 1)}
+                            </td>
+                            <td className="px-4 py-2 font-mono text-xs tabular-nums text-secondary">{formatBytes(c.mem_working_set)}</td>
+                            <td className="px-4 py-2 font-mono text-xs tabular-nums text-tertiary">
+                              {formatBytes(c.mem_request)} / {formatBytes(c.mem_limit)}
+                            </td>
+                            <td className={`px-4 py-2 font-mono text-xs tabular-nums ${c.mem_psi_some10 >= 10 ? 'text-hubble-error' : 'text-secondary'}`}>
+                              {formatPercent(c.mem_psi_some10, 1)} / {formatPercent(c.mem_psi_full10, 1)}
+                            </td>
+                            <td className="px-4 py-2 font-mono text-xs tabular-nums text-secondary" title={c.runq_p99_us === null ? 'Scheduler probe not loaded on this node' : undefined}>
+                              {formatMicros(c.runq_p99_us)}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+                <div className="px-4 py-2 bg-hubble-dark border-t border-hubble-border text-xs text-tertiary">
+                  Pod gauge: {formatMillicores(compute.cpuMillis)} of {formatMillicores(compute.cpuCapacityMillis)} CPU {denominatorLabel(compute.cpuDenominator)} ·{' '}
+                  {formatBytes(compute.memBytes)} of {formatBytes(compute.memCapacityBytes)} memory {denominatorLabel(compute.memDenominator)}
+                </div>
+              </div>
+
+              {blameRows.length > 0 && (
+                <div className="bg-hubble-card rounded-surface border border-hubble-border overflow-hidden" data-testid="compute-blame">
+                  <div className="px-4 py-2 bg-hubble-dark border-b border-hubble-border text-xs font-medium text-tertiary uppercase tracking-wide">
+                    Blame — who was on the CPU while this pod waited
+                  </div>
+                  <table className="w-full text-sm">
+                    <thead className="border-b border-hubble-border">
+                      <tr className="text-left text-xs font-medium text-tertiary uppercase tracking-wide">
+                        <th className="px-4 py-2">Culprit</th>
+                        <th className="px-4 py-2">Kind</th>
+                        <th className="px-4 py-2">Victim</th>
+                        <th className="px-4 py-2">Share</th>
+                        <th className="px-4 py-2">Wait</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {blameRows.map((b) => (
+                        <tr key={`${b.victim}:${b.cgroup_id}`} className="border-b border-hubble-border">
+                          <td className="px-4 py-2 font-mono text-xs text-primary">{b.ref}</td>
+                          <td className="px-4 py-2">
+                            <span className={`px-2 py-0.5 rounded text-xs ${b.kind === 'pod' ? 'bg-hubble-error/15 text-hubble-error' : 'bg-hubble-border/30 text-secondary'}`}>{b.kind}</span>
+                          </td>
+                          <td className="px-4 py-2 font-mono text-xs text-secondary">{b.victim}</td>
+                          <td className="px-4 py-2 font-mono text-xs tabular-nums text-secondary">
+                            {totalWaitNs > 0 ? formatPercent((b.wait_ns / totalWaitNs) * 100) : '—'}
+                          </td>
+                          <td className="px-4 py-2 font-mono text-xs tabular-nums text-secondary">{formatMicros(b.wait_ns / 1000)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Syscalls Section */}
       {hasSyscalls && (
