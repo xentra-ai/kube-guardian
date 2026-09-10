@@ -1,0 +1,61 @@
+---
+title: "compute findings"
+description: "List compute findings — throttled, contended and noisy-neighbour pods — for a namespace, a node, or the cluster"
+icon: "gauge-high"
+---
+
+## Synopsis
+
+List the broker's current compute findings. Read-only: the command calls
+`GET /compute/findings` and prints the result; it generates nothing and
+applies nothing.
+
+```bash
+kubectl kguardian compute findings [flags]
+```
+
+## Flags
+
+| Flag | Type | Description | Default |
+|------|------|-------------|---------|
+| `-n, --namespace` | string | Only findings whose victim is in this namespace | all namespaces |
+| `--node` | string | Only findings whose victim runs on this node | all nodes |
+| `-o, --output` | string | `table` or `json` | `table` |
+
+Global flags (`--kubeconfig`, `--context`, `--broker-namespace`,
+`--broker-service`, `--debug`) are listed in the [CLI overview](/cli/overview).
+
+## Output
+
+The table has one row per finding:
+
+```
+SEVERITY  KIND            VICTIM                 CULPRIT                 SHARE  MESSAGE
+high      noisy-neighbor  payments/api-7c9d…/api  batch/etl-1-x/worker    71%    payments/api is starved for CPU by batch/etl-1-x (71% of its wait); etl-1-x is using 1.9 cores against a 0.5-core request.
+medium    cpu-throttled   payments/worker-5f…/w   -                       -      payments/worker is throttled 34% of the time by its own 500m limit.
+```
+
+`CULPRIT` and `SHARE` are `-` for the kinds that never name one
+(`cpu-throttled`, `cpu-contended`, `memory-limit-thrash`). A `system` or
+`kernel` culprit prints its `ref` (for example `system.slice/kubelet.service`).
+
+`-o json` prints the broker's `{ "findings": [...] }` response unchanged;
+the schema is in the [compute reference](/reference/compute#finding).
+
+## Examples
+
+```bash
+# Everything in one namespace
+kubectl kguardian compute findings -n payments
+
+# One node, cluster-wide, as JSON for scripting
+kubectl kguardian compute findings --node worker-3 -o json
+
+# Only noisy neighbours
+kubectl kguardian compute findings -o json | jq '.findings[] | select(.kind == "noisy-neighbor")'
+```
+
+---
+
+See [Compute Contention](/concepts/compute-contention) for what each kind
+means and why a throttled pod is never blamed on a neighbour.

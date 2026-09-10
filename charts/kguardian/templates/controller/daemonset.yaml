@@ -87,10 +87,32 @@ spec:
             value: "{{ . }}"
           {{- end }}
           {{- end }}
+          {{- $compute := .Values.compute | default dict }}
+          {{- if $compute.enabled }}
+          # Compute gauges + noisy-neighbour detection (values.yaml `compute`).
+          # The cgroup sampler is the master switch; the scheduler probe is a
+          # second switch beneath it and is off by default until measured.
+          - name: COMPUTE_ENABLED
+            value: "true"
+          - name: COMPUTE_SAMPLE_INTERVAL_SECS
+            value: {{ $compute.sampleInterval | default 5 | quote }}
+          - name: COMPUTE_CONTENTION_ENABLED
+            value: {{ (($compute.contention | default dict).enabled | default false) | quote }}
+          - name: COMPUTE_MIN_RUNQ_LATENCY_US
+            value: {{ (($compute.contention | default dict).minRunqLatencyUs | default 100) | quote }}
+          {{- else }}
+          - name: COMPUTE_ENABLED
+            value: "false"
+          {{- end }}
           volumeMounts:
           {{- if .Values.seccomp.distribute }}
           - name: seccomp-profiles
             mountPath: {{ .Values.seccomp.kubeletRoot }}/seccomp
+          {{- end }}
+          {{- if $compute.enabled }}
+          - name: cgroupfs
+            mountPath: /sys/fs/cgroup
+            readOnly: true
           {{- end }}
           - mountPath: /sys/kernel/debug
             name: debugfs
@@ -155,6 +177,15 @@ spec:
         hostPath:
           path: {{ .Values.seccomp.kubeletRoot }}/seccomp
           type: DirectoryOrCreate
+      {{- end }}
+      {{- if (.Values.compute | default dict).enabled }}
+      # cgroup v2 root, read-only: the compute sampler reads cpu.stat,
+      # cpu.pressure, memory.* per container and /sys/fs/cgroup/cgroup.controllers
+      # for the node facts. Nothing is ever written here.
+      - name: cgroupfs
+        hostPath:
+          path: /sys/fs/cgroup
+          type: Directory
       {{- end }}
       nodeSelector:
         {{- if .Values.controller.nodeSelector }}

@@ -270,6 +270,87 @@ seccomp:
   # itself reacts to changes immediately). Empty uses the controller default (30).
   distributeIntervalSeconds: ""
 
+# -- Live compute gauges and noisy-neighbour detection. Three layers, each
+# gating the next: **usage** (CPU / memory per container against its limit,
+# request or the node), **stall** (cgroup v2 PSI, CFS throttle counters,
+# memory reclaim events) and **blame** (an eBPF scheduler probe that records,
+# in kernel, who was on the CPU while a tracked pod waited). The first two are
+# a file walk over `/sys/fs/cgroup` with no BPF; only the third loads a probe.
+# Findings (`noisy-neighbor`, `cpu-throttled`, `cpu-contended`,
+# `memory-pressure`, `memory-limit-thrash`) are computed in the broker so the
+# UI, the CLI and the assistant agree. Needs cgroup v2 and PSI on the node;
+# a node without them reports itself unsupported and renders without gauges.
+# A pod opts out with the annotation `kguardian.dev/compute: "off"`. See
+# docs/concepts/compute-contention.
+compute:
+  # -- Master switch. Mounts `/sys/fs/cgroup` read-only into the controller
+  # and starts the sampler, which reads ~10 small files per container every
+  # `sampleInterval`. On by default: the gauge and stall layers cost about
+  # one file walk per interval and the feature is most useful when every pod
+  # already has history the first time someone looks. `false` removes the
+  # mount, the sampler and every `COMPUTE_*` setting below.
+  enabled: true
+  # -- Seconds between cgroup samples. Drives the live gauges and the
+  # `pod_compute_latest` upsert; the controller folds twelve samples into one
+  # minute row for history regardless of this value.
+  sampleInterval: 5
+  contention:
+    # -- Load the `sched_contention` eBPF probe (`sched_wakeup`,
+    # `sched_wakeup_new`, `sched_switch`, `sched_process_exit`) so the broker
+    # can name the pod, system unit or kernel thread a stalled pod waited
+    # behind. Requires `compute.enabled`. Off by default until its per-node
+    # overhead is measured against the roadmap's controller-overhead line
+    # (design doc, Phase 4); without it kguardian still raises the
+    # self-inflicted findings (`cpu-throttled`, `memory-limit-thrash`) but
+    # never a `noisy-neighbor`. The probe attaches via `tp_btf` and falls
+    # back to `raw_tp`; if neither attaches the node reports
+    # `contention_loaded=false` and keeps its gauges.
+    enabled: false
+    # -- In-kernel filter: a run-queue wait shorter than this many
+    # microseconds is dropped before any map write. Lower values record more
+    # noise at higher probe cost; raise it on nodes with very high
+    # context-switch rates.
+    minRunqLatencyUs: 100
+  # -- Finding thresholds, evaluated by the broker over the last five minutes
+  # of history. Rendered into `COMPUTE_THRESHOLD_*` on the broker.
+  thresholds:
+    # -- A victim counts as stalled when its cgroup `cpu.pressure some avg10`
+    # is at or above this percentage for two consecutive minutes (or its
+    # run-queue p99 crosses `runqP99Ms`).
+    stallSome: 20
+    # -- Run-queue latency p99, in milliseconds, at or above which a victim
+    # counts as stalled. Only meaningful with `contention.enabled`.
+    runqP99Ms: 20
+    # -- `cpu-throttled` fires when a container's CFS throttled time divided by
+    # its quota time over the window is at or above this ratio. Remediation
+    # is the container's own `limits.cpu`; no neighbour is named.
+    throttledRatio: 0.25
+    # -- Hard gate: a container throttled above this ratio is never reported
+    # as a `noisy-neighbor` victim, whatever the scheduler probe says, because
+    # its own quota explains the wait.
+    throttledRatioMax: 0.10
+    # -- Share of a victim's total wait time a single cgroup must account for
+    # before it is named as the culprit. The culprit must also be using CPU
+    # above its own request (or have none) — a pod inside its request is
+    # entitled to that CPU.
+    blameShare: 0.40
+    # -- `memory-pressure` fires when a container's `memory.pressure some
+    # avg10` is at or above this percentage while the node itself is under
+    # memory pressure. Memory blame is a heuristic and is labelled as one.
+    memStallSome: 10
+  history:
+    # -- Days of per-pod compute and contention history the broker keeps.
+    # Minute rows are downsampled to 5-minute rows after
+    # `minuteResolutionHours`, so 7 days at 3 000 containers stays under
+    # ~10 M rows. `0` disables history inserts and pruning; the live gauges
+    # (`pod_compute_latest`) still work. Rendered into
+    # `COMPUTE_HISTORY_RETENTION_DAYS`.
+    retentionDays: 7
+    # -- Hours of history kept at one-minute resolution before the broker's
+    # retention pass folds it into 5-minute rows. Rendered into
+    # `COMPUTE_HISTORY_MINUTE_HOURS`.
+    minuteResolutionHours: 24
+
 broker:
   # -- Number of broker replicas to deploy
   replicaCount: 1

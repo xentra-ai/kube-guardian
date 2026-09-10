@@ -44,6 +44,9 @@ port-forwards to the broker and needs to find it.
   <Card title="audit promote-cluster" icon="globe" href="/concepts/audit-network-policy#cluster-scoped--kguardian-audit-promote-cluster">
     Convert an AuditClusterNetworkPolicy into one NetworkPolicy per matched namespace (discovery from `namespaceSelector`).
   </Card>
+  <Card title="compute findings" icon="gauge-high" href="/cli/compute-findings">
+    List throttled, contended and noisy-neighbour pods with the evidence behind each finding. Read-only.
+  </Card>
   <Card title="version" icon="tag">
     Print client version information. Also available as `-v` / `--version` on the root command.
   </Card>
@@ -60,4 +63,7 @@ kubectl kguardian gen seccomp --all -n staging
 
 # Generate Cilium policies cluster-wide
 kubectl kguardian gen netpol -A --type cilium
+
+# Which pods are starved for CPU, and by whom
+kubectl kguardian compute findings -n production
 ```

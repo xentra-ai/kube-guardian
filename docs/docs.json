@@ -31,6 +31,7 @@
               "concepts/peer-attribution",
               "concepts/audit-network-policy",
               "concepts/seccomp-profiles",
+              "concepts/compute-contention",
               "concepts/policy-as-code"
             ]
           },
@@ -39,7 +40,8 @@
             "pages": [
               "guides/generating-network-policies",
               "guides/mcp-endpoint",
-              "guides/distributing-seccomp-profiles"
+              "guides/distributing-seccomp-profiles",
+              "guides/compute-gauges"
             ]
           },
           {
@@ -59,13 +61,20 @@
             "pages": [
               "cli/overview",
               "cli/gen-networkpolicy",
-              "cli/gen-seccomp"
+              "cli/gen-seccomp",
+              "cli/compute-findings"
             ]
           },
           {
             "group": "CRD Reference",
             "pages": [
               "reference/crds/seccompprofile"
+            ]
+          },
+          {
+            "group": "Configuration Reference",
+            "pages": [
+              "reference/compute"
             ]
           },
           {
