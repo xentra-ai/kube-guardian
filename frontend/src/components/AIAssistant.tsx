@@ -4,6 +4,7 @@ import remarkGfm from 'remark-gfm';
 import { X, Send, ArrowRight, Minimize2, Maximize2, ChevronRight, ChevronLeft, Copy, Check } from 'lucide-react';
 import { streamChatMessage, type HistoryMessage } from '../services/aiApi';
 import { UI_DIMENSIONS } from '../constants/ui';
+import { initialViewMode, storeViewMode, type AssistantViewMode } from '../utils/assistantViewMode';
 import { Button } from './ui/Button';
 import { Modal } from './ui/Modal';
 
@@ -221,13 +222,13 @@ interface AIAssistantProps {
   podNames?: string[];
 }
 
-type ViewMode = 'modal' | 'side-panel';
+type ViewMode = AssistantViewMode;
 
 const AIAssistant: React.FC<AIAssistantProps> = ({ isOpen, onClose, onLayoutChange, namespace, podNames }) => {
   const [messages, setMessages] = useState<Message[]>([]);
   const [inputValue, setInputValue] = useState('');
   const [isTyping, setIsTyping] = useState(false);
-  const [viewMode, setViewMode] = useState<ViewMode>('modal');
+  const [viewMode, setViewMode] = useState<ViewMode>(initialViewMode);
   const [isCollapsed, setIsCollapsed] = useState(false);
   const [panelWidth, setPanelWidth] = useState<number>(UI_DIMENSIONS.AI_PANEL_DEFAULT_WIDTH);
   const [isResizing, setIsResizing] = useState(false);
@@ -372,7 +373,9 @@ const AIAssistant: React.FC<AIAssistantProps> = ({ isOpen, onClose, onLayoutChan
   };
 
   const toggleViewMode = () => {
-    setViewMode(prev => prev === 'modal' ? 'side-panel' : 'modal');
+    const next: ViewMode = viewMode === 'modal' ? 'side-panel' : 'modal';
+    storeViewMode(next);
+    setViewMode(next);
     // Reset collapse state when switching to modal
     if (viewMode === 'side-panel') {
       setIsCollapsed(false);
