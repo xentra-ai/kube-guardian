@@ -20,8 +20,8 @@ pub use add::{
 pub use audit::AuditClient;
 pub use compute::{compute_findings, ComputeThresholds};
 pub use compute_api::{
-    add_compute_batch, add_compute_history_batch, get_compute_contention, get_compute_findings,
-    get_compute_history, get_compute_latest, get_compute_nodes,
+    add_compute_batch, add_compute_history_batch, compute_ingest_scope, get_compute_contention,
+    get_compute_findings, get_compute_history, get_compute_latest, get_compute_nodes,
 };
 pub use compute_types::*;
 pub use error::*;

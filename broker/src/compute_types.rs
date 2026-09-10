@@ -20,6 +20,34 @@ use chrono::{DateTime, NaiveDateTime, Utc};
 use diesel::prelude::*;
 use serde::{Deserialize, Serialize};
 
+/// Serde codec for every timestamp this feature puts on the wire.
+///
+/// Storage stays `TIMESTAMP` (naive, UTC by convention, like every other
+/// broker table) and the row structs stay `NaiveDateTime`; only the JSON
+/// form changes. Serialised as RFC 3339 UTC with a trailing `Z`
+/// (`2026-09-10T02:41:05Z`) so a browser or Go client parses it as an
+/// instant instead of local wall time — the naive form
+/// (`2026-09-10T02:41:05`) is read as local time by `new Date()`.
+/// Deserialisation accepts both, so a stored/echoed row round-trips.
+pub mod utc_ts {
+    use chrono::{DateTime, NaiveDateTime, SecondsFormat};
+    use serde::{self, Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(t: &NaiveDateTime, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&t.and_utc().to_rfc3339_opts(SecondsFormat::Secs, true))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<NaiveDateTime, D::Error> {
+        let raw = String::deserialize(d)?;
+        if let Ok(dt) = DateTime::parse_from_rfc3339(&raw) {
+            return Ok(dt.naive_utc());
+        }
+        NaiveDateTime::parse_from_str(&raw, "%Y-%m-%dT%H:%M:%S%.f")
+            .or_else(|_| NaiveDateTime::parse_from_str(&raw, "%Y-%m-%dT%H:%M:%S"))
+            .map_err(serde::de::Error::custom)
+    }
+}
+
 // ---------------------------------------------------------------------
 // Ingest: POST /pod/compute/batch
 // ---------------------------------------------------------------------
@@ -361,6 +389,7 @@ pub struct PodComputeLatest {
     pub container: String,
     pub node: String,
     pub cgroup_id: i64,
+    #[serde(with = "utc_ts")]
     pub ts: NaiveDateTime,
     pub interval_ms: i32,
     pub cpu_usage_millis: f64,
@@ -392,6 +421,7 @@ pub struct PodComputeLatest {
     pub runq_overflow: Option<i64>,
     /// The wire `blame` array, verbatim.
     pub blame: serde_json::Value,
+    #[serde(with = "utc_ts")]
     pub updated_at: NaiveDateTime,
 }
 
@@ -458,6 +488,7 @@ impl PodComputeLatest {
 #[diesel(primary_key(node))]
 pub struct NodeComputeLatest {
     pub node: String,
+    #[serde(with = "utc_ts")]
     pub ts: NaiveDateTime,
     pub interval_ms: i32,
     pub ctxt_per_sec: f64,
@@ -474,6 +505,7 @@ pub struct NodeComputeLatest {
     pub bpf_runq_hist: i64,
     pub bpf_pair: i64,
     pub unknown_blame_share: f64,
+    #[serde(with = "utc_ts")]
     pub updated_at: NaiveDateTime,
 }
 
@@ -505,7 +537,9 @@ impl NodeComputeLatest {
 /// A stored history row (minute or five-minute). Positional — matches
 /// `schema::pod_compute_history`. This is also what the findings engine
 /// consumes, so tests build these directly.
-#[derive(Debug, Clone, Serialize, Deserialize, Queryable, Identifiable, PartialEq)]
+#[derive(
+    Debug, Clone, Serialize, Deserialize, Queryable, QueryableByName, Identifiable, PartialEq,
+)]
 #[diesel(table_name = crate::schema::pod_compute_history)]
 pub struct PodComputeHistoryRow {
     pub id: i64,
@@ -515,6 +549,7 @@ pub struct PodComputeHistoryRow {
     pub pod_name: String,
     pub container: String,
     pub node: String,
+    #[serde(with = "utc_ts")]
     pub ts: NaiveDateTime,
     pub resolution_secs: i32,
     pub cpu_usage_millis_avg: f64,
@@ -682,6 +717,7 @@ impl NewPodComputeHistory {
 #[diesel(table_name = crate::schema::pod_contention_history)]
 pub struct PodContentionRow {
     pub id: i64,
+    #[serde(with = "utc_ts")]
     pub ts: NaiveDateTime,
     pub node: String,
     pub victim_container_uid: String,
@@ -771,6 +807,9 @@ pub struct FindingVictim {
 /// unknown-dominated blame list produces no culprit at all. The pod
 /// identity fields are `null` for non-pod culprits, and `blame_share` is
 /// the culprit's fraction of the victim's total wait over the window.
+/// `cpu_usage_millis` is `null` when no usage is known: a `system` /
+/// `kernel` cgroup, or a pod opted out of sampling
+/// (`kguardian.dev/compute: "off"`) that is still named as a culprit.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FindingCulprit {
     pub kind: String,
@@ -781,7 +820,7 @@ pub struct FindingCulprit {
     pub pod_name: Option<String>,
     pub container_uid: Option<String>,
     pub blame_share: f64,
-    pub cpu_usage_millis: f64,
+    pub cpu_usage_millis: Option<f64>,
     pub cpu_request_millis: Option<i64>,
 }
 
@@ -808,7 +847,9 @@ pub struct Finding {
     pub victim: FindingVictim,
     pub culprit: Option<FindingCulprit>,
     pub evidence: FindingEvidence,
+    #[serde(with = "utc_ts")]
     pub first_seen: NaiveDateTime,
+    #[serde(with = "utc_ts")]
     pub last_seen: NaiveDateTime,
     pub message: String,
 }
@@ -867,6 +908,110 @@ mod tests {
         let node = NodeComputeLatest::from_batch(&batch, now);
         assert_eq!(node.cpu_cores, 32);
         assert!(!node.contention_loaded);
+    }
+
+    #[test]
+    fn row_timestamps_serialise_as_rfc3339_utc() {
+        let batch: ComputeBatch = serde_json::from_str(SAMPLE).unwrap();
+        let now =
+            NaiveDateTime::parse_from_str("2026-09-10T02:41:07", "%Y-%m-%dT%H:%M:%S").unwrap();
+        let latest = PodComputeLatest::from_sample(&batch, &batch.containers[0], now);
+        let v = serde_json::to_value(&latest).unwrap();
+        assert_eq!(v["ts"], "2026-09-10T02:41:05Z");
+        assert_eq!(v["updated_at"], "2026-09-10T02:41:07Z");
+        let node = NodeComputeLatest::from_batch(&batch, now);
+        let v = serde_json::to_value(&node).unwrap();
+        assert_eq!(v["ts"], "2026-09-10T02:41:05Z");
+        assert_eq!(v["updated_at"], "2026-09-10T02:41:07Z");
+        let pair = PodContentionRow {
+            id: 1,
+            ts: now,
+            node: "n".into(),
+            victim_container_uid: "v/c".into(),
+            victim_pod_uid: "v".into(),
+            victim_namespace: "ns".into(),
+            culprit_cgroup_id: 1,
+            culprit_kind: "pod".into(),
+            culprit_ref: "a/b/c".into(),
+            culprit_container_uid: None,
+            count: 1,
+            wait_ns: 1,
+        };
+        let v = serde_json::to_value(&pair).unwrap();
+        assert_eq!(v["ts"], "2026-09-10T02:41:07Z");
+        // Round trip: the Z form and the legacy naive form both parse.
+        let back: PodContentionRow = serde_json::from_value(v).unwrap();
+        assert_eq!(back.ts, now);
+        let mut legacy = serde_json::to_value(&pair).unwrap();
+        legacy["ts"] = serde_json::Value::String("2026-09-10T02:41:07".into());
+        let back: PodContentionRow = serde_json::from_value(legacy).unwrap();
+        assert_eq!(back.ts, now);
+    }
+
+    #[test]
+    fn history_row_timestamp_serialises_as_rfc3339_utc() {
+        let json = r#"{
+          "node": "worker-3", "ts": "2026-09-10T02:41:00Z", "interval_ms": 60000,
+          "containers": [{
+            "container_uid": "abc/api", "pod_uid": "abc", "pod_name": "api", "namespace": "payments",
+            "container": "api", "cpu": {}, "memory": {}
+          }]
+        }"#;
+        let batch: ComputeHistoryBatch = serde_json::from_str(json).unwrap();
+        let new = NewPodComputeHistory::from_history(&batch, &batch.containers[0]);
+        // Materialise a stored row from the insertable half to check the
+        // read-side codec (the insertable never serialises).
+        let row = PodComputeHistoryRow {
+            id: 7,
+            container_uid: new.container_uid.clone(),
+            pod_uid: new.pod_uid.clone(),
+            namespace: new.namespace.clone(),
+            pod_name: new.pod_name.clone(),
+            container: new.container.clone(),
+            node: new.node.clone(),
+            ts: new.ts,
+            resolution_secs: new.resolution_secs,
+            cpu_usage_millis_avg: 0.0,
+            cpu_usage_millis_max: 0.0,
+            cpu_usage_millis_last: 0.0,
+            cpu_quota_usec: None,
+            cpu_period_usec: 100_000,
+            cpu_request_millis: None,
+            cpu_limit_millis: None,
+            cpu_nr_periods: 0,
+            cpu_nr_throttled: 0,
+            cpu_throttled_usec: 0,
+            cpu_psi_some10_avg: 0.0,
+            cpu_psi_some10_max: 0.0,
+            cpu_psi_full10_avg: 0.0,
+            cpu_psi_full10_max: 0.0,
+            mem_current_avg: 0,
+            mem_current_max: 0,
+            mem_current_last: 0,
+            mem_working_set_avg: 0,
+            mem_working_set_max: 0,
+            mem_working_set_last: 0,
+            mem_limit: None,
+            mem_request: None,
+            mem_psi_some10_avg: 0.0,
+            mem_psi_some10_max: 0.0,
+            mem_psi_full10_avg: 0.0,
+            mem_psi_full10_max: 0.0,
+            mem_events_high: 0,
+            mem_events_max: 0,
+            mem_oom_kill: 0,
+            mem_refault: 0,
+            mem_pgmajfault: 0,
+            runq_count: None,
+            runq_p50_us: None,
+            runq_p95_us: None,
+            runq_p99_us: None,
+            runq_max_us: None,
+            runq_overflow: None,
+            runq_hist: None,
+        };
+        let v = serde_json::to_value(&row).unwrap();
+        assert_eq!(v["ts"], "2026-09-10T02:41:00Z");
     }
 
     #[test]
@@ -957,7 +1102,7 @@ mod tests {
                 pod_name: Some("etl".into()),
                 container_uid: Some("c/worker".into()),
                 blame_share: 0.71,
-                cpu_usage_millis: 1900.0,
+                cpu_usage_millis: Some(1900.0),
                 cpu_request_millis: Some(500),
             }),
             evidence: FindingEvidence {
@@ -976,6 +1121,12 @@ mod tests {
             message: "m".into(),
         };
         let v = serde_json::to_value(&f).unwrap();
+        assert_eq!(
+            v["first_seen"], "1970-01-01T00:00:00Z",
+            "RFC 3339 UTC with Z"
+        );
+        assert_eq!(v["last_seen"], "1970-01-01T00:00:00Z");
+        assert_eq!(v["culprit"]["cpu_usage_millis"], 1900.0);
         assert_eq!(v["kind"], "noisy-neighbor");
         assert_eq!(v["severity"], "high");
         assert_eq!(v["culprit"]["ref"], "batch/etl/worker");

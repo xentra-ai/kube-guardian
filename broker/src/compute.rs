@@ -22,7 +22,7 @@
 //!   `unknown`-dominated blame list names nobody.
 //! - **`cpu-contended`**: (1) and (2) hold but no C passes (3).
 //! - **`memory-pressure`**: victim memory PSI some >= `mem_stall_some`
-//!   or refaults rising (sustained) WHILE the node's memory PSI some >=
+//!   or refaulting at >= `refault_per_min` (sustained) WHILE the node's memory PSI some >=
 //!   [`NODE_MEM_SOME_PCT`]. Culprit (heuristic, labelled as such in the
 //!   message): the container on the node with the largest
 //!   `current - request` that also grew over the window and holds >=
@@ -85,6 +85,11 @@ pub struct ComputeThresholds {
     pub blame_share: f64,
     /// memory PSI some avg10, percent.
     pub mem_stall_some: f64,
+    /// Workingset refaults per minute at or above which a container
+    /// counts as thrashing. Any file-backed workload refaults a few
+    /// pages a minute; `> 0` would flag every such container on a node
+    /// under pressure.
+    pub refault_per_min: f64,
 }
 
 impl Default for ComputeThresholds {
@@ -96,6 +101,7 @@ impl Default for ComputeThresholds {
             throttled_ratio_max: 0.10,
             blame_share: 0.40,
             mem_stall_some: 10.0,
+            refault_per_min: 1000.0,
         }
     }
 }
@@ -117,6 +123,7 @@ impl ComputeThresholds {
             ),
             blame_share: env_f64("COMPUTE_THRESHOLD_BLAME_SHARE", d.blame_share),
             mem_stall_some: env_f64("COMPUTE_THRESHOLD_MEM_STALL_SOME", d.mem_stall_some),
+            refault_per_min: env_f64("COMPUTE_THRESHOLD_REFAULT_PER_MIN", d.refault_per_min),
         }
     }
 }
@@ -231,6 +238,12 @@ fn throttled_ratio(rows: &[&PodComputeHistoryRow]) -> f64 {
     }
 }
 
+/// Refaults per minute for one row, whatever its resolution.
+fn refault_rate_per_min(r: &PodComputeHistoryRow) -> f64 {
+    let minutes = (f64::from(r.resolution_secs.max(1)) / 60.0).max(1.0 / 60.0);
+    r.mem_refault as f64 / minutes
+}
+
 fn victim_of(rows: &[&PodComputeHistoryRow]) -> FindingVictim {
     let r = rows[rows.len() - 1];
     FindingVictim {
@@ -278,6 +291,16 @@ fn mib(bytes: i64) -> String {
     format!("{}", bytes / (1024 * 1024))
 }
 
+/// `(namespace, pod)` from a `ns/pod/container` culprit ref; both `None`
+/// for any other shape.
+fn ns_pod(reference: &str) -> (Option<String>, Option<String>) {
+    let mut parts = reference.split('/');
+    match (parts.next(), parts.next()) {
+        (Some(ns), Some(pod)) => (Some(ns.to_string()), Some(pod.to_string())),
+        _ => (None, None),
+    }
+}
+
 /// `ns/pod` for a message, from a culprit ref of the `ns/pod/container`
 /// or `pod:<uid8>` shape.
 fn pod_label(reference: &str) -> String {
@@ -309,10 +332,17 @@ fn cpu_finding(
     let victim = victim_of(rows);
     let ratio = throttled_ratio(rows);
     let psi_span = sustained(rows, |r| r.cpu_psi_some10_avg >= t.stall_some);
+    // A wait that lands in the histogram's overflow bucket (>= 2^23 µs,
+    // ~8.4 s) has no finite quantile: the controller reports p99 and
+    // max_us from the finite buckets only, so a victim whose waits are
+    // ALL that long would show p99 = max = 0. Any overflow is a stall,
+    // and a critical one.
     let runq_span = sustained(rows, |r| {
         r.runq_p99_us
             .is_some_and(|p| p as f64 >= t.runq_p99_ms * 1000.0)
+            || r.runq_overflow.is_some_and(|o| o > 0)
     });
+    let overflowed = rows.iter().any(|r| r.runq_overflow.is_some_and(|o| o > 0));
     let stalled = psi_span.is_some() || runq_span.is_some();
     let evidence = evidence_of(rows, 0.0);
 
@@ -354,6 +384,7 @@ fn cpu_finding(
     let first_seen = [psi_span, runq_span].iter().flatten().map(|s| s.0).min()?;
     let last_seen = [psi_span, runq_span].iter().flatten().map(|s| s.1).max()?;
     let severity = if evidence.cpu_psi_full10_max >= CRITICAL_CPU_FULL_PCT
+        || overflowed
         || evidence
             .runq_p99_us_max
             .is_some_and(|p| p >= CRITICAL_RUNQ_P99_US)
@@ -441,10 +472,18 @@ fn cpu_finding(
     let (culprit, message) = match top.kind {
         "pod" => {
             // D6 condition 3, second half: a pod inside its request is
-            // entitled to that CPU. Needs the culprit's own rows; an
-            // untracked pod (`pod:<uid8>`, excluded namespace or not
-            // yet registered) cannot be checked, so it is not named.
-            let Some(crows) = top.container_uid.and_then(|u| all.get(u)) else {
+            // entitled to that CPU. Needs the culprit's own rows.
+            //
+            // Two ways to have none, treated differently (D9):
+            // - no `container_uid` at all: an untracked cgroup the
+            //   controller could only name as `pod:<uid8>` (excluded
+            //   namespace, not yet registered). Nothing is known about
+            //   it, so it is not named — `cpu-contended` says why.
+            // - a `container_uid` but no rows in the window: the pod is
+            //   opted out of sampling (`kguardian.dev/compute: "off"`).
+            //   Opt-out is explicitly NOT a shield against being named
+            //   as a culprit, so it stays eligible with usage unknown.
+            let Some(cuid) = top.container_uid else {
                 return Some(contended(format!(
                     "{who} is starved for CPU on node {}; {} tops its wait ({}) but is not \
                      tracked, so its usage against its request cannot be checked.",
@@ -452,6 +491,36 @@ fn cpu_finding(
                     pod_label(top.reference),
                     pct(share)
                 )));
+            };
+            let Some(crows) = all.get(cuid) else {
+                let (ns, pod) = ns_pod(top.reference);
+                let label = pod_label(top.reference);
+                let message = format!(
+                    "{who} is starved for CPU by {label} ({} of its wait); {label} is opted out of \
+                     compute sampling, so its usage was not checked.",
+                    pct(share)
+                );
+                let culprit = FindingCulprit {
+                    kind: "pod".to_string(),
+                    reference: top.reference.to_string(),
+                    pod_uid: cuid.split('/').next().map(String::from),
+                    namespace: ns,
+                    pod_name: pod,
+                    container_uid: Some(cuid.to_string()),
+                    blame_share: share,
+                    cpu_usage_millis: None,
+                    cpu_request_millis: None,
+                };
+                return Some(Finding {
+                    kind: FindingKind::NoisyNeighbor,
+                    severity,
+                    victim,
+                    culprit: Some(culprit),
+                    evidence,
+                    first_seen,
+                    last_seen,
+                    message,
+                });
             };
             let usage =
                 crows.iter().map(|r| r.cpu_usage_millis_avg).sum::<f64>() / crows.len() as f64;
@@ -491,7 +560,7 @@ fn cpu_finding(
                     pod_name: Some(last.pod_name.clone()),
                     container_uid: Some(last.container_uid.clone()),
                     blame_share: share,
-                    cpu_usage_millis: usage,
+                    cpu_usage_millis: Some(usage),
                     cpu_request_millis: request,
                 },
                 message,
@@ -506,7 +575,7 @@ fn cpu_finding(
                 pod_name: None,
                 container_uid: None,
                 blame_share: share,
-                cpu_usage_millis: 0.0,
+                cpu_usage_millis: None,
                 cpu_request_millis: None,
             },
             format!(
@@ -548,7 +617,7 @@ fn memory_finding(
 ) -> Option<Finding> {
     let victim = victim_of(rows);
     let psi_span = sustained(rows, |r| r.mem_psi_some10_avg >= t.mem_stall_some);
-    let refault_span = sustained(rows, |r| r.mem_refault > 0);
+    let refault_span = sustained(rows, |r| refault_rate_per_min(r) >= t.refault_per_min);
     let stalled = psi_span.is_some() || refault_span.is_some();
     if !stalled {
         return None;
@@ -582,12 +651,12 @@ fn memory_finding(
     if node_pressured {
         let culprit = memory_culprit(&victim, all);
         let message = match &culprit {
-            Some(c) => format!(
+            Some((c, overage)) => format!(
                 "{who} is stalling on memory while node {} is under memory pressure; {} is using \
                  {} MiB over its request (heuristic: largest grown overage on the node).",
                 victim.node,
                 pod_label(&c.reference),
-                mib((c.cpu_usage_millis) as i64)
+                mib(*overage)
             ),
             None => format!(
                 "{who} is stalling on memory while node {} is under memory pressure; no single \
@@ -595,15 +664,7 @@ fn memory_finding(
                 victim.node
             ),
         };
-        // `cpu_usage_millis` on a memory culprit carries the overage in
-        // bytes for the message above; re-state it properly for the wire.
-        let culprit = culprit.map(|mut c| {
-            c.cpu_usage_millis = all
-                .get(c.container_uid.as_deref().unwrap_or(""))
-                .map(|rs| rs.iter().map(|r| r.cpu_usage_millis_avg).sum::<f64>() / rs.len() as f64)
-                .unwrap_or(0.0);
-            c
-        });
+        let culprit = culprit.map(|(c, _)| c);
         return Some(Finding {
             kind: FindingKind::MemoryPressure,
             severity,
@@ -646,12 +707,11 @@ fn memory_finding(
 /// largest `current - request` (a container with no request counts all
 /// of its usage as overage — it reserved nothing) that also grew over the
 /// window and holds at least `MEM_CULPRIT_OVERAGE_SHARE` of the node's
-/// total positive overage. Returns the culprit with `cpu_usage_millis`
-/// temporarily holding the overage bytes (the caller rewrites it).
+/// total positive overage. Returns the culprit and its overage in bytes.
 fn memory_culprit(
     victim: &FindingVictim,
     all: &BTreeMap<&str, Vec<&PodComputeHistoryRow>>,
-) -> Option<FindingCulprit> {
+) -> Option<(FindingCulprit, i64)> {
     let mut node_overage: i128 = 0;
     let mut best: Option<(&PodComputeHistoryRow, i64)> = None;
     for (uid, rows) in all {
@@ -683,17 +743,22 @@ fn memory_culprit(
     if share < MEM_CULPRIT_OVERAGE_SHARE {
         return None;
     }
-    Some(FindingCulprit {
-        kind: "pod".to_string(),
-        reference: format!("{}/{}/{}", row.namespace, row.pod_name, row.container),
-        pod_uid: Some(row.pod_uid.clone()),
-        namespace: Some(row.namespace.clone()),
-        pod_name: Some(row.pod_name.clone()),
-        container_uid: Some(row.container_uid.clone()),
-        blame_share: share,
-        cpu_usage_millis: overage as f64,
-        cpu_request_millis: row.cpu_request_millis,
-    })
+    let rows = all.get(row.container_uid.as_str())?;
+    let usage = rows.iter().map(|r| r.cpu_usage_millis_avg).sum::<f64>() / rows.len() as f64;
+    Some((
+        FindingCulprit {
+            kind: "pod".to_string(),
+            reference: format!("{}/{}/{}", row.namespace, row.pod_name, row.container),
+            pod_uid: Some(row.pod_uid.clone()),
+            namespace: Some(row.namespace.clone()),
+            pod_name: Some(row.pod_name.clone()),
+            container_uid: Some(row.container_uid.clone()),
+            blame_share: share,
+            cpu_usage_millis: Some(usage),
+            cpu_request_millis: row.cpu_request_millis,
+        },
+        overage,
+    ))
 }
 
 #[cfg(test)]
@@ -877,7 +942,7 @@ mod tests {
         assert_eq!(c.container_uid.as_deref(), Some(BULLY));
         assert_eq!(c.pod_name.as_deref(), Some("etl-1-x"));
         assert!((c.blame_share - 0.7).abs() < 1e-9);
-        assert_eq!(c.cpu_usage_millis, 1900.0);
+        assert_eq!(c.cpu_usage_millis, Some(1900.0));
         assert_eq!(c.cpu_request_millis, Some(500));
         // Both signals sustained, neither critical threshold crossed.
         assert_eq!(f.severity, Severity::High);
@@ -950,6 +1015,78 @@ mod tests {
         assert!(findings[0]
             .message
             .contains("inside its 2.0-core CPU request"));
+    }
+
+    #[test]
+    fn opted_out_culprit_with_container_uid_is_named_with_unknown_usage() {
+        // D9: a pod annotated kguardian.dev/compute=off is not sampled
+        // (no history rows) but resolves with a container_uid, and must
+        // still be nameable as a culprit.
+        let (mut history, pairs) = bully_victim();
+        history.retain(|r| r.container_uid != BULLY);
+        let findings = compute_findings(&history, &pairs, &[], &ComputeThresholds::default());
+        assert_eq!(findings.len(), 1, "{findings:#?}");
+        let f = &findings[0];
+        assert_eq!(f.kind, FindingKind::NoisyNeighbor);
+        let c = f.culprit.as_ref().expect("opted-out bully is named");
+        assert_eq!(c.kind, "pod");
+        assert_eq!(c.container_uid.as_deref(), Some(BULLY));
+        assert_eq!(c.pod_uid.as_deref(), Some("etl-1-x-uid"));
+        assert_eq!(c.namespace.as_deref(), Some("batch"));
+        assert_eq!(c.pod_name.as_deref(), Some("etl-1-x"));
+        assert_eq!(c.cpu_usage_millis, None);
+        assert_eq!(c.cpu_request_millis, None);
+        assert_eq!(
+            f.message,
+            "payments/api is starved for CPU by batch/etl-1-x (70% of its wait); batch/etl-1-x is opted out of compute sampling, so its usage was not checked."
+        );
+        let v = serde_json::to_value(c).unwrap();
+        assert_eq!(v["cpu_usage_millis"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn untracked_culprit_without_container_uid_is_cpu_contended() {
+        let (mut history, mut pairs) = bully_victim();
+        history.retain(|r| r.container_uid != BULLY);
+        for p in pairs.iter_mut().filter(|p| p.culprit_kind == "pod") {
+            p.culprit_container_uid = None;
+            p.culprit_ref = "pod:etl1x0ab".into();
+        }
+        let findings = compute_findings(&history, &pairs, &[], &ComputeThresholds::default());
+        assert_eq!(findings.len(), 1, "{findings:#?}");
+        assert_eq!(findings[0].kind, FindingKind::CpuContended);
+        assert!(findings[0].culprit.is_none());
+        assert!(findings[0]
+            .message
+            .contains("pod:etl1x0ab tops its wait (70%) but is not tracked"));
+    }
+
+    #[test]
+    fn two_thousand_containers_still_yield_the_right_finding() {
+        // Scale guard for the per-container row bound: the engine must
+        // reach the same verdict for one victim regardless of how many
+        // other (quiet) containers share the window, as long as every
+        // container keeps its own full set of minute rows.
+        let (mut history, pairs) = bully_victim();
+        let mut id = 10_000;
+        for n in 0..2_000 {
+            let node = format!("worker-{}", n % 40);
+            for m in 0..5 {
+                id += 1;
+                history.push(row(id, "fleet", &format!("svc-{n}"), "app", &node, m));
+            }
+        }
+        assert!(history.len() > 10_000);
+        let findings = compute_findings(&history, &pairs, &[], &ComputeThresholds::default());
+        assert_eq!(findings.len(), 1, "one victim, one finding");
+        let f = &findings[0];
+        assert_eq!(f.kind, FindingKind::NoisyNeighbor);
+        assert_eq!(f.victim.container_uid, VICTIM);
+        assert_eq!(
+            f.culprit.as_ref().unwrap().container_uid.as_deref(),
+            Some(BULLY)
+        );
+        assert_eq!(f.severity, Severity::High);
     }
 
     #[test]
@@ -1104,7 +1241,7 @@ mod tests {
             let mut v = row(m, "payments", "api", "api", "worker-3", m);
             v.mem_psi_some10_avg = 20.0;
             v.mem_psi_some10_max = 25.0;
-            v.mem_refault = 500;
+            v.mem_refault = 1500;
             history.push(v);
             // A hog: no request, growing, holds most of the node overage.
             let mut h = row(100 + m, "batch", "hog", "main", "worker-3", m);
@@ -1141,7 +1278,7 @@ mod tests {
         assert_eq!(c.pod_name.as_deref(), Some("hog"));
         assert!(c.blame_share > 0.8, "hog holds most of the overage: {c:?}");
         assert_eq!(f.evidence.node_mem_some10_max, 8.0);
-        assert_eq!(f.evidence.refault_delta, 2500);
+        assert_eq!(f.evidence.refault_delta, 7500);
         assert_eq!(f.severity, Severity::High, "PSI and refault both sustained");
         assert!(f.message.contains("batch/hog is using"));
         // No thrash finding for the same victim while the node is hot.
@@ -1171,7 +1308,7 @@ mod tests {
             let mut v = row(m, "payments", "api", "api", "worker-3", m);
             v.mem_limit = Some(256 << 20);
             v.mem_events_high = 3;
-            v.mem_refault = 900;
+            v.mem_refault = 5000;
             history.push(v);
         }
         (history, vec![node("worker-3", node_mem)])
@@ -1248,6 +1385,66 @@ mod tests {
     }
 
     #[test]
+    fn runq_overflow_counts_as_a_critical_stall() {
+        // Every wait in the overflow bucket: finite quantiles read 0.
+        let (mut history, pairs) = bully_victim();
+        for r in history.iter_mut().filter(|r| r.container_uid == VICTIM) {
+            r.cpu_psi_some10_avg = 1.0;
+            r.cpu_psi_full10_max = 0.0;
+            r.runq_p99_us = Some(0);
+            r.runq_max_us = Some(0);
+            r.runq_overflow = Some(3);
+        }
+        let findings = compute_findings(&history, &pairs, &[], &ComputeThresholds::default());
+        assert_eq!(findings.len(), 1, "{findings:#?}");
+        assert_eq!(findings[0].kind, FindingKind::NoisyNeighbor);
+        assert_eq!(findings[0].severity, Severity::Critical);
+        assert_eq!(findings[0].evidence.runq_p99_us_max, Some(0));
+
+        // A single overflow minute is still subject to the sustain rule.
+        for r in history.iter_mut().filter(|r| r.container_uid == VICTIM) {
+            r.runq_overflow = if r.ts == minute(2) { Some(3) } else { Some(0) };
+        }
+        let findings = compute_findings(&history, &pairs, &[], &ComputeThresholds::default());
+        assert!(findings.is_empty(), "{findings:#?}");
+    }
+
+    #[test]
+    fn low_refault_rate_alone_is_not_memory_pressure() {
+        // A file-backed workload refaulting a few hundred pages a minute
+        // on a pressured node, with no memory PSI: below refaultPerMin
+        // (1 000) it is background noise, not thrash.
+        let (mut history, nodes) = memory_victim(8.0);
+        for r in history.iter_mut().filter(|r| r.container_uid == VICTIM) {
+            r.mem_psi_some10_avg = 0.0;
+            r.mem_psi_some10_max = 0.0;
+            r.mem_refault = 300;
+        }
+        let findings = compute_findings(&history, &[], &nodes, &ComputeThresholds::default());
+        assert!(findings.is_empty(), "{findings:#?}");
+
+        for r in history.iter_mut().filter(|r| r.container_uid == VICTIM) {
+            r.mem_refault = 1000;
+        }
+        let findings = compute_findings(&history, &[], &nodes, &ComputeThresholds::default());
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].kind, FindingKind::MemoryPressure);
+        assert_eq!(
+            findings[0].severity,
+            Severity::Medium,
+            "refault only, no PSI"
+        );
+
+        // The rate is per minute: the same count on a 5-minute row is 5x
+        // lower and must not fire.
+        for r in history.iter_mut().filter(|r| r.container_uid == VICTIM) {
+            r.resolution_secs = 300;
+        }
+        let findings = compute_findings(&history, &[], &nodes, &ComputeThresholds::default());
+        assert!(findings.is_empty(), "{findings:#?}");
+    }
+
+    #[test]
     fn thresholds_parse_from_env_with_defaults() {
         let _guard = crate::test_support::env_lock();
         let keys = [
@@ -1257,6 +1454,7 @@ mod tests {
             "COMPUTE_THRESHOLD_THROTTLED_RATIO_MAX",
             "COMPUTE_THRESHOLD_BLAME_SHARE",
             "COMPUTE_THRESHOLD_MEM_STALL_SOME",
+            "COMPUTE_THRESHOLD_REFAULT_PER_MIN",
         ];
         let prev: Vec<Option<String>> = keys.iter().map(|k| std::env::var(k).ok()).collect();
         for k in keys {
@@ -1270,12 +1468,15 @@ mod tests {
         assert_eq!(d.throttled_ratio_max, 0.10);
         assert_eq!(d.blame_share, 0.40);
         assert_eq!(d.mem_stall_some, 10.0);
+        assert_eq!(d.refault_per_min, 1000.0);
 
         std::env::set_var("COMPUTE_THRESHOLD_STALL_SOME", " 35 \n");
         std::env::set_var("COMPUTE_THRESHOLD_BLAME_SHARE", "0.6");
         std::env::set_var("COMPUTE_THRESHOLD_RUNQ_P99_MS", "garbage");
         std::env::set_var("COMPUTE_THRESHOLD_MEM_STALL_SOME", "-1");
+        std::env::set_var("COMPUTE_THRESHOLD_REFAULT_PER_MIN", "250");
         let t = ComputeThresholds::from_env();
+        assert_eq!(t.refault_per_min, 250.0);
         assert_eq!(t.stall_some, 35.0, "trimmed");
         assert_eq!(t.blame_share, 0.6);
         assert_eq!(t.runq_p99_ms, 20.0, "unparseable keeps the default");

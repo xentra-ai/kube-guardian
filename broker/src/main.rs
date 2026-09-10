@@ -4,16 +4,16 @@ use actix_cors::Cors;
 use actix_web::middleware::from_fn;
 use actix_web::{get, web, App, HttpResponse, HttpServer};
 use api::{
-    add_compute_batch, add_compute_history_batch, add_node_facts, add_pod_details, add_pods_batch,
-    add_pods_syscalls, add_svc_details, delete_seccomp_cr, establish_connection,
-    export_seccomp_profile, export_seccomp_profile_post, get_audit_verdicts,
-    get_cluster_environment, get_compute_contention, get_compute_findings, get_compute_history,
-    get_compute_latest, get_compute_nodes, get_pod_by_ip, get_pod_by_name, get_pod_details,
-    get_pod_syscall_name, get_pod_traffic, get_pod_traffic_name, get_pods_by_node,
-    get_seccomp_profile, get_seccomp_profile_file, get_svc_by_ip, get_svc_details, get_version,
-    list_seccomp_profiles, mark_pod_dead, post_seccomp_node_status, put_seccomp_cr,
-    set_statement_timeout, spawn_peer_late_resolve, spawn_retention, spawn_version_check,
-    AuditClient, ReadBudget, StatementTimeoutCustomizer, VersionCheckState,
+    add_node_facts, add_pod_details, add_pods_batch, add_pods_syscalls, add_svc_details,
+    compute_ingest_scope, delete_seccomp_cr, establish_connection, export_seccomp_profile,
+    export_seccomp_profile_post, get_audit_verdicts, get_cluster_environment,
+    get_compute_contention, get_compute_findings, get_compute_history, get_compute_latest,
+    get_compute_nodes, get_pod_by_ip, get_pod_by_name, get_pod_details, get_pod_syscall_name,
+    get_pod_traffic, get_pod_traffic_name, get_pods_by_node, get_seccomp_profile,
+    get_seccomp_profile_file, get_svc_by_ip, get_svc_details, get_version, list_seccomp_profiles,
+    mark_pod_dead, post_seccomp_node_status, put_seccomp_cr, set_statement_timeout,
+    spawn_peer_late_resolve, spawn_retention, spawn_version_check, AuditClient, ReadBudget,
+    StatementTimeoutCustomizer, VersionCheckState,
 };
 
 use diesel::r2d2;
@@ -387,8 +387,9 @@ async fn main() -> Result<(), std::io::Error> {
             .service(get_audit_verdicts)
             .service(mark_pod_dead)
             .service(add_node_facts)
-            .service(add_compute_batch)
-            .service(add_compute_history_batch)
+            // /pod/compute/{batch,history/batch} with their own 16 MiB
+            // JsonConfig (compute_api::COMPUTE_JSON_LIMIT_BYTES).
+            .service(compute_ingest_scope())
             .service(get_compute_latest)
             .service(get_compute_history)
             .service(get_compute_contention)
