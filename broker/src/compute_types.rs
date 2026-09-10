@@ -114,8 +114,9 @@ pub struct BpfOccupancy {
     pub runq_hist: i64,
     #[serde(default)]
     pub pair: i64,
-    /// Cumulative failed `runq_hist` / `pair` map updates since probe
-    /// load (dropped samples); `None` from an older controller.
+    /// Failed `runq_hist` / `pair` map updates during this interval
+    /// (dropped samples; the controller ships deltas of the kernel's
+    /// cumulative counters); `None` from an older controller.
     #[serde(default)]
     pub hist_update_failures: Option<i64>,
     #[serde(default)]
@@ -516,7 +517,7 @@ pub struct NodeComputeLatest {
     pub unknown_blame_share: f64,
     #[serde(with = "utc_ts")]
     pub updated_at: NaiveDateTime,
-    /// Cumulative BPF map insert failures since probe load — the
+    /// BPF map insert failures during the last sample interval — the
     /// "loss shows up as a number" guarantee. NULL = older controller.
     /// Last: positional Queryable.
     pub bpf_hist_update_failures: Option<i64>,

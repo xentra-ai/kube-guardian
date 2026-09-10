@@ -362,8 +362,9 @@ diesel::table! {
         bpf_pair -> Int8,
         unknown_blame_share -> Double,
         updated_at -> Timestamp,
-        // Cumulative BPF map insert failures since probe load; NULL from
-        // a controller that predates them. Positional — stay last.
+        // BPF map insert failures during the last sample interval (the
+        // controller ships deltas of the kernel's cumulative counters);
+        // NULL from a controller that predates them. Positional — stay last.
         bpf_hist_update_failures -> Nullable<Int8>,
         bpf_pair_update_failures -> Nullable<Int8>,
     }

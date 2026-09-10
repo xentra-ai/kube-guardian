@@ -1,4 +1,5 @@
--- Cumulative BPF map insert failures since the scheduler probe loaded
+-- BPF map insert failures during the last sample interval (a delta of
+-- the scheduler probe's cumulative counters, shipped by the controller)
 -- (design D4: "a leak shows up as a number, not as a phantom p99" — and
 -- so does loss). A failed `runq_hist` update means a victim's latency
 -- sample was dropped; a failed `pair` update means a blame sample was.
