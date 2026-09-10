@@ -178,8 +178,14 @@ export function useComputeData(namespace: string, opts: UseComputeDataOptions = 
       });
     } catch (err) {
       if (gen !== generation.current) return;
-      if (err instanceof ComputeUnsupportedError) markUnsupported(err);
-      // Any other failure here is not worth surfacing: the 5 s poll carries the same rows.
+      if (err instanceof ComputeUnsupportedError) {
+        markUnsupported(err);
+        return;
+      }
+      // Transient failure: let the next poll tick or visibility change retry
+      // the one-shot fetch instead of leaving cluster-wide node state unknown
+      // for the whole namespace session.
+      nodesLoadedGen.current = -1;
     }
   }, [api, markUnsupported]);
 

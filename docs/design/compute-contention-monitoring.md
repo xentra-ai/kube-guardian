@@ -299,7 +299,7 @@ row count is the risk. The controller therefore does the reduction:
   broker **upserts** into `pod_compute_latest` (primary key
   `container_uid`), so that table never exceeds the number of live
   containers. This is what the live gauges read.
-- **Every 60 s:** the controller folds its last twelve samples into a
+- **Every 60 s:** the controller folds one minute of samples into a
   `ComputeMinute` (avg / max / last for gauges, sum for counters, the
   merged runq histogram delta and the top-N culprit pairs) and POSTs
   `/pod/compute/history/batch`. The broker inserts into
@@ -362,7 +362,7 @@ as one. `memory-pressure` finding: victim `memory.pressure some avg10` ≥
 `/proc/pressure/memory some` ≥ 5 %; culprit = the container on the node with
 the largest `memory.current − request` that also grew over W, ≥ 40 % of node
 overage. `memory-limit-thrash` (victim thrashing under its **own**
-`memory.max`, `memory.events high` rising, node not under pressure) is the
+`memory.max`, `memory.events` `high` + `max` rising, node not under pressure) is the
 memory analogue of `cpu-throttled`: no culprit, raise the limit.
 
 ### D7 — Findings are computed in the broker, not the browser
@@ -739,7 +739,7 @@ payments/api slow?" from the tools alone.
 | Postgres growth (the `pod_traffic` incident) | Controller-side reduction; `latest` is upsert-bounded; minute rows downsampled to 5-minute after 24 h; 7-day retention pass; read budgets; row estimates in this doc checked against an accelerated-retention run in Phase 1. |
 | Cgroup id generation bits differ by provider (GKE) | `name_to_handle_at` for the userspace side, `kn->id` in BPF — expected to be the same 64-bit value; the Phase 0 exit test compares both against `bpftool cgroup tree` on GKE and Talos, and if they differ the sampler falls back to matching on the low 32 bits with a logged warning. |
 | cgroup v1 / no PSI nodes | Detected in node facts; feature reports unsupported per node; no crash, no empty bars. |
-| Cross-namespace culprit exposure | Documented behaviour of a cluster-scoped tool; findings endpoint honours the same namespace exclusions as traffic. |
+| Cross-namespace culprit exposure | Documented behaviour of a cluster-scoped tool; excluded namespaces never register with the controller, so they cannot be victims and appear as culprits only as `pod:<uid8>`. |
 | `NODE_HEIGHT` change disturbs existing layouts / screenshots | Height only changes on expanded nodes; README screenshots re-shot once at Phase 1 with neutral sample data. |
 | A pod without requests is always "eligible" as culprit | Intentional: it is the textbook noisy neighbour. The finding text says "no CPU request set". |
 

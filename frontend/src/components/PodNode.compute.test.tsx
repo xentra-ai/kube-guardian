@@ -150,7 +150,7 @@ test('dropped BPF inserts on the node: warning dot, tooltip names the counts', (
   const { container } = renderNode(base({ compute: compute({ status: 'warning', probeDrops: { hist: 3, pair: 5 } }) }));
   const dot = container.querySelector('[data-testid="compute-status-dot"]')!;
   expect(dot.className).toContain(COMPUTE_DOT_CLASS.warning);
-  expect(dot.getAttribute('title')).toBe('Compute warning: active findings; probe map full: 3 histogram / 5 pair inserts dropped');
+  expect(dot.getAttribute('title')).toBe('Compute warning; probe map full: 3 histogram / 5 pair inserts dropped');
   expect(dot.getAttribute('aria-label')).toBe(dot.getAttribute('title'));
 });
 

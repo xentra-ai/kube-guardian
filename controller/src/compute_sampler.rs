@@ -447,10 +447,20 @@ pub struct BpfOccupancy {
     pub runq_enqueued: u64,
     pub runq_hist: u64,
     pub pair: u64,
-    /// Cumulative map-full insert failures since load (additive to the
-    /// contract): any increase means samples were lost in kernel.
+    /// Map-full insert failures during this interval (additive to the
+    /// contract; the kernel counters are cumulative, the sampler ships
+    /// the delta): any non-zero value means samples were lost in kernel.
     pub hist_update_failures: u64,
     pub pair_update_failures: u64,
+}
+
+/// Per-interval insert-failure deltas from cumulative kernel counters.
+/// Returns `(hist_delta, pair_delta, new_prev)`; a counter that went
+/// backwards (probe reloaded) re-baselines to zero for that interval.
+pub(crate) fn failure_deltas(prev: (u64, u64), m: &MapOccupancy) -> (u64, u64, (u64, u64)) {
+    let hist = m.hist_update_failures.saturating_sub(prev.0);
+    let pair = m.pair_update_failures.saturating_sub(prev.1);
+    (hist, pair, (m.hist_update_failures, m.pair_update_failures))
 }
 
 impl From<&MapOccupancy> for BpfOccupancy {
@@ -1218,6 +1228,10 @@ pub struct Sampler {
     tracked_synced: bool,
     /// The startup self-check has fired (it fires at most once).
     self_check_done: bool,
+    /// Cumulative probe insert-failure counters as of the previous
+    /// snapshot, so the wire carries the per-interval delta: a single
+    /// burst of dropped inserts must not flag the node forever.
+    prev_failures: (u64, u64),
 }
 
 impl Sampler {
@@ -1251,11 +1265,25 @@ impl Sampler {
             fold_every,
             tracked_synced: false,
             self_check_done: false,
+            prev_failures: (0, 0),
         }
     }
 
     pub fn contention_loaded(&self) -> bool {
         self.probe.is_some()
+    }
+
+    /// Occupancy for the wire: gauges as read, failure counters as the
+    /// delta since the previous snapshot (the kernel counters are
+    /// cumulative and never reset while the probe is loaded). A counter
+    /// that went backwards means the probe was reloaded: re-baseline.
+    fn occupancy_delta(&mut self, m: &MapOccupancy) -> BpfOccupancy {
+        let mut occ = BpfOccupancy::from(m);
+        let (hist, pair, next) = failure_deltas(self.prev_failures, m);
+        occ.hist_update_failures = hist;
+        occ.pair_update_failures = pair;
+        self.prev_failures = next;
+        occ
     }
 
     pub fn supported(&self) -> bool {
@@ -1591,7 +1619,7 @@ impl Sampler {
             node_capacity,
             bpf_occupancy: snapshot
                 .as_ref()
-                .map(|s| BpfOccupancy::from(&s.map_occupancy))
+                .map(|s| self.occupancy_delta(&s.map_occupancy))
                 .unwrap_or_default(),
             unknown_blame_share: unknown_share,
             containers,
@@ -2693,6 +2721,29 @@ mod tests {
         std::fs::write(dir.join("memory.max"), "max\n").unwrap();
         std::fs::write(dir.join("memory.stat"), MEMORY_STAT).unwrap();
         std::fs::write(dir.join("memory.events"), MEMORY_EVENTS).unwrap();
+    }
+
+    #[test]
+    fn probe_failure_counters_ship_as_interval_deltas() {
+        let occ = |h, p| MapOccupancy {
+            runq_enqueued: 0,
+            runq_hist: 0,
+            pair: 0,
+            hist_update_failures: h,
+            pair_update_failures: p,
+        };
+        // First snapshot: everything since load is this interval's delta.
+        let (h, p, prev) = failure_deltas((0, 0), &occ(7, 3));
+        assert_eq!((h, p), (7, 3));
+        // Quiet interval: zero, so a one-off burst does not stick.
+        let (h, p, prev) = failure_deltas(prev, &occ(7, 3));
+        assert_eq!((h, p), (0, 0));
+        // New failures: only the increase.
+        let (h, p, prev) = failure_deltas(prev, &occ(9, 3));
+        assert_eq!((h, p), (2, 0));
+        // Probe reloaded (counters reset): re-baseline, never underflow.
+        let (h, p, _) = failure_deltas(prev, &occ(1, 0));
+        assert_eq!((h, p), (0, 0));
     }
 
     #[test]

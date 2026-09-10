@@ -149,8 +149,10 @@ function statusTooltipBase(status: ComputeStatus, findings: readonly ComputeFind
     case 'ok':
       return 'Compute: no active findings';
     default: {
+      // No findings here means the status came from somewhere else (probe
+      // drops, appended by the caller) — do not claim findings that do not exist.
       const kinds = [...new Set(findings.map((f) => f.kind))].join(', ');
-      return `Compute ${status}: ${kinds || 'active findings'}`;
+      return kinds ? `Compute ${status}: ${kinds}` : `Compute ${status}`;
     }
   }
 }

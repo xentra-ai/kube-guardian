@@ -184,7 +184,7 @@ describe('buildPodComputeData', () => {
     const d = buildPodComputeData({ containers: [container()], nodesByName: nodes, findings: [], samples: [] });
     expect(d.probeDrops).toEqual({ hist: 3, pair: 5 });
     expect(d.status).toBe('warning');
-    expect(statusTooltip(d.status, d.findings, d.probeDrops)).toBe('Compute warning: active findings; probe map full: 3 histogram / 5 pair inserts dropped');
+    expect(statusTooltip(d.status, d.findings, d.probeDrops)).toBe('Compute warning; probe map full: 3 histogram / 5 pair inserts dropped');
     // A critical finding is not downgraded; zero / absent counters mean no drops.
     const c = buildPodComputeData({ containers: [container()], nodesByName: nodes, findings: [finding('critical')], samples: [] });
     expect(c.status).toBe('critical');
