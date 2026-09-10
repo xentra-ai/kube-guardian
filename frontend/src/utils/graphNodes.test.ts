@@ -66,3 +66,55 @@ describe('mergeNodeData (a data tick)', () => {
     expect(mergeNodeData([], [node('a')])).toEqual([]);
   });
 });
+
+import { isRectInView, layoutIntent, layoutSignatureOf, type LayoutParts } from './graphNodes';
+
+const parts = (nodes: Record<string, string>, edges: string[] = ['a>b'], direction = 'LR'): LayoutParts => ({
+  direction,
+  nodes: new Map(Object.entries(nodes)),
+  edges,
+});
+
+describe('layoutIntent (what the viewport does after a layout)', () => {
+  test('first layout and any change to the node set or edges refit', () => {
+    expect(layoutIntent(null, parts({ a: '00', b: '00' }))).toEqual({ kind: 'refit' });
+    expect(layoutIntent(parts({ a: '00', b: '00' }), parts({ a: '00', b: '00', c: '00' }))).toEqual({ kind: 'refit' });
+    expect(layoutIntent(parts({ a: '00', b: '00' }), parts({ a: '00', c: '00' }))).toEqual({ kind: 'refit' });
+    expect(layoutIntent(parts({ a: '00', b: '00' }), parts({ a: '00', b: '00' }, ['a>b', 'b>a']))).toEqual({ kind: 'refit' });
+    expect(layoutIntent(parts({ a: '00', b: '00' }), parts({ a: '00', b: '00' }, ['a>b'], 'TB'))).toEqual({ kind: 'refit' });
+  });
+
+  test('expanding one card is laid out in place and names that card', () => {
+    expect(layoutIntent(parts({ a: '00', b: '00' }), parts({ a: '10', b: '00' }))).toEqual({ kind: 'in-place', toggledId: 'a' });
+    expect(layoutIntent(parts({ a: '10', b: '00' }), parts({ a: '00', b: '00' }))).toEqual({ kind: 'in-place', toggledId: 'a' });
+  });
+
+  test('gauges arriving on a poll tick are in place with no card to pan to', () => {
+    expect(layoutIntent(parts({ a: '00', b: '00' }), parts({ a: '01', b: '01' }))).toEqual({ kind: 'in-place', toggledId: null });
+  });
+
+  test('two cards toggled at once: in place, no single target', () => {
+    expect(layoutIntent(parts({ a: '00', b: '00' }), parts({ a: '10', b: '10' }))).toEqual({ kind: 'in-place', toggledId: null });
+  });
+
+  test('signature is stable for equal parts and differs on any change', () => {
+    const p = parts({ a: '00', b: '10' });
+    expect(layoutSignatureOf(p)).toBe(layoutSignatureOf(parts({ a: '00', b: '10' })));
+    expect(layoutSignatureOf(p)).not.toBe(layoutSignatureOf(parts({ a: '00', b: '00' })));
+  });
+});
+
+describe('isRectInView', () => {
+  const pane = { width: 1000, height: 600 };
+  test('a card inside the pane at zoom 1 is visible', () => {
+    expect(isRectInView({ x: 100, y: 100, width: 240, height: 100 }, { x: 0, y: 0, zoom: 1 }, pane)).toBe(true);
+  });
+  test('a card that grew past the bottom edge is not', () => {
+    expect(isRectInView({ x: 100, y: 550, width: 240, height: 180 }, { x: 0, y: 0, zoom: 1 }, pane)).toBe(false);
+  });
+  test('panning and zoom are applied', () => {
+    // At zoom 0.5 the card at flow (1500, 100) lands at screen (750 + x, 50 + y).
+    expect(isRectInView({ x: 1500, y: 100, width: 240, height: 100 }, { x: 0, y: 0, zoom: 0.5 }, pane)).toBe(true);
+    expect(isRectInView({ x: 1500, y: 100, width: 240, height: 100 }, { x: -800, y: 0, zoom: 0.5 }, pane)).toBe(false);
+  });
+});

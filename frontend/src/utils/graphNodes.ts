@@ -62,3 +62,72 @@ export function mergeNodeData(prev: readonly Node[], next: readonly Node[]): Nod
   });
   return changed ? out : (prev as Node[]);
 }
+
+// ---------------------------------------------------------------------------
+// Viewport policy after a layout.
+//
+// ELK re-runs whenever the layout signature changes, and historically every
+// layout ended in `fitView`, which yanked the viewport back to the centre of
+// the graph when all the user did was expand one card. Only a change to the
+// SET of nodes / edges (namespace switch, toggle of external or DaemonSet
+// nodes, focus mode, layout direction) deserves a refit. A change that keeps
+// the same nodes and edges — a card expanded or collapsed, gauges arriving on
+// a poll tick — is laid out in place: the viewport stays where it is, and if
+// the toggled card grew out of view we pan to it, nothing else.
+// ---------------------------------------------------------------------------
+
+export interface LayoutParts {
+  direction: string;
+  /** node id → per-node layout bits, first char = expanded (0/1). */
+  nodes: ReadonlyMap<string, string>;
+  edges: readonly string[];
+}
+
+export type LayoutIntent = { kind: 'refit' } | { kind: 'in-place'; toggledId: string | null };
+
+export function layoutSignatureOf(parts: LayoutParts): string {
+  const nodes = [...parts.nodes.entries()].map(([id, bits]) => `${id}:${bits}`);
+  return `${parts.direction}|${nodes.join(',')}|${parts.edges.join(',')}`;
+}
+
+/**
+ * Decide how the viewport should react once the next layout lands.
+ * Same node ids, same edges, same direction ⇒ in place; `toggledId` is the
+ * one node whose expanded bit flipped (null when it was only gauges, or more
+ * than one card changed at once).
+ */
+export function layoutIntent(prev: LayoutParts | null, next: LayoutParts): LayoutIntent {
+  if (!prev) return { kind: 'refit' };
+  if (prev.direction !== next.direction) return { kind: 'refit' };
+  if (prev.nodes.size !== next.nodes.size) return { kind: 'refit' };
+  for (const id of next.nodes.keys()) if (!prev.nodes.has(id)) return { kind: 'refit' };
+  if (prev.edges.length !== next.edges.length) return { kind: 'refit' };
+  for (let i = 0; i < next.edges.length; i++) if (prev.edges[i] !== next.edges[i]) return { kind: 'refit' };
+
+  const toggled: string[] = [];
+  for (const [id, bits] of next.nodes) {
+    const before = prev.nodes.get(id) ?? '';
+    if (before.charAt(0) !== bits.charAt(0)) toggled.push(id);
+  }
+  return { kind: 'in-place', toggledId: toggled.length === 1 ? toggled[0] : null };
+}
+
+export interface Rect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+/** Whether a flow-space rect is fully inside the visible pane. */
+export function isRectInView(
+  rect: Rect,
+  viewport: { x: number; y: number; zoom: number },
+  pane: { width: number; height: number },
+): boolean {
+  const left = rect.x * viewport.zoom + viewport.x;
+  const top = rect.y * viewport.zoom + viewport.y;
+  const right = left + rect.width * viewport.zoom;
+  const bottom = top + rect.height * viewport.zoom;
+  return left >= 0 && top >= 0 && right <= pane.width && bottom <= pane.height;
+}

@@ -1,4 +1,4 @@
-import React, { useCallback, useMemo, useEffect, useState } from 'react';
+import React, { useCallback, useMemo, useEffect, useRef, useState } from 'react';
 import ReactFlow, {
   Controls,
   useNodesState,
@@ -16,7 +16,16 @@ import PodNode from './PodNode';
 import ContentionEdge from './ContentionEdge';
 import { EDGE_COLOR_CONTENTION, buildContentionEdges } from '../utils/contentionEdges';
 import { hasComputeGauges, nodeHeight } from '../utils/compute';
-import { mergeNodeData, placeNodes, pruneNodes } from '../utils/graphNodes';
+import {
+  isRectInView,
+  layoutIntent,
+  layoutSignatureOf,
+  mergeNodeData,
+  placeNodes,
+  pruneNodes,
+  type LayoutIntent,
+  type LayoutParts,
+} from '../utils/graphNodes';
 import type { ComputeFinding } from '../types/compute';
 import { shouldExitFocus } from '../utils/graphFocus';
 import { EDGE_COLOR_DAEMONSET, edgeStrokeColor, isDaemonSetPeer, partitionDaemonSetPeers, shouldAutoShowDaemonSets } from '../utils/daemonSetPeers';
@@ -96,7 +105,8 @@ const NetworkGraphInner: React.FC<NetworkGraphProps> = ({
   focusedNodeId,
   onFocusChange,
 }) => {
-  const { fitView } = useReactFlow();
+  const { fitView, setCenter, getViewport } = useReactFlow();
+  const paneRef = useRef<HTMLDivElement>(null);
 
   // Focus mode: isolate a node + its direct upstream/downstream, hide the rest,
   // and re-lay-out the subset. Toggling the same node (or Esc / the pill) exits.
@@ -517,19 +527,28 @@ const NetworkGraphInner: React.FC<NetworkGraphProps> = ({
   // rebuilds the node objects every 5 s with new gauge values; those must
   // repaint the cards but must never re-run ELK (and the fitView that follows
   // it, which would yank the viewport every 5 s).
-  const layoutSignature = useMemo(() => {
-    const nodes = displayNodes.map((n) => {
+  const layoutParts = useMemo<LayoutParts>(() => {
+    const nodes = new Map<string, string>();
+    for (const n of displayNodes) {
       const d = n.data as PodNodeData;
-      return `${n.id}:${d.isExpanded ? 1 : 0}${hasComputeGauges(d.compute) ? 1 : 0}`;
-    });
-    const edges = displayEdges.map((e) => `${e.source}>${e.target}`);
-    return `${layoutDirection}|${nodes.join(',')}|${edges.join(',')}`;
+      nodes.set(n.id, `${d.isExpanded ? 1 : 0}${hasComputeGauges(d.compute) ? 1 : 0}`);
+    }
+    return { direction: layoutDirection, nodes, edges: displayEdges.map((e) => `${e.source}>${e.target}`) };
   }, [displayNodes, displayEdges, layoutDirection]);
+  const layoutSignature = useMemo(() => layoutSignatureOf(layoutParts), [layoutParts]);
+  // What the viewport should do when the layout for this signature lands
+  // (utils/graphNodes `layoutIntent`): refit for a new node set, stay put for
+  // an expand/collapse or a gauge tick, panning only to a card that grew out
+  // of view.
+  const lastLayoutParts = React.useRef<LayoutParts | null>(null);
+  const pendingIntent = React.useRef<LayoutIntent>({ kind: 'refit' });
   const lastLayoutSignature = React.useRef<string | null>(null);
 
   useEffect(() => {
     if (lastLayoutSignature.current === layoutSignature) return;
     lastLayoutSignature.current = layoutSignature;
+    pendingIntent.current = layoutIntent(lastLayoutParts.current, layoutParts);
+    lastLayoutParts.current = layoutParts;
 
     if (displayNodes.length === 0) {
       // eslint-disable-next-line react-hooks/set-state-in-effect
@@ -635,7 +654,7 @@ const NetworkGraphInner: React.FC<NetworkGraphProps> = ({
       });
       setElkPositions(positions);
     });
-  }, [displayNodes, displayEdges, layoutDirection, layoutSignature]);
+  }, [displayNodes, displayEdges, layoutDirection, layoutSignature, layoutParts]);
 
   const [nodes, setNodes, onNodesChange] = useNodesState([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState(displayEdges);
@@ -681,14 +700,38 @@ const NetworkGraphInner: React.FC<NetworkGraphProps> = ({
     return () => window.removeEventListener('keydown', onKey);
   }, [focusedNodeId]);
 
-  // Auto-fit view after ELK layout completes
+  // After ELK lands: refit for a new node set; otherwise leave the viewport
+  // alone (expanding a card must not yank the screen back to the centre) and
+  // only pan to the toggled card if its new size pushed it out of view.
   useEffect(() => {
-    if (elkPositions.size > 0) {
-      setTimeout(() => {
+    if (elkPositions.size === 0) return;
+    const intent = pendingIntent.current;
+    const timer = setTimeout(() => {
+      if (intent.kind === 'refit') {
         fitView({ padding: 0.2, duration: UI_TIMING.FIT_VIEW_DURATION });
-      }, UI_TIMING.FIT_VIEW_DELAY);
-    }
-  }, [elkPositions, fitView]);
+        return;
+      }
+      if (!intent.toggledId) return;
+      const pos = elkPositions.get(intent.toggledId);
+      const node = displayNodesRef.current.find((n) => n.id === intent.toggledId);
+      const pane = paneRef.current;
+      if (!pos || !node || !pane) return;
+      const data = node.data as PodNodeData;
+      const rect = {
+        x: pos.x,
+        y: pos.y,
+        width: NODE_WIDTH,
+        height: nodeHeight({ isExpanded: !!data.isExpanded, hasCompute: hasComputeGauges(data.compute) }),
+      };
+      const viewport = getViewport();
+      if (isRectInView(rect, viewport, { width: pane.clientWidth, height: pane.clientHeight })) return;
+      setCenter(rect.x + rect.width / 2, rect.y + rect.height / 2, {
+        zoom: viewport.zoom,
+        duration: UI_TIMING.FIT_VIEW_DURATION,
+      });
+    }, UI_TIMING.FIT_VIEW_DELAY);
+    return () => clearTimeout(timer);
+  }, [elkPositions, fitView, setCenter, getViewport]);
 
   const onNodeClick = useCallback(
     (_event: React.MouseEvent, node: Node) => {
@@ -720,7 +763,7 @@ const NetworkGraphInner: React.FC<NetworkGraphProps> = ({
   }, [pods]);
 
   return (
-    <div className="w-full h-full">
+    <div ref={paneRef} className="w-full h-full">
       <ReactFlow
         nodes={nodes}
         edges={edges}
