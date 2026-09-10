@@ -111,13 +111,22 @@ func runComputeFindings(cmd *cobra.Command, _ []string) error {
 		return fmt.Errorf("timeout waiting for broker port-forward")
 	}
 
-	return fetchAndRenderComputeFindings(namespace, computeFindingsNode, output, os.Stdout)
+	return fetchAndRenderComputeFindings(namespace, computeFindingsNode, output, os.Stdout, os.Stderr)
 }
 
+// Operator notices for the table mode. Both go to stderr so a piped table
+// stays clean, and neither changes the exit code: this is a report.
+const (
+	historyDisabledNotice = "Compute findings are unavailable: history retention is disabled on the broker (compute.history.retentionDays is 0)."
+	truncatedNoticeFmt    = "Findings evaluated for the first %d victims (victims_evaluated); narrow with -n or --node."
+)
+
 // fetchAndRenderComputeFindings is the testable core: fetch via the broker
-// client, then render as a table or pass the broker's JSON through verbatim
-// (re-indented). A fetch failure is an error; an empty result is not.
-func fetchAndRenderComputeFindings(namespace, node, output string, w io.Writer) error {
+// client, then render as a table (stdout) plus any history_disabled /
+// truncated notice (stderr), or pass the broker's JSON through verbatim
+// (re-indented, notices included as fields). A fetch failure is an error; an
+// empty result is not.
+func fetchAndRenderComputeFindings(namespace, node, output string, w, errw io.Writer) error {
 	resp, raw, err := api.GetComputeFindings(namespace, node)
 	if err != nil {
 		return fmt.Errorf("fetching compute findings: %w", err)
@@ -134,7 +143,20 @@ func fetchAndRenderComputeFindings(namespace, node, output string, w io.Writer) 
 		_, err := w.Write(buf.Bytes())
 		return err
 	}
-	return renderComputeFindingsTable(w, resp.Findings)
+	if resp.HistoryDisabled {
+		if _, err := fmt.Fprintln(errw, historyDisabledNotice); err != nil {
+			return err
+		}
+	}
+	if err := renderComputeFindingsTable(w, resp.Findings); err != nil {
+		return err
+	}
+	if resp.Truncated {
+		if _, err := fmt.Fprintf(errw, truncatedNoticeFmt+"\n", resp.VictimsEvaluated); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // severityRank orders critical before high before medium; anything the

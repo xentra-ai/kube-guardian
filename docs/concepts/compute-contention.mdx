@@ -177,9 +177,10 @@ enabled and supported on that node and whether the scheduler probe attached.
   exist there. The node reports `compute_supported: false`, its pods render
   without gauges, and the tooltip says why. Nothing crashes and no empty bars
   are drawn.
-- **The scheduler probe attaches via `tp_btf` and falls back to `raw_tp`.**
-  If neither attaches, the node reports `contention_loaded: false` and keeps
-  its gauges and stall findings; it just never produces a `noisy-neighbor`.
+- **The scheduler probe requires kernel BTF (`/sys/kernel/btf/vmlinux`).**
+  Without it the probe does not load, the node reports
+  `contention_loaded: false` and keeps its gauges and stall findings; it
+  just never produces a `noisy-neighbor`.
 - **A node with no compute row at all** is either running with
   `compute.enabled=false` or a controller older than this feature.
 

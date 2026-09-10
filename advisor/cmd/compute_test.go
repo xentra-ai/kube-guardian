@@ -249,8 +249,8 @@ func newBrokerFixture(t *testing.T) (*httptest.Server, *string) {
 
 func TestFetchAndRenderComputeFindings_JSONPassthrough(t *testing.T) {
 	_, gotQuery := newBrokerFixture(t)
-	var buf bytes.Buffer
-	if err := fetchAndRenderComputeFindings("payments", "worker-3", "json", &buf); err != nil {
+	var buf, errBuf bytes.Buffer
+	if err := fetchAndRenderComputeFindings("payments", "worker-3", "json", &buf, &errBuf); err != nil {
 		t.Fatalf("fetch/render: %v", err)
 	}
 	if *gotQuery != "namespace=payments&node=worker-3" {
@@ -276,12 +276,15 @@ func TestFetchAndRenderComputeFindings_JSONPassthrough(t *testing.T) {
 
 func TestFetchAndRenderComputeFindings_TableFromBroker(t *testing.T) {
 	_, gotQuery := newBrokerFixture(t)
-	var buf bytes.Buffer
-	if err := fetchAndRenderComputeFindings("", "", "table", &buf); err != nil {
+	var buf, errBuf bytes.Buffer
+	if err := fetchAndRenderComputeFindings("", "", "table", &buf, &errBuf); err != nil {
 		t.Fatalf("fetch/render: %v", err)
 	}
 	if *gotQuery != "" {
 		t.Errorf("cluster scope must send no query, got %q", *gotQuery)
+	}
+	if errBuf.Len() != 0 {
+		t.Errorf("no notice expected when neither truncated nor history_disabled, got %q", errBuf.String())
 	}
 	rows := tableRows(t, buf.String())
 	if len(rows) != 3 {
@@ -302,8 +305,8 @@ func TestFetchAndRenderComputeFindings_TableFromBroker(t *testing.T) {
 
 func TestFetchAndRenderComputeFindings_NamespaceOnlyQuery(t *testing.T) {
 	_, gotQuery := newBrokerFixture(t)
-	var buf bytes.Buffer
-	if err := fetchAndRenderComputeFindings("payments", "", "table", &buf); err != nil {
+	var buf, errBuf bytes.Buffer
+	if err := fetchAndRenderComputeFindings("payments", "", "table", &buf, &errBuf); err != nil {
 		t.Fatalf("fetch/render: %v", err)
 	}
 	if *gotQuery != "namespace=payments" {
@@ -320,8 +323,8 @@ func TestFetchAndRenderComputeFindings_BrokerErrorIsReturned(t *testing.T) {
 	api.BrokerBaseURL = srv.URL
 	t.Cleanup(func() { api.BrokerBaseURL = orig })
 
-	var buf bytes.Buffer
-	err := fetchAndRenderComputeFindings("", "", "table", &buf)
+	var buf, errBuf bytes.Buffer
+	err := fetchAndRenderComputeFindings("", "", "table", &buf, &errBuf)
 	if err == nil {
 		t.Fatal("a broker 500 must surface as an error, not an empty report")
 	}
@@ -354,5 +357,75 @@ func TestComputeFindingsCmd_RegisteredWithFlags(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("compute command not registered on root")
+	}
+}
+
+// serveFindingsBody points the broker client at a server returning body.
+func serveFindingsBody(t *testing.T, body string) {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(body))
+	}))
+	t.Cleanup(srv.Close)
+	orig := api.BrokerBaseURL
+	api.BrokerBaseURL = srv.URL
+	t.Cleanup(func() { api.BrokerBaseURL = orig })
+}
+
+func TestFetchAndRenderComputeFindings_HistoryDisabledNotice(t *testing.T) {
+	// retentionDays=0 means the engine has no window: an empty list here is a
+	// configuration state, not a clean bill of health. The operator must be
+	// told, on stderr (stdout stays a clean table), and the exit code stays 0.
+	serveFindingsBody(t, `{"findings":[],"history_disabled":true,"victims_evaluated":0}`)
+	var out, errOut bytes.Buffer
+	if err := fetchAndRenderComputeFindings("", "", "table", &out, &errOut); err != nil {
+		t.Fatalf("history_disabled must not be an error (exit 0): %v", err)
+	}
+	if strings.TrimSpace(errOut.String()) != historyDisabledNotice {
+		t.Errorf("stderr: want %q, got %q", historyDisabledNotice, errOut.String())
+	}
+	if !strings.Contains(errOut.String(), "compute.history.retentionDays is 0") {
+		t.Errorf("notice must name the values key to flip")
+	}
+	if strings.TrimSpace(out.String()) != "No compute findings." {
+		t.Errorf("stdout should still carry the (empty) report, got %q", out.String())
+	}
+}
+
+func TestFetchAndRenderComputeFindings_TruncatedNotice(t *testing.T) {
+	serveFindingsBody(t, `{"findings":[
+  {"kind":"cpu-throttled","severity":"medium","victim":{"namespace":"a","pod_name":"p","container":"c"},"culprit":null,"message":"m"}
+],"truncated":true,"victims_evaluated":500}`)
+	var out, errOut bytes.Buffer
+	if err := fetchAndRenderComputeFindings("", "", "table", &out, &errOut); err != nil {
+		t.Fatalf("truncated must not be an error (exit 0): %v", err)
+	}
+	want := "Findings evaluated for the first 500 victims (victims_evaluated); narrow with -n or --node."
+	if strings.TrimSpace(errOut.String()) != want {
+		t.Errorf("stderr: want %q, got %q", want, errOut.String())
+	}
+	if rows := tableRows(t, out.String()); len(rows) != 1 {
+		t.Errorf("table must still render the findings that were evaluated, got %d rows", len(rows))
+	}
+}
+
+func TestFetchAndRenderComputeFindings_JSONModeCarriesNoticesAsFields(t *testing.T) {
+	// JSON is raw passthrough: the flags reach the caller as fields, and
+	// nothing is written to stderr so `-o json | jq` pipelines stay clean.
+	serveFindingsBody(t, `{"findings":[],"truncated":true,"victims_evaluated":7,"history_disabled":true}`)
+	var out, errOut bytes.Buffer
+	if err := fetchAndRenderComputeFindings("", "", "json", &out, &errOut); err != nil {
+		t.Fatalf("json: %v", err)
+	}
+	if errOut.Len() != 0 {
+		t.Errorf("json mode must not print notices to stderr, got %q", errOut.String())
+	}
+	var got api.ComputeFindingsResponse
+	if err := json.Unmarshal(out.Bytes(), &got); err != nil {
+		t.Fatalf("output not JSON: %v", err)
+	}
+	if !got.Truncated || got.VictimsEvaluated != 7 || !got.HistoryDisabled {
+		t.Errorf("flags lost in passthrough: %+v", got)
 	}
 }

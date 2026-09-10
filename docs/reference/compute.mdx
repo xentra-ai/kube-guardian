@@ -22,7 +22,7 @@ feature. Operational steps are in the [guide](/guides/compute-gauges).
 | `compute.thresholds.blameShare` | float | `0.40` | Share of the victim's wait time one cgroup must hold to be named the culprit. |
 | `compute.thresholds.memStallSome` | int | `10` | `memory.pressure some avg10` (percent) at or above which `memory-pressure` can fire (while the node is also under pressure). |
 | `compute.thresholds.refaultPerMin` | int | `1000` | Workingset refaults per minute at or above which a container counts as thrashing for `memory-pressure` (the alternative to `memStallSome`; the node must also be under pressure). |
-| `compute.history.retentionDays` | int | `7` | Days of history kept. `0` disables history inserts and pruning; the live table still works. |
+| `compute.history.retentionDays` | int | `7` | Days of history kept. `0` disables history inserts and pruning **and every compute finding** (they are computed from history); only the live gauges remain. |
 | `compute.history.minuteResolutionHours` | int | `24` | Hours kept at one-minute resolution before rows are folded into 5-minute rows. |
 
 Thresholds are evaluated by the broker, so a change takes effect on the next
@@ -82,7 +82,7 @@ auth middleware is global, not per route.
 | `GET /compute/latest?namespace=<ns>` | `{ "containers": [...], "nodes": [...] }` — one row per live container in the namespace (blame inline) and the node rows for the nodes hosting them. `namespace` is required. |
 | `GET /compute/history/{pod_uid}?minutes=60` | `{ "rows": [...] }` — history rows for the pod, oldest first, at whatever resolution the window has. `minutes` is capped at 10080. |
 | `GET /compute/contention?namespace=<ns>&node=<node>&minutes=5` | `{ "pairs": [...] }` — victim→culprit pairs. One of `namespace` / `node` is required. Up to 50 pairs per victim. |
-| `GET /compute/findings?namespace=<ns>&node=<node>` | `{ "findings": [Finding] }`. Both filters optional; neither means the whole cluster. |
+| `GET /compute/findings?namespace=<ns>&node=<node>` | `{ "findings": [Finding], "truncated": bool, "victims_evaluated": int, "history_disabled": bool }` — see [findings response](#findings-response). Both filters optional; neither means the whole cluster. |
 | `GET /compute/nodes` | `{ "nodes": [...] }` — every node's latest sample: pressure, context-switch rate, capacity, BPF map occupancy, and the `compute_enabled` / `compute_supported` / `contention_loaded` flags. |
 | `POST /pod/compute/batch` | Controller → broker, every sample interval. |
 | `POST /pod/compute/history/batch` | Controller → broker, every 60 s. |
@@ -138,6 +138,19 @@ auth middleware is global, not per route.
 | `evidence` | The values that fired the rule, as maxima over the window. `runq_p99_us_max` is `null` when the probe is not loaded. |
 | `first_seen` / `last_seen` | RFC 3339 UTC. |
 | `message` | One sentence, safe to show verbatim. |
+
+## Findings response
+
+```json
+{ "findings": [ … ], "truncated": false, "victims_evaluated": 412, "history_disabled": false }
+```
+
+| Field | Notes |
+|---|---|
+| `findings` | Array of [Finding](#finding). |
+| `truncated` | `true` when the request hit the per-call victim cap and some containers in scope were not evaluated. Narrow the scope with `namespace` or `node`. |
+| `victims_evaluated` | Number of containers the rule engine actually evaluated for this call. |
+| `history_disabled` | `true` when `compute.history.retentionDays` is `0`. Findings are computed from history, so this response can never contain any; the live gauges are unaffected. |
 
 ## History row
 

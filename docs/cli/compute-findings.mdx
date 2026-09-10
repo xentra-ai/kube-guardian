@@ -44,8 +44,12 @@ the JSON output. A `system` culprit prints as `system:<unit>` (for example
 the victim's scheduler wait for `noisy-neighbor`, and its share of the
 node's memory overage for `memory-pressure`.
 
-`-o json` prints the broker's `{ "findings": [...] }` response unchanged;
-the schema is in the [compute reference](/reference/compute#finding).
+`-o json` prints the broker's response unchanged (`findings`, `truncated`,
+`victims_evaluated`, `history_disabled`); the schema is in the
+[compute reference](/reference/compute#findings-response). In table mode the
+CLI prints a notice when `truncated` is set (narrow the scope with `-n` or
+`--node`), when `history_disabled` is set (`retentionDays: 0` — no findings
+are possible), and how many victims were evaluated.
 
 ## Examples
 

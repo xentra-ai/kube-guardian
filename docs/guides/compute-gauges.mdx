@@ -39,9 +39,11 @@ helm upgrade kguardian oci://ghcr.io/kguardian-dev/charts/kguardian \
 ```
 
 The probe attaches to `sched_wakeup`, `sched_wakeup_new`, `sched_switch` and
-`sched_process_exit` via `tp_btf`, falling back to `raw_tp`. A node where
-neither attaches keeps its gauges and reports `contention_loaded: false`;
-check with `GET /compute/nodes` on the broker or the node tooltip in the UI.
+`sched_process_exit` via `tp_btf`, which requires kernel BTF
+(`/sys/kernel/btf/vmlinux`). Without it the probe does not load: the node
+reports `contention_loaded: false` and its gauges and stall findings keep
+working. Check with `GET /compute/nodes` on the broker or the status-dot
+tooltip on a pod in the UI.
 
 `compute.contention.minRunqLatencyUs` (default 100) is the in-kernel filter:
 a run-queue wait shorter than this is dropped before any map write. Raise it
@@ -117,9 +119,10 @@ Traffic and syscalls stay on manual refresh.
 </Steps>
 
 A pod with no gauge shows a muted dot instead, and the dot's tooltip says
-why: **pending** (`no compute sample yet` — the pod is registered but its
-first sample has not arrived), **off** (the feature is disabled on that
-node, or the controller predates it), or **unsupported** (the node is
+why: **off** (the node's controller reports `compute.enabled` false — a
+disabled controller still posts a heartbeat), **pending** (`no compute
+sample yet`: the pod's first sample has not arrived, it is opted out, or
+its controller predates the feature), or **unsupported** (the node is
 cgroup v1 or has no PSI).
 
 ## From the CLI
@@ -160,8 +163,9 @@ likely to touch:
   [why throttling is never blamed on a neighbour](/concepts/compute-contention#why-throttling-is-never-blamed-on-a-neighbour).
 
 History size is `compute.history.retentionDays` (default 7; `0` keeps only
-the live table) and `compute.history.minuteResolutionHours` (default 24,
-after which minute rows are folded into 5-minute rows).
+the live table **and disables every compute finding**, since findings are
+computed from history) and `compute.history.minuteResolutionHours` (default
+24, after which minute rows are folded into 5-minute rows).
 
 ## Troubleshooting
 

@@ -221,11 +221,16 @@ atomics encode as legacy `lock xadd` and load on 5.10+ x86 and 5.15 arm64
 regardless of the builder's clang.
 
 ```
-tp_btf/sched_wakeup       → if p.on_cpu: return   # a wakeup can target a task that is
+tp_btf/sched_wakeup       → if p.on_cpu or p == current: return
+                                                  # a wakeup can target a task that is
                                                   # still running (ttwu_runnable / self-wake);
                                                   # stamping it would fold run + sleep time
                                                   # into the next wait
-                            runq_enqueued[p.pid] = now   (BPF_ANY: latest wakeup wins)
+                            runq_enqueued[p.pid] = now   (BPF_NOEXIST: a stamp set at
+                                                  # preemption below must survive a later
+                                                  # wakeup; with the guard above no stale
+                                                  # stamp can exist, every stamp is popped
+                                                  # by switch-in or exit)
 tp_btf/sched_wakeup_new   → same (forked tasks; the reference missed these)
 tp_btf/sched_switch(preempt, prev, next):
     if preempt or prev.state == TASK_RUNNING: # still runnable: preempted, or preempted
@@ -465,7 +470,7 @@ positional `Queryable`).
 Anything that depends on configuration or on a load result is **live** and
 travels with every node sample into `node_compute_latest` instead:
 `compute_enabled`, `compute_supported` (cgroup v2 ∧ PSI), and
-`contention_loaded` (`tp_btf` or `raw_tp` attach succeeded). The UI reads
+`contention_loaded` (`tp_btf` attach succeeded; requires kernel BTF). The UI reads
 `node_compute_latest` to render a node's pods without gauges and a tooltip
 that says *why* (feature off vs cgroup v1 vs probe failed), instead of an
 empty bar. A node that has no `node_compute_latest` row at all is "feature
@@ -655,9 +660,10 @@ on the controller measured and recorded in the docs.
 **Changes**
 
 - *controller* — `bpf/sched_contention.bpf.c` per D4; `build.rs` block;
-  `tracked_cgroups` population from the registration channel (same
-  generation discipline as `inode_num`); load guard (`tp_btf` → `raw_tp`
-  fallback → disabled, reported as `contention_loaded=false` in the node sample); map readers in
+  `tracked_cgroups` population from the registration channel (kernfs ids
+  carry their own generation, see D4); load guard (`tp_btf` requires
+  kernel BTF → otherwise disabled, reported as `contention_loaded=false`
+  in the node sample); map readers in
   `compute_sampler.rs`; histogram → quantile fn (unit-tested against the
   overflow case); culprit resolution index; map-occupancy export.
 - *broker* — `pod_contention_history` migration; `runq` / `blame` fields on

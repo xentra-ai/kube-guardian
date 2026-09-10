@@ -55,8 +55,18 @@ type ComputeFinding struct {
 }
 
 // ComputeFindingsResponse is the envelope of GET /compute/findings.
+//
+// Truncated is set when the broker stopped evaluating after its per-request
+// victim budget; VictimsEvaluated says how many it got through, so the
+// operator can narrow with -n/--node. HistoryDisabled means the broker runs
+// with compute history retention off (compute.history.retentionDays = 0),
+// in which case the rule engine has no window to evaluate and Findings is
+// always empty — a configuration state, not "all clear".
 type ComputeFindingsResponse struct {
-	Findings []ComputeFinding `json:"findings"`
+	Findings         []ComputeFinding `json:"findings"`
+	Truncated        bool             `json:"truncated,omitempty"`
+	VictimsEvaluated int              `json:"victims_evaluated,omitempty"`
+	HistoryDisabled  bool             `json:"history_disabled,omitempty"`
 }
 
 // GetComputeFindingsFunc is swappable for tests that bypass HTTP entirely.
