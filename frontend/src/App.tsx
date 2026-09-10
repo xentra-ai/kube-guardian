@@ -1,4 +1,5 @@
-import { useState, useCallback, useEffect, useMemo, useRef, lazy, Suspense } from 'react';
+import { useState, useCallback, useEffect, useMemo, useRef, Suspense } from 'react';
+import { lazyRetry } from './utils/lazyRetry';
 import { Bot, RefreshCw, Share2, ShieldAlert, LayoutDashboard, FileCode, Boxes, Search, Lock } from 'lucide-react';
 import NetworkGraph from './components/NetworkGraph';
 import { FindingsView } from './components/FindingsView';
@@ -19,12 +20,12 @@ import { useCluster } from './contexts/ClusterContext';
 
 // Heavy surfaces — lazy so they stay out of the initial bundle and only load
 // when first opened (the NetworkPolicyEditor alone is ~2k lines).
-const AIAssistant = lazy(() => import('./components/AIAssistant'));
-const AuditVerdictsPanel = lazy(() => import('./components/AuditVerdictsPanel'));
-const PolicyBuilderModal = lazy(() =>
+const AIAssistant = lazyRetry(() => import('./components/AIAssistant'));
+const AuditVerdictsPanel = lazyRetry(() => import('./components/AuditVerdictsPanel'));
+const PolicyBuilderModal = lazyRetry(() =>
   import('./components/PolicyBuilderModal').then((m) => ({ default: m.PolicyBuilderModal })),
 );
-const SeccompProfilesView = lazy(() => import('./components/SeccompProfilesView'));
+const SeccompProfilesView = lazyRetry(() => import('./components/SeccompProfilesView'));
 import { Button } from './components/ui/Button';
 import { EmptyState } from './components/ui/EmptyState';
 import { GraphSkeleton } from './components/ui/Skeleton';
