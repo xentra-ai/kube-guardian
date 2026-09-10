@@ -130,6 +130,23 @@ pub const AUDIT_ROW_COST_BYTES: u64 = 1_024;
 /// manifest costs.
 pub const POD_DETAIL_ROW_COST_BYTES: u64 = 4_096;
 
+/// Peak in-flight heap per compute row (`pod_compute_latest`,
+/// `pod_compute_history`, `pod_contention_history`), in bytes.
+///
+/// In family with [`AUDIT_ROW_COST_BYTES`]: the compute rows are wide
+/// (38-47 columns) but almost entirely numeric — a history row has six
+/// short strings and forty numbers, so its heap footprint is dominated by
+/// the fixed-size struct plus the doubling-transient of the JSON body,
+/// not by per-field allocations. The exceptions are `blame` on the latest
+/// row (a small `serde_json::Value` array, ~10 entries) and `runq_hist`
+/// (24 x i64). ~1 KiB per row covers both.
+///
+/// This is an estimate, not a measurement — the design (D5) calls for
+/// extending `tests/read_memory_profile.rs` before the endpoints ship.
+/// Charged against the endpoints' hard row caps (`compute_api.rs`), so
+/// the reservation is exact for what an endpoint can return.
+pub const COMPUTE_ROW_COST_BYTES: u64 = 1_024;
+
 /// Assumed worst-case pod count for the reservation charged by the
 /// unbounded whole-table endpoints (`/pod/info`, `/pod/list/{node}`).
 ///

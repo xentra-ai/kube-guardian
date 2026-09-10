@@ -122,6 +122,31 @@ sheds_when_budget_exhausted!(
     api::get_audit_verdicts,
     "/audit/verdicts?limit=500"
 );
+sheds_when_budget_exhausted!(
+    compute_latest_sheds,
+    api::get_compute_latest,
+    "/compute/latest?namespace=payments"
+);
+sheds_when_budget_exhausted!(
+    compute_history_sheds,
+    api::get_compute_history,
+    "/compute/history/some-pod-uid?minutes=60"
+);
+sheds_when_budget_exhausted!(
+    compute_contention_sheds,
+    api::get_compute_contention,
+    "/compute/contention?namespace=payments&minutes=5"
+);
+sheds_when_budget_exhausted!(
+    compute_findings_sheds,
+    api::get_compute_findings,
+    "/compute/findings"
+);
+sheds_when_budget_exhausted!(
+    compute_nodes_sheds,
+    api::get_compute_nodes,
+    "/compute/nodes"
+);
 
 /// The complement of the shed tests: with budget available, the request is
 /// admitted and proceeds to the database (which then fails, because there
@@ -192,6 +217,40 @@ async fn bad_input_is_rejected_before_the_budget_is_consulted() {
         budget.get_ref().shed_count(),
         0,
         "a rejected request must not consume or shed budget"
+    );
+}
+
+/// Same property for the compute reads: a missing required filter is a
+/// 400 straight away, not a queued read. `/compute/latest` requires
+/// `namespace`; `/compute/contention` requires `namespace` or `node`.
+#[actix_web::test]
+async fn compute_reads_reject_missing_filters_before_the_budget() {
+    let (budget, _hog) = exhausted_budget().await;
+    let app = test::init_service(
+        App::new()
+            .app_data(web::Data::new(unreachable_pool()))
+            .app_data(budget.clone())
+            .service(api::get_compute_latest)
+            .service(api::get_compute_contention),
+    )
+    .await;
+
+    for uri in [
+        "/compute/latest",
+        "/compute/latest?namespace=",
+        "/compute/contention",
+    ] {
+        let resp = test::call_service(&app, test::TestRequest::get().uri(uri).to_request()).await;
+        assert_eq!(
+            resp.status(),
+            actix_web::http::StatusCode::BAD_REQUEST,
+            "{uri} must 400 on a missing filter even with the budget exhausted"
+        );
+    }
+    assert_eq!(
+        budget.get_ref().shed_count(),
+        0,
+        "rejected requests must not consume or shed budget"
     );
 }
 

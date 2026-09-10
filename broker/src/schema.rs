@@ -143,6 +143,15 @@ diesel::table! {
         node_os -> Varchar,
         time_stamp -> Timestamp,
         policy_enforcement -> Nullable<Varchar>,
+        // Static compute facts (design D10): node capacity for gauge
+        // normalisation and the three facts that decide whether the
+        // compute feature can work on the node. NULL = a controller
+        // that predates the columns. Positional — these stay last.
+        cpu_cores -> Nullable<Int4>,
+        memory_bytes -> Nullable<Int8>,
+        kernel_version -> Nullable<Text>,
+        cgroup_version -> Nullable<Int2>,
+        psi_available -> Nullable<Bool>,
     }
 }
 
@@ -202,6 +211,160 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    // Live compute gauge per container: one row per LIVE container,
+    // upserted on every sample interval by `POST /pod/compute/batch`.
+    // Counters are deltas over `interval_ms`; gauges are instantaneous;
+    // `cpu_usage_millis` is derived at ingest. `blame` is the wire
+    // culprit list stored verbatim as a JSONB array. See
+    // src/compute_api.rs and the migration.
+    pod_compute_latest (container_uid) {
+        container_uid -> Text,
+        pod_uid -> Text,
+        namespace -> Text,
+        pod_name -> Text,
+        container -> Text,
+        node -> Text,
+        cgroup_id -> Int8,
+        ts -> Timestamp,
+        interval_ms -> Int4,
+        cpu_usage_millis -> Double,
+        cpu_quota_usec -> Nullable<Int8>,
+        cpu_period_usec -> Int8,
+        cpu_request_millis -> Nullable<Int8>,
+        cpu_limit_millis -> Nullable<Int8>,
+        cpu_nr_periods -> Int8,
+        cpu_nr_throttled -> Int8,
+        cpu_throttled_usec -> Int8,
+        cpu_psi_some10 -> Double,
+        cpu_psi_full10 -> Double,
+        mem_current -> Int8,
+        mem_working_set -> Int8,
+        mem_limit -> Nullable<Int8>,
+        mem_request -> Nullable<Int8>,
+        mem_psi_some10 -> Double,
+        mem_psi_full10 -> Double,
+        mem_events_high -> Int8,
+        mem_events_max -> Int8,
+        mem_oom_kill -> Int8,
+        mem_refault -> Int8,
+        mem_pgmajfault -> Int8,
+        runq_count -> Nullable<Int8>,
+        runq_p50_us -> Nullable<Int8>,
+        runq_p95_us -> Nullable<Int8>,
+        runq_p99_us -> Nullable<Int8>,
+        runq_max_us -> Nullable<Int8>,
+        runq_overflow -> Nullable<Int8>,
+        blame -> Jsonb,
+        updated_at -> Timestamp,
+    }
+}
+
+diesel::table! {
+    // Per-container compute history: one row per container per minute
+    // (`resolution_secs = 60`, written by the controller) or per five
+    // minutes (`resolution_secs = 300`, produced by the retention.rs
+    // downsample). Gauges carry avg/max/last, counters are sums,
+    // `runq_hist` is the summed 24-bucket run-queue latency histogram.
+    pod_compute_history (id) {
+        id -> Int8,
+        container_uid -> Text,
+        pod_uid -> Text,
+        namespace -> Text,
+        pod_name -> Text,
+        container -> Text,
+        node -> Text,
+        ts -> Timestamp,
+        resolution_secs -> Int4,
+        cpu_usage_millis_avg -> Double,
+        cpu_usage_millis_max -> Double,
+        cpu_usage_millis_last -> Double,
+        cpu_quota_usec -> Nullable<Int8>,
+        cpu_period_usec -> Int8,
+        cpu_request_millis -> Nullable<Int8>,
+        cpu_limit_millis -> Nullable<Int8>,
+        cpu_nr_periods -> Int8,
+        cpu_nr_throttled -> Int8,
+        cpu_throttled_usec -> Int8,
+        cpu_psi_some10_avg -> Double,
+        cpu_psi_some10_max -> Double,
+        cpu_psi_full10_avg -> Double,
+        cpu_psi_full10_max -> Double,
+        mem_current_avg -> Int8,
+        mem_current_max -> Int8,
+        mem_current_last -> Int8,
+        mem_working_set_avg -> Int8,
+        mem_working_set_max -> Int8,
+        mem_working_set_last -> Int8,
+        mem_limit -> Nullable<Int8>,
+        mem_request -> Nullable<Int8>,
+        mem_psi_some10_avg -> Double,
+        mem_psi_some10_max -> Double,
+        mem_psi_full10_avg -> Double,
+        mem_psi_full10_max -> Double,
+        mem_events_high -> Int8,
+        mem_events_max -> Int8,
+        mem_oom_kill -> Int8,
+        mem_refault -> Int8,
+        mem_pgmajfault -> Int8,
+        runq_count -> Nullable<Int8>,
+        runq_p50_us -> Nullable<Int8>,
+        runq_p95_us -> Nullable<Int8>,
+        runq_p99_us -> Nullable<Int8>,
+        runq_max_us -> Nullable<Int8>,
+        runq_overflow -> Nullable<Int8>,
+        runq_hist -> Nullable<Array<Int8>>,
+    }
+}
+
+diesel::table! {
+    // Scheduler-probe blame pairs per minute: (victim container, culprit
+    // cgroup) with the summed preemption count and wait. `culprit_kind`
+    // is pod | system | kernel | unknown; `culprit_container_uid` is set
+    // only for tracked pod culprits. See src/compute.rs (D6).
+    pod_contention_history (id) {
+        id -> Int8,
+        ts -> Timestamp,
+        node -> Text,
+        victim_container_uid -> Text,
+        victim_pod_uid -> Text,
+        victim_namespace -> Text,
+        culprit_cgroup_id -> Int8,
+        culprit_kind -> Text,
+        culprit_ref -> Text,
+        culprit_container_uid -> Nullable<Text>,
+        count -> Int8,
+        wait_ns -> Int8,
+    }
+}
+
+diesel::table! {
+    // One row per node, upserted with every compute sample: the LIVE
+    // half of node state (feature on / supported / probe loaded, node
+    // PSI, context-switch rate, BPF map occupancy, unknown-blame share).
+    // Static facts live on node_facts (D10).
+    node_compute_latest (node) {
+        node -> Text,
+        ts -> Timestamp,
+        interval_ms -> Int4,
+        ctxt_per_sec -> Double,
+        compute_enabled -> Bool,
+        compute_supported -> Bool,
+        contention_loaded -> Bool,
+        cpu_some10 -> Double,
+        cpu_full10 -> Double,
+        mem_some10 -> Double,
+        mem_full10 -> Double,
+        cpu_cores -> Int4,
+        memory_bytes -> Int8,
+        bpf_runq_enqueued -> Int8,
+        bpf_runq_hist -> Int8,
+        bpf_pair -> Int8,
+        unknown_blame_share -> Double,
+        updated_at -> Timestamp,
+    }
+}
+
 diesel::allow_tables_to_appear_in_same_query!(
     pod_details,
     pod_traffic,
@@ -209,4 +372,8 @@ diesel::allow_tables_to_appear_in_same_query!(
     pod_syscalls,
     audit_verdicts,
     node_facts,
+    pod_compute_latest,
+    pod_compute_history,
+    pod_contention_history,
+    node_compute_latest,
 );

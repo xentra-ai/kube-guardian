@@ -281,6 +281,22 @@ pub struct NodeFact {
     /// looked and could not establish it.
     #[serde(default)]
     pub policy_enforcement: Option<String>,
+    /// Static compute facts (design D10). All optional on the wire and
+    /// last in the struct for the same positional-Queryable reason as
+    /// `policy_enforcement`; NULL means a controller that predates them.
+    /// `cpu_cores` / `memory_bytes` normalise a gauge that has neither a
+    /// limit nor a request; `cgroup_version` (1 or 2) and `psi_available`
+    /// decide whether the feature can work on the node at all.
+    #[serde(default)]
+    pub cpu_cores: Option<i32>,
+    #[serde(default)]
+    pub memory_bytes: Option<i64>,
+    #[serde(default)]
+    pub kernel_version: Option<String>,
+    #[serde(default)]
+    pub cgroup_version: Option<i16>,
+    #[serde(default)]
+    pub psi_available: Option<bool>,
 }
 
 /// Serde default for rows arriving without a timestamp (the controller
