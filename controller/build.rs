@@ -31,6 +31,11 @@ fn main() {
     let pkt_drop_out = out_dir.join("netpolicy_drop.skel.rs");
     let tcp_probe_out = out_dir.join("network_probe.skel.rs");
     let sched_contention_out = out_dir.join("sched_contention.skel.rs");
+    // The sched_contention object is also kept on disk (the skeleton
+    // embeds a copy of exactly this file) so
+    // contention::tests::embedded_object_uses_legacy_xadd_atomics can
+    // inspect the instruction encoding.
+    let sched_contention_obj = out_dir.join("sched_contention.bpf.o");
 
     let arch = env::var("CARGO_CFG_TARGET_ARCH")
         .expect("CARGO_CFG_TARGET_ARCH must be set in build script");
@@ -62,11 +67,22 @@ fn main() {
         .build_and_generate(&pkt_drop_out)
         .unwrap();
 
+    // -mcpu=v2 pins the atomics encoding. Recent clang (>= 18 or so)
+    // defaults the BPF target to cpu v3 and lowers __sync_fetch_and_add
+    // to BPF_ATOMIC|BPF_FETCH, which the verifier rejects on kernels
+    // before 5.12 and the arm64 JIT before 5.18. On v2 it lowers to the
+    // legacy BPF_XADD every supported kernel accepts. Only this probe
+    // carries the flag: the other three have the same exposure but are
+    // left as they are here on purpose (contract Deviations, follow-up).
+    // contention::tests::embedded_object_uses_legacy_xadd_atomics fails
+    // the build's test run if a toolchain change undoes this.
     SkeletonBuilder::new()
         .source(SCHED_CONTENTION_SRC)
+        .obj(&sched_contention_obj)
         .clang_args([
             OsStr::new("-I"),
             vmlinux::include_path_root().join(arch).as_os_str(),
+            OsStr::new("-mcpu=v2"),
         ])
         .build_and_generate(&sched_contention_out)
         .unwrap();

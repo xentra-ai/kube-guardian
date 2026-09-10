@@ -3,24 +3,31 @@
 //
 // Design: docs/design/compute-contention-monitoring.md, D4. The shape
 // is Netflix's runq.latency + sched.switch.out split, with the bcc
-// runqlat fix (re-timestamp a preempted `prev`) and the corrections the
-// olga-mir reference needed: typed BPF_PROG() arguments instead of a
-// hand-cast ctx, a sched_wakeup_new hook so forked tasks are not
-// orphaned, a sched_process_exit hook so dead pids are not orphaned,
-// and an overflow bucket that stays an overflow bucket.
+// runqlat fixes (re-timestamp a preempted `prev`; latest wakeup wins)
+// and the corrections the olga-mir reference needed: typed BPF_PROG()
+// arguments instead of a hand-cast ctx, a sched_wakeup_new hook so
+// forked tasks are not orphaned, a sched_process_exit hook so dead pids
+// are not orphaned, and an overflow bucket that stays an overflow
+// bucket.
 //
 // No ring buffer. Everything is aggregated in the maps and read by
 // userspace (controller/src/contention.rs) once per sample interval,
 // which diffs against its previous read. Nothing here is ever zeroed
 // by the kernel side.
 //
-// Two program families carry the same bodies: `tp_btf/` (typed,
-// fastest, needs CONFIG_DEBUG_INFO_BTF) and `raw_tp/` (works on any
-// kernel with raw tracepoints). Userspace autoloads exactly one family;
-// the bodies use only BPF_CORE_READ so they verify under both — in a
-// raw_tp program `prev`/`next` are untrusted pointers and may NOT be
-// dereferenced directly, so do not "simplify" a BPF_CORE_READ into a
-// plain `->` even though the tp_btf verifier would accept it.
+// Programs are `tp_btf/` only. A raw_tp fallback was considered and
+// dropped: every BPF_CORE_READ below is a CO-RE relocation that libbpf
+// resolves against /sys/kernel/btf/vmlinux at load time, so a kernel
+// without BTF cannot load a raw_tp build of this file either — the
+// fallback could never succeed. Userspace checks for vmlinux BTF and
+// reports contention_loaded=false without it.
+//
+// Portability of the atomics: build.rs compiles this file with
+// -mcpu=v2 so `__sync_fetch_and_add` lowers to the legacy BPF_XADD
+// (`lock *(u64 *)(r) += r`) rather than v3's BPF_ATOMIC|BPF_FETCH,
+// which the verifier rejects before 5.12 and the arm64 JIT before 5.18.
+// None of the adds below use the returned value — that is what makes
+// the v2 lowering possible; keep it that way.
 #include "vmlinux.h"
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
@@ -39,6 +46,15 @@ _Static_assert(sizeof(struct pair_value) == 16, "pair_value is 16 bytes on the w
 // culprits are recorded raw, since "starved by kubelet" is a legitimate
 // answer. The value is a flags word written by userspace; the probe
 // tests presence only.
+//
+// No registration generation is folded into this key, unlike inode_num
+// (helper.h KG_GEN_SHIFT). A cgroup v2 id IS kernfs_node.id, which on
+// 64-bit kernels is `ino | (generation << 32)`: the kernfs idr bumps the
+// generation every time an inode number is recycled (kernfs_id_gen /
+// kernfs_gen), so a replacement pod landing on a reused ino still gets
+// a different u64 here and cannot inherit its predecessor's rows. The
+// design doc's "same generation discipline" is therefore satisfied by
+// the key itself.
 struct
 {
     __uint(type, BPF_MAP_TYPE_HASH);
@@ -60,11 +76,16 @@ struct
     __type(value, u64);
 } runq_enqueued SEC(".maps");
 
-// {victim, bucket} -> count. Exact (not LRU): tracked cgroups x 24.
+// {victim, bucket} -> count. Exact (not LRU) so the histogram is never
+// silently eroded: 65536 rows = 2730 tracked cgroups x 24 buckets, ~2 MB.
+// Userspace frees a victim's rows on untrack and sweeps any stragglers
+// on each snapshot. If the map does fill, bpf_map_update_elem fails and
+// the miss is counted in probe_stats so the loss is a visible number
+// rather than a quietly flat histogram.
 struct
 {
     __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 8192);
+    __uint(max_entries, 65536);
     __type(key, struct runq_hist_key);
     __type(value, u64);
 } runq_hist SEC(".maps");
@@ -91,11 +112,43 @@ struct
     __type(value, u64);
 } probe_config SEC(".maps");
 
-// task_struct.state was renamed to __state (and narrowed to unsigned
-// int) in 5.14. Our vmlinux.h predates that, so the new name is reached
-// through a local CO-RE shadow type; bpf_core_field_exists() picks the
-// live one and libbpf leaves the other branch as a poisoned-but-dead
-// instruction the verifier prunes.
+// Update-failure counters, read alongside map occupancy every sample.
+//   [0] runq_hist inserts that failed (map full)
+//   [1] pair inserts that failed (LRU eviction itself never fails; this
+//       only moves when the LRU cannot evict, e.g. all rows hot on the
+//       same CPU)
+#define KG_STAT_HIST_UPDATE_FAILURES 0
+#define KG_STAT_PAIR_UPDATE_FAILURES 1
+#define KG_STAT_COUNT 2
+
+struct
+{
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, KG_STAT_COUNT);
+    __type(key, u32);
+    __type(value, u64);
+} probe_stats SEC(".maps");
+
+static __always_inline void stat_inc(u32 idx)
+{
+    u64 *v = bpf_map_lookup_elem(&probe_stats, &idx);
+    if (v)
+        __sync_fetch_and_add(v, 1);
+}
+
+// task_struct.state was renamed to __state (and narrowed from long to
+// unsigned int) in 5.14. Both spellings are reached through local CO-RE
+// shadow types rather than through whatever the bundled vmlinux.h
+// happens to call the field, so this compiles and relocates the same
+// way whichever vmlinux.h generation is checked in.
+// bpf_core_field_exists() resolves to a constant at load time; libbpf
+// leaves the other branch as a poisoned-but-dead instruction that the
+// verifier prunes.
+struct task_struct___pre_5_14
+{
+    volatile long state;
+} __attribute__((preserve_access_index));
+
 struct task_struct___post_5_14
 {
     unsigned int __state;
@@ -106,7 +159,19 @@ static __always_inline u32 task_state(struct task_struct *t)
     struct task_struct___post_5_14 *tn = (void *)t;
     if (bpf_core_field_exists(tn->__state))
         return BPF_CORE_READ(tn, __state);
-    return (u32)BPF_CORE_READ(t, state);
+
+    struct task_struct___pre_5_14 *to = (void *)t;
+    return (u32)BPF_CORE_READ(to, state);
+}
+
+// True when the task is currently executing on a CPU. `on_cpu` exists
+// only under CONFIG_SMP; on a UP kernel nothing can be woken while it
+// runs in the sense that matters here, so the answer is "no".
+static __always_inline bool task_on_cpu(struct task_struct *t)
+{
+    if (!bpf_core_field_exists(t->on_cpu))
+        return false;
+    return BPF_CORE_READ(t, on_cpu) != 0;
 }
 
 // cgroup v2 id via the probe-read path: task->cgroups->dfl_cgrp->kn->id.
@@ -145,8 +210,10 @@ static __always_inline u32 log2_u64(u64 v)
     return r;
 }
 
-// Latency (ns) -> histogram bucket. Sub-microsecond latencies land in
-// bucket 0 (only reachable when config[0] < 1000); anything >= 2^23 us
+// Latency (ns) -> histogram bucket. Bucket b covers [2^b, 2^(b+1)) us;
+// a sub-microsecond latency (lat_us == 0) is folded into bucket 0, which
+// is only reachable when probe_config[0] is below 1000 ns — at the
+// default 100 us floor bucket 0 is never written. Anything >= 2^23 us
 // lands in the overflow bucket.
 static __always_inline u32 runq_bucket(u64 lat_ns)
 {
@@ -159,31 +226,64 @@ static __always_inline u32 runq_bucket(u64 lat_ns)
     return b;
 }
 
-// Shared body: sched_wakeup / sched_wakeup_new. BPF_NOEXIST keeps the
-// OLDEST timestamp if the task is already waiting (woken again while
-// still on the queue), which is the latency the task actually saw.
+// Shared body: sched_wakeup / sched_wakeup_new.
+//
+// What the tracepoint actually means, from kernel/sched/core.c:
+//
+//  - A task that is already runnable and WAITING (on the rq, not on a
+//    CPU) never gets a second sched_wakeup: ttwu_state_match() rejects a
+//    target whose state is already TASK_RUNNING. So there is no
+//    "woken again while queued" case to protect a timestamp against.
+//
+//  - A task that is RUNNING on a CPU does get sched_wakeup: it has set
+//    TASK_INTERRUPTIBLE ahead of schedule() and a wakeup landed in the
+//    window (ttwu_runnable() -> ttwu_do_wakeup() whenever
+//    task_on_rq_queued(); also the p == current self-wake path). It
+//    then carries on running, never switches in, and an entry stamped
+//    now would be popped by its NEXT switch-in — after it has run,
+//    blocked for real and been woken again — charging the run and the
+//    sleep to run-queue latency. With a keep-oldest policy that stale
+//    stamp also survived the genuine wakeup, and the result was a
+//    phantom multi-second p99 in the victim's histogram and a bogus
+//    pair. Hence: ignore wakeups of an on-CPU task, and let the latest
+//    wakeup win (BPF_ANY, bcc runqlat semantics).
+//
+// Not measured, same as bcc: wake-list IPI latency. sched_wakeup fires
+// on the CPU that finally enqueues the task (ttwu_do_activate), so time
+// spent queued on another CPU's wake_list before that is invisible
+// here. It is normally a few microseconds and not a neighbour effect.
 static __always_inline int handle_wakeup(struct task_struct *p)
 {
     u32 pid = BPF_CORE_READ(p, pid);
     if (pid == 0)
         return 0;
+    if (task_on_cpu(p))
+        return 0;
 
     u64 ts = bpf_ktime_get_ns();
-    bpf_map_update_elem(&runq_enqueued, &pid, &ts, BPF_NOEXIST);
+    bpf_map_update_elem(&runq_enqueued, &pid, &ts, BPF_ANY);
     return 0;
 }
 
 // Shared body: sched_switch.
-static __always_inline int handle_switch(struct task_struct *prev, struct task_struct *next)
+static __always_inline int handle_switch(bool preempt, struct task_struct *prev,
+                                         struct task_struct *next)
 {
     u64 now = bpf_ktime_get_ns();
 
-    // A prev that is still TASK_RUNNING was preempted, not blocked: it
-    // goes straight back on the run queue and its wait starts now.
-    // This is the noisy-neighbour case and the line Netflix's published
-    // snippet omits (bcc runqlat has it).
+    // A prev that stays on the run queue was not blocked: its wait
+    // starts now. Two ways that happens, both from __schedule():
+    //   - prev is still TASK_RUNNING: ordinary preemption (tick, wakeup
+    //     preemption) — the bcc runqlat check;
+    //   - `preempt` is set: prev was preempted between
+    //     set_current_state(!RUNNING) and schedule(), so its state is
+    //     not RUNNING yet __schedule() skipped deactivate_task() and it
+    //     is still queued. A state-only check misses exactly this case.
+    // Preemption IS the noisy-neighbour mechanism, so both count. The
+    // `preempt` flag is the tracepoint's first argument on every kernel
+    // this probe supports.
     u32 prev_pid = BPF_CORE_READ(prev, pid);
-    if (prev_pid != 0 && task_state(prev) == TASK_RUNNING)
+    if (prev_pid != 0 && (preempt || task_state(prev) == TASK_RUNNING))
         bpf_map_update_elem(&runq_enqueued, &prev_pid, &now, BPF_ANY);
 
     u32 next_pid = BPF_CORE_READ(next, pid);
@@ -229,6 +329,8 @@ static __always_inline int handle_switch(struct task_struct *prev, struct task_s
     }
     if (cnt)
         __sync_fetch_and_add(cnt, 1);
+    else
+        stat_inc(KG_STAT_HIST_UPDATE_FAILURES);
 
     // Culprit: whoever had the CPU. Idle (pid 0) and kernel threads are
     // 0, which userspace classifies as `kernel`.
@@ -252,6 +354,8 @@ static __always_inline int handle_switch(struct task_struct *prev, struct task_s
         __sync_fetch_and_add(&pv->count, 1);
         __sync_fetch_and_add(&pv->wait_ns, lat);
     }
+    else
+        stat_inc(KG_STAT_PAIR_UPDATE_FAILURES);
 
     return 0;
 }
@@ -269,14 +373,16 @@ static __always_inline int handle_exit(struct task_struct *p)
     return 0;
 }
 
-// ---- tp_btf family -------------------------------------------------
+// ---- tp_btf programs -----------------------------------------------
 //
 // Argument lists mirror the tracepoint prototypes in
-// include/trace/events/sched.h. sched_switch grew a fourth `prev_state`
-// argument in 5.18; it is deliberately NOT declared here because a
-// tp_btf program that names more arguments than the kernel's tracepoint
-// has fails verification on older kernels. prev's state is read off the
-// task instead (bcc runqlat does the same).
+// include/trace/events/sched.h, truncated to what every supported
+// kernel has. A tp_btf program that names MORE arguments than the
+// running kernel's tracepoint carries fails verification, so:
+//   - sched_switch grew a 4th `unsigned int prev_state` in 5.18: not
+//     declared; prev's state is read off the task instead.
+//   - sched_process_exit grew a 2nd `bool group_dead` in 6.16: never
+//     declare it.
 
 SEC("tp_btf/sched_wakeup")
 int BPF_PROG(tp_btf_sched_wakeup, struct task_struct *p)
@@ -293,39 +399,11 @@ int BPF_PROG(tp_btf_sched_wakeup_new, struct task_struct *p)
 SEC("tp_btf/sched_switch")
 int BPF_PROG(tp_btf_sched_switch, bool preempt, struct task_struct *prev, struct task_struct *next)
 {
-    return handle_switch(prev, next);
+    return handle_switch(preempt, prev, next);
 }
 
 SEC("tp_btf/sched_process_exit")
 int BPF_PROG(tp_btf_sched_process_exit, struct task_struct *p)
-{
-    return handle_exit(p);
-}
-
-// ---- raw_tp family -------------------------------------------------
-//
-// Same bodies. libbpf auto-attaches SEC("raw_tp/<name>") by name.
-
-SEC("raw_tp/sched_wakeup")
-int BPF_PROG(raw_tp_sched_wakeup, struct task_struct *p)
-{
-    return handle_wakeup(p);
-}
-
-SEC("raw_tp/sched_wakeup_new")
-int BPF_PROG(raw_tp_sched_wakeup_new, struct task_struct *p)
-{
-    return handle_wakeup(p);
-}
-
-SEC("raw_tp/sched_switch")
-int BPF_PROG(raw_tp_sched_switch, bool preempt, struct task_struct *prev, struct task_struct *next)
-{
-    return handle_switch(prev, next);
-}
-
-SEC("raw_tp/sched_process_exit")
-int BPF_PROG(raw_tp_sched_process_exit, struct task_struct *p)
 {
     return handle_exit(p);
 }

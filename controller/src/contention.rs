@@ -14,12 +14,13 @@
 //! `quantiles_from_hist` — the names and shapes are pinned by the
 //! compute-contention contract; keep them stable.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::mem::MaybeUninit;
 use std::path::Path;
 
 use libbpf_rs::skel::{OpenSkel, Skel, SkelBuilder};
-use libbpf_rs::{MapCore, MapFlags, OpenObject};
+use libbpf_rs::{MapCore, MapFlags, MapMut, OpenObject};
+use std::os::fd::{AsFd, AsRawFd};
 use tracing::{info, warn};
 
 use crate::Error;
@@ -28,9 +29,7 @@ pub mod sched_contention_skel {
     include!(concat!(env!("OUT_DIR"), "/sched_contention.skel.rs"));
 }
 
-use sched_contention_skel::{
-    OpenSchedContentionSkel, SchedContentionSkel, SchedContentionSkelBuilder,
-};
+use sched_contention_skel::{SchedContentionSkel, SchedContentionSkelBuilder};
 
 /// Number of histogram buckets. Bucket `b` covers `[2^b, 2^(b+1))` µs;
 /// bucket 23 is the overflow bucket (`>= 2^23` µs ≈ 8.4 s).
@@ -69,13 +68,19 @@ pub struct PairDelta {
     pub wait_ns: u64,
 }
 
-/// Live key counts of the kernel maps. Exported per node so a leak is a
-/// number on a dashboard rather than a phantom p99.
+/// Live key counts of the kernel maps plus cumulative insert failures.
+/// Exported per node so a leak or a full map is a number on a dashboard
+/// rather than a phantom p99 or a quietly flat histogram.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MapOccupancy {
     pub runq_enqueued: u64,
     pub runq_hist: u64,
     pub pair: u64,
+    /// `runq_hist` inserts the probe could not make (map full). Cumulative
+    /// since load; any increase means histogram samples were lost.
+    pub hist_update_failures: u64,
+    /// `pair` inserts the probe could not make. Cumulative since load.
+    pub pair_update_failures: u64,
 }
 
 /// Quantiles derived from a 24-bucket log2 histogram. See
@@ -93,30 +98,35 @@ pub struct RunqQuantiles {
     pub overflow: u64,
 }
 
-/// Which tracepoint program family is attached.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AttachFamily {
-    /// `tp_btf/*`: typed arguments, fastest; needs vmlinux BTF.
-    TpBtf,
-    /// `raw_tp/*`: untyped raw tracepoints; the fallback.
-    RawTp,
-}
-
 type HistKey = (u64, u32);
 type PairKey = (u64, u64);
 type PairCounters = (u64, u64);
 
 pub struct ContentionProbe {
     skel: SchedContentionSkel<'static>,
-    family: AttachFamily,
     prev_hist: HashMap<HistKey, u64>,
     prev_pair: HashMap<PairKey, PairCounters>,
+    /// False once the kernel has refused `BPF_MAP_LOOKUP_BATCH` (pre-5.6
+    /// or batch ops disabled); the per-key path is used from then on.
+    batch_supported: bool,
+    /// Snapshots taken so far; drives the every-12th `runq_enqueued`
+    /// count on the per-key fallback path.
+    ticks: u64,
+    /// Last `runq_enqueued` count, re-reported between recounts.
+    last_runq_enqueued: u64,
 }
+
+/// On the per-key fallback path `runq_enqueued` (up to 65536 keys, one
+/// `get_next_key` syscall each) is only recounted every this many
+/// snapshots; the previous count is reported in between. 12 ticks at the
+/// default 5 s interval is once a minute.
+const RUNQ_ENQUEUED_RECOUNT_EVERY: u64 = 12;
+
+const VMLINUX_BTF: &str = "/sys/kernel/btf/vmlinux";
 
 impl std::fmt::Debug for ContentionProbe {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ContentionProbe")
-            .field("family", &self.family)
             .field("prev_hist_keys", &self.prev_hist.len())
             .field("prev_pair_keys", &self.prev_pair.len())
             .finish()
@@ -124,60 +134,53 @@ impl std::fmt::Debug for ContentionProbe {
 }
 
 impl ContentionProbe {
-    /// Open, load and attach the probe. Tries the `tp_btf` family first
-    /// (when `/sys/kernel/btf/vmlinux` exists), then `raw_tp`. `Err`
-    /// means neither family attached; the caller records
-    /// `contention_loaded=false` and carries on without blame data.
+    /// Open, load and attach the probe.
     ///
-    /// `min_runq_latency_us` is written to `probe_config[0]` (in ns) between
-    /// load and attach, so no event is ever evaluated against a zero.
+    /// Requires `/sys/kernel/btf/vmlinux`: the programs are `tp_btf` and
+    /// every field read is a CO-RE relocation, both of which libbpf
+    /// resolves against vmlinux BTF. (A `raw_tp` build would need the
+    /// same BTF for its relocations, so there is no fallback that could
+    /// work without it.) `Err` means the probe is not running; the caller
+    /// records `contention_loaded=false` and carries on without blame
+    /// data.
+    ///
+    /// `min_runq_latency_us` is written to `probe_config[0]` (in ns)
+    /// between load and attach, so no event is ever evaluated against a
+    /// zero.
     pub fn load(min_runq_latency_us: u64) -> Result<Self, Error> {
+        if !Path::new(VMLINUX_BTF).exists() {
+            return Err(Error::Custom(format!(
+                "sched_contention probe needs kernel BTF ({VMLINUX_BTF} missing; kernel built \
+                 without CONFIG_DEBUG_INFO_BTF); contention monitoring disabled"
+            )));
+        }
         let min_ns = min_runq_latency_us.saturating_mul(1_000);
-        let mut attempts: Vec<(AttachFamily, libbpf_rs::Error)> = Vec::new();
-
-        if Path::new("/sys/kernel/btf/vmlinux").exists() {
-            match open_load_attach(AttachFamily::TpBtf, min_ns) {
-                Ok(skel) => return Ok(Self::new(skel, AttachFamily::TpBtf)),
-                Err(e) => {
-                    warn!("sched_contention tp_btf programs failed to load ({e}); trying raw_tp");
-                    attempts.push((AttachFamily::TpBtf, e));
-                }
-            }
-        } else {
-            warn!("/sys/kernel/btf/vmlinux missing; sched_contention will use raw_tp programs");
-        }
-
-        match open_load_attach(AttachFamily::RawTp, min_ns) {
-            Ok(skel) => Ok(Self::new(skel, AttachFamily::RawTp)),
-            Err(e) => {
-                attempts.push((AttachFamily::RawTp, e));
-                let detail = attempts
-                    .iter()
-                    .map(|(f, e)| format!("{f:?}: {e}"))
-                    .collect::<Vec<_>>()
-                    .join("; ");
-                Err(Error::Custom(format!(
-                    "sched_contention probe could not be attached ({detail})"
-                )))
-            }
-        }
-    }
-
-    fn new(skel: SchedContentionSkel<'static>, family: AttachFamily) -> Self {
-        info!("sched_contention probe attached via {family:?}");
-        Self {
+        let skel = open_load_attach(min_ns).map_err(|e| {
+            Error::Custom(format!("sched_contention probe could not be attached: {e}"))
+        })?;
+        info!(
+            "sched_contention probe attached (tp_btf, min runq latency {min_runq_latency_us} us)"
+        );
+        Ok(Self {
             skel,
-            family,
             prev_hist: HashMap::new(),
             prev_pair: HashMap::new(),
-        }
-    }
-
-    pub fn family(&self) -> AttachFamily {
-        self.family
+            batch_supported: true,
+            ticks: 0,
+            last_runq_enqueued: 0,
+        })
     }
 
     /// Start recording `cgroup_id` as a victim.
+    ///
+    /// The value is a bare presence flag, not a generation-bearing flags
+    /// word like `inode_num`'s. That is safe here because a cgroup v2 id
+    /// is `kernfs_node.id`, which on 64-bit kernels is
+    /// `ino | (generation << 32)` and the kernfs idr bumps the generation
+    /// each time an inode number is recycled — a replacement pod that
+    /// lands on a reused ino gets a different u64 and cannot inherit the
+    /// old pod's histogram or pair rows. The key carries the generation;
+    /// nothing has to be folded in.
     pub fn track(&self, cgroup_id: u64) -> Result<(), Error> {
         self.skel
             .maps
@@ -229,50 +232,89 @@ impl ContentionProbe {
     ///
     /// The first call after `load` reports everything recorded so far as
     /// a delta, which is correct: nothing was reported before.
+    ///
+    /// Cost: with `BPF_MAP_LOOKUP_BATCH` (kernel ≥ 5.6) each map is read
+    /// in one or two syscalls — keys and values together, sized to the
+    /// map's `max_entries` so a hash bucket can never overflow the batch.
+    /// On kernels without batch ops it falls back to `get_next_key` +
+    /// `lookup` per key (≤ 2 syscalls × live rows of `runq_hist` and
+    /// `pair`) and only recounts `runq_enqueued` every
+    /// [`RUNQ_ENQUEUED_RECOUNT_EVERY`] snapshots, reporting the previous
+    /// count in between. The fallback is detected once and remembered.
     pub fn snapshot(&mut self) -> Result<ContentionSnapshot, Error> {
+        self.ticks = self.ticks.wrapping_add(1);
         let maps = &self.skel.maps;
 
         let mut cur_hist: HashMap<HistKey, u64> = HashMap::new();
-        for key in maps.runq_hist.keys() {
-            let Some((cgroup_id, bucket)) = hist_key_from_bytes(&key) else {
+        for (key, value) in read_map(&mut self.batch_supported, &maps.runq_hist)? {
+            let (Some(k), Some(count)) = (hist_key_from_bytes(&key), u64_from_bytes(&value)) else {
                 continue;
             };
-            let Some(value) = maps
-                .runq_hist
-                .lookup(&key, MapFlags::ANY)
-                .map_err(|e| Error::Custom(format!("runq_hist lookup: {e}")))?
-            else {
-                continue; // deleted between keys() and lookup()
-            };
-            let Some(count) = u64_from_bytes(&value) else {
-                continue;
-            };
-            cur_hist.insert((cgroup_id, bucket), count);
+            cur_hist.insert(k, count);
+        }
+
+        // Orphan sweep. untrack() deletes a victim's 24 rows, but an
+        // event that passed the in-kernel tracked check just before the
+        // key went away can still insert a row afterwards. Rows whose
+        // victim is no longer in tracked_cgroups are deleted here and
+        // kept out of the snapshot. tracked_cgroups is read AFTER
+        // runq_hist so a cgroup tracked between the two reads (whose
+        // first rows may already be in cur_hist) is seen as tracked.
+        let tracked: HashSet<u64> = read_map(&mut self.batch_supported, &maps.tracked_cgroups)?
+            .into_iter()
+            .filter_map(|(k, _)| u64_from_bytes(&k))
+            .collect();
+        let orphans: Vec<HistKey> = cur_hist
+            .keys()
+            .filter(|(cg, _)| !tracked.contains(cg))
+            .copied()
+            .collect();
+        for (cg, bucket) in orphans {
+            cur_hist.remove(&(cg, bucket));
+            match maps.runq_hist.delete(&hist_key_to_bytes(cg, bucket)) {
+                Ok(()) | Err(_) => {} // already gone is fine; a failure is retried next tick
+            }
         }
 
         let mut cur_pair: HashMap<PairKey, PairCounters> = HashMap::new();
-        for key in maps.pair.keys() {
-            let Some(pk) = pair_key_from_bytes(&key) else {
-                continue;
-            };
-            let Some(value) = maps
-                .pair
-                .lookup(&key, MapFlags::ANY)
-                .map_err(|e| Error::Custom(format!("pair lookup: {e}")))?
+        for (key, value) in read_map(&mut self.batch_supported, &maps.pair)? {
+            let (Some(k), Some(v)) = (pair_key_from_bytes(&key), pair_value_from_bytes(&value))
             else {
                 continue;
             };
-            let Some(pv) = pair_value_from_bytes(&value) else {
-                continue;
-            };
-            cur_pair.insert(pk, pv);
+            cur_pair.insert(k, v);
         }
 
-        let runq_enqueued = maps.runq_enqueued.keys().count() as u64;
+        let runq_enqueued = if self.batch_supported {
+            match lookup_batch(&maps.runq_enqueued)? {
+                Some(rows) => rows.len() as u64,
+                None => {
+                    self.batch_supported = false;
+                    maps.runq_enqueued.keys().count() as u64
+                }
+            }
+        } else if self.ticks % RUNQ_ENQUEUED_RECOUNT_EVERY == 1 {
+            maps.runq_enqueued.keys().count() as u64
+        } else {
+            self.last_runq_enqueued
+        };
+        self.last_runq_enqueued = runq_enqueued;
+
+        let stat = |idx: u32| -> Result<u64, Error> {
+            Ok(maps
+                .probe_stats
+                .lookup(&idx.to_ne_bytes(), MapFlags::ANY)
+                .map_err(|e| Error::Custom(format!("probe_stats lookup {idx}: {e}")))?
+                .as_deref()
+                .and_then(u64_from_bytes)
+                .unwrap_or(0))
+        };
         let occupancy = MapOccupancy {
             runq_enqueued,
             runq_hist: cur_hist.len() as u64,
             pair: cur_pair.len() as u64,
+            hist_update_failures: stat(STAT_HIST_UPDATE_FAILURES)?,
+            pair_update_failures: stat(STAT_PAIR_UPDATE_FAILURES)?,
         };
 
         let mut snapshot = compute_deltas(&self.prev_hist, &cur_hist, &self.prev_pair, &cur_pair);
@@ -284,41 +326,153 @@ impl ContentionProbe {
     }
 }
 
-/// Open the skeleton with exactly one program family autoloaded, load,
-/// write `config[0]`, attach.
+/// All (key, value) rows of `map`: batched when the kernel allows,
+/// per-key otherwise. Flips `batch_supported` off on the first refusal.
+/// A free function over the one flag (not a method) so `snapshot()` can
+/// hold `&self.skel.maps` across the call.
+fn read_map(
+    batch_supported: &mut bool,
+    map: &MapMut<'_>,
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>, Error> {
+    if *batch_supported {
+        match lookup_batch(map)? {
+            Some(rows) => return Ok(rows),
+            None => {
+                warn!(
+                    "kernel refused BPF_MAP_LOOKUP_BATCH on {:?}; sched_contention falls back \
+                     to per-key map reads",
+                    map.name()
+                );
+                *batch_supported = false;
+            }
+        }
+    }
+    read_map_per_key(map)
+}
+
+/// Indices into the `probe_stats` array; mirror KG_STAT_* in
+/// sched_contention.bpf.c.
+const STAT_HIST_UPDATE_FAILURES: u32 = 0;
+const STAT_PAIR_UPDATE_FAILURES: u32 = 1;
+
+/// `ENOTSUPP` is a kernel-internal errno (not in libc) that the generic
+/// map code returns when a map type has no batch op.
+const ENOTSUPP: i32 = 524;
+
+/// Read a whole map with `bpf_map_lookup_batch`.
+///
+/// `Ok(None)` means the kernel does not support batch lookup on this map
+/// (pre-5.6, or a map type without a batch op) — the caller must fall
+/// back to per-key reads. Any other failure is an error.
+///
+/// The batch is sized to `max_entries`, so the kernel can never hit the
+/// "bucket larger than batch" `ENOSPC` case that otherwise forces a
+/// retry, and a whole map comes back in one call followed by the
+/// terminating `ENOENT`. libbpf-rs's own `BatchedMapIter` is not used
+/// because it swallows every error other than ENOENT/EINTR by ending the
+/// iteration early, which would make an unsupported kernel look exactly
+/// like an empty map and turn the next snapshot's deltas into garbage.
+fn lookup_batch(map: &MapMut<'_>) -> Result<Option<Vec<(Vec<u8>, Vec<u8>)>>, Error> {
+    let key_size = map.key_size() as usize;
+    let value_size = map.value_size() as usize;
+    let batch = map.max_entries().max(1);
+    let mut keys = vec![0u8; key_size * batch as usize];
+    let mut values = vec![0u8; value_size * batch as usize];
+    let mut in_batch = vec![0u8; key_size];
+    let mut out_batch = vec![0u8; key_size];
+    let opts = libbpf_sys::bpf_map_batch_opts {
+        sz: std::mem::size_of::<libbpf_sys::bpf_map_batch_opts>() as libbpf_sys::size_t,
+        elem_flags: 0,
+        flags: 0,
+    };
+
+    let mut rows = Vec::new();
+    let mut first = true;
+    loop {
+        let mut count: u32 = batch;
+        // SAFETY: every pointer is to a live, correctly sized Vec for the
+        // duration of the call; `count` is in/out and bounded by the
+        // buffer sizes; `opts.sz` is set so libbpf validates the struct.
+        let ret = unsafe {
+            libbpf_sys::bpf_map_lookup_batch(
+                map.as_fd().as_raw_fd(),
+                if first {
+                    std::ptr::null_mut()
+                } else {
+                    in_batch.as_mut_ptr().cast()
+                },
+                out_batch.as_mut_ptr().cast(),
+                keys.as_mut_ptr().cast(),
+                values.as_mut_ptr().cast(),
+                &mut count,
+                &opts,
+            )
+        };
+        let errno = if ret < 0 { -ret } else { 0 };
+        match errno {
+            0 | libc::ENOENT => {}
+            libc::EINTR => continue,
+            libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP | ENOTSUPP
+                if first && rows.is_empty() =>
+            {
+                return Ok(None);
+            }
+            e => {
+                return Err(Error::Custom(format!(
+                    "bpf_map_lookup_batch on {:?}: {}",
+                    map.name(),
+                    std::io::Error::from_raw_os_error(e)
+                )));
+            }
+        }
+
+        let count = (count as usize).min(batch as usize);
+        for i in 0..count {
+            rows.push((
+                keys[i * key_size..(i + 1) * key_size].to_vec(),
+                values[i * value_size..(i + 1) * value_size].to_vec(),
+            ));
+        }
+
+        if errno == libc::ENOENT {
+            return Ok(Some(rows));
+        }
+        first = false;
+        in_batch.copy_from_slice(&out_batch);
+    }
+}
+
+/// Per-key fallback: `get_next_key` walk plus one `lookup` per key. A key
+/// that disappears between the two calls is skipped.
+fn read_map_per_key(map: &MapMut<'_>) -> Result<Vec<(Vec<u8>, Vec<u8>)>, Error> {
+    let mut rows = Vec::new();
+    for key in map.keys() {
+        if let Some(value) = map
+            .lookup(&key, MapFlags::ANY)
+            .map_err(|e| Error::Custom(format!("{:?} lookup: {e}", map.name())))?
+        {
+            rows.push((key, value));
+        }
+    }
+    Ok(rows)
+}
+
+/// Open the skeleton, load, write `probe_config[0]`, attach.
 ///
 /// The skeleton borrows its `OpenObject` storage for its whole life, so
 /// storing it in a struct needs a `'static` borrow; the storage (one
 /// pointer-sized `MaybeUninit`) is `Box::leak`ed. The probe is a
 /// once-per-process singleton, and a failed attempt leaks the same 8
 /// bytes, once — the object itself is still dropped and closed.
-fn open_load_attach(
-    family: AttachFamily,
-    min_ns: u64,
-) -> Result<SchedContentionSkel<'static>, libbpf_rs::Error> {
+fn open_load_attach(min_ns: u64) -> Result<SchedContentionSkel<'static>, libbpf_rs::Error> {
     let storage: &'static mut MaybeUninit<OpenObject> = Box::leak(Box::new(MaybeUninit::uninit()));
-    let mut open = SchedContentionSkelBuilder::default().open(storage)?;
-    select_family(&mut open, family);
-
+    let open = SchedContentionSkelBuilder::default().open(storage)?;
     let mut skel = open.load()?;
     skel.maps
         .probe_config
         .update(&0u32.to_ne_bytes(), &min_ns.to_ne_bytes(), MapFlags::ANY)?;
     skel.attach()?;
     Ok(skel)
-}
-
-fn select_family(open: &mut OpenSchedContentionSkel<'_>, family: AttachFamily) {
-    let progs = &mut open.progs;
-    let tp_btf = family == AttachFamily::TpBtf;
-    progs.tp_btf_sched_wakeup.set_autoload(tp_btf);
-    progs.tp_btf_sched_wakeup_new.set_autoload(tp_btf);
-    progs.tp_btf_sched_switch.set_autoload(tp_btf);
-    progs.tp_btf_sched_process_exit.set_autoload(tp_btf);
-    progs.raw_tp_sched_wakeup.set_autoload(!tp_btf);
-    progs.raw_tp_sched_wakeup_new.set_autoload(!tp_btf);
-    progs.raw_tp_sched_switch.set_autoload(!tp_btf);
-    progs.raw_tp_sched_process_exit.set_autoload(!tp_btf);
 }
 
 /// Delta of one cumulative counter.
@@ -668,9 +822,77 @@ mod tests {
         assert_eq!(pair_value_from_bytes(&pk), Some((7, 9)));
     }
 
+    /// Toolchain guard for build.rs's `-mcpu=v2`.
+    ///
+    /// Scans every executable section of the built ELF object for
+    /// BPF_ATOMIC instructions (opcode class STX|ATOMIC, 0xdb for 64-bit
+    /// and 0xc3 for 32-bit). The legacy BPF_XADD encoding has imm ==
+    /// BPF_ADD (0x00); the cpu-v3 fetch forms set BPF_FETCH (0x01) in imm
+    /// and are rejected by verifiers before 5.12 and the arm64 JIT before
+    /// 5.18. A clang that ignores or loses the flag fails here rather
+    /// than on a customer's node.
+    #[test]
+    fn embedded_object_uses_legacy_xadd_atomics() {
+        // build.rs writes the object the skeleton embeds to this path.
+        let obj: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sched_contention.bpf.o"));
+        let (atomics, fetch) = scan_bpf_atomics(obj);
+        assert!(
+            atomics > 0,
+            "expected __sync_fetch_and_add sites in the object"
+        );
+        assert_eq!(
+            fetch, 0,
+            "{fetch} BPF_ATOMIC|BPF_FETCH instruction(s) found; build.rs must pass -mcpu=v2"
+        );
+    }
+
+    /// Minimal ELF64-LE walk: returns (atomic insns, atomic insns with
+    /// BPF_FETCH) over all SHF_EXECINSTR sections.
+    fn scan_bpf_atomics(elf: &[u8]) -> (usize, usize) {
+        let u16_at = |o: usize| u16::from_le_bytes(elf[o..o + 2].try_into().unwrap());
+        let u32_at = |o: usize| u32::from_le_bytes(elf[o..o + 4].try_into().unwrap());
+        let u64_at = |o: usize| u64::from_le_bytes(elf[o..o + 8].try_into().unwrap());
+        assert_eq!(&elf[..4], b"\x7fELF", "not an ELF object");
+        assert_eq!(elf[4], 2, "expected ELF64");
+        assert_eq!(elf[5], 1, "scanner handles little-endian BPF objects only");
+
+        let shoff = u64_at(0x28) as usize;
+        let shentsize = u16_at(0x3a) as usize;
+        let shnum = u16_at(0x3c) as usize;
+        const SHF_EXECINSTR: u64 = 0x4;
+        const BPF_LD_IMM64: u8 = 0x18;
+        const BPF_ATOMIC_DW: u8 = 0xdb;
+        const BPF_ATOMIC_W: u8 = 0xc3;
+        const BPF_FETCH: u32 = 0x01;
+
+        let (mut atomics, mut fetch) = (0usize, 0usize);
+        for i in 0..shnum {
+            let sh = shoff + i * shentsize;
+            let flags = u64_at(sh + 8);
+            if flags & SHF_EXECINSTR == 0 {
+                continue;
+            }
+            let off = u64_at(sh + 24) as usize;
+            let size = u64_at(sh + 32) as usize;
+            let code = &elf[off..off + size];
+            let mut pc = 0;
+            while pc + 8 <= code.len() {
+                let op = code[pc];
+                if op == BPF_ATOMIC_DW || op == BPF_ATOMIC_W {
+                    atomics += 1;
+                    let imm = u32::from_le_bytes(code[pc + 4..pc + 8].try_into().unwrap());
+                    if imm & BPF_FETCH != 0 {
+                        fetch += 1;
+                    }
+                }
+                pc += if op == BPF_LD_IMM64 { 16 } else { 8 };
+            }
+        }
+        (atomics, fetch)
+    }
+
     /// Loads the real probe into the running kernel. Needs CAP_BPF +
-    /// CAP_PERFMON (in practice root) and a kernel with raw tracepoints;
-    /// `tp_btf` additionally needs /sys/kernel/btf/vmlinux. Run on a
+    /// CAP_PERFMON (in practice root) and /sys/kernel/btf/vmlinux. Run on a
     /// node or a privileged dev box with:
     ///
     /// ```text
@@ -681,14 +903,12 @@ mod tests {
     ///
     /// (or `sudo -E cargo test contention -- --ignored` when sudo keeps
     /// the cargo environment). The assertion is deliberately weak: it
-    /// proves the verifier accepts both the program bodies and whichever
-    /// family this kernel offers, and that the map codecs agree with the
-    /// C layouts. It does not assert on latency values.
+    /// proves the verifier accepts the programs on this kernel and that
+    /// the map codecs agree with the C layouts. It does not assert on latency values.
     #[test]
     #[ignore = "loads BPF into the running kernel; needs root / CAP_BPF"]
     fn probe_loads_and_snapshots() {
         let mut probe = ContentionProbe::load(100).expect("probe loads and attaches");
-        eprintln!("attached via {:?}", probe.family());
         let cgroup_id = 0xffff_ffff_0000_0001u64;
         probe.track(cgroup_id).expect("track");
         std::thread::sleep(std::time::Duration::from_millis(200));
