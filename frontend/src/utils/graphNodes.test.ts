@@ -138,3 +138,19 @@ describe('keepOnMap (Traffic filter)', () => {
     expect(keepOnMap({ id: 'v', traffic: [] }, true, new Set(['v']), gauges)).toBe(true);
   });
 });
+
+import { mergeLayoutIntent } from './graphNodes';
+
+describe('mergeLayoutIntent (a layout still in flight)', () => {
+  test('an unconsumed refit survives a gauge tick that arrives before ELK lands', () => {
+    expect(mergeLayoutIntent({ kind: 'refit' }, { kind: 'in-place', toggledId: null })).toEqual({ kind: 'refit' });
+    expect(mergeLayoutIntent({ kind: 'refit' }, { kind: 'in-place', toggledId: 'a' })).toEqual({ kind: 'refit' });
+  });
+  test('once consumed, the newer intent stands', () => {
+    expect(mergeLayoutIntent(null, { kind: 'in-place', toggledId: 'a' })).toEqual({ kind: 'in-place', toggledId: 'a' });
+    expect(mergeLayoutIntent(null, { kind: 'refit' })).toEqual({ kind: 'refit' });
+  });
+  test('an in-place intent is replaced by a later refit', () => {
+    expect(mergeLayoutIntent({ kind: 'in-place', toggledId: 'a' }, { kind: 'refit' })).toEqual({ kind: 'refit' });
+  });
+});

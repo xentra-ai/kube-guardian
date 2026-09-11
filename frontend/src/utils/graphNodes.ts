@@ -150,3 +150,16 @@ export function keepOnMap<C>(
   if (contentionIds?.has(pod.id)) return true;
   return hasGauges(pod.compute);
 }
+
+/**
+ * Combine the intent already waiting for a layout that has not landed with
+ * the intent of a newer signature change. A pending `refit` is sticky: a
+ * gauge tick that flips the compute bit on every card while a namespace
+ * switch's ELK run is in flight must not downgrade that switch to "in
+ * place", or the new namespace would never be fitted. `null` means the last
+ * intent was consumed (acted on), so the newer one stands on its own.
+ */
+export function mergeLayoutIntent(pending: LayoutIntent | null, next: LayoutIntent): LayoutIntent {
+  if (pending?.kind === 'refit') return pending;
+  return next;
+}

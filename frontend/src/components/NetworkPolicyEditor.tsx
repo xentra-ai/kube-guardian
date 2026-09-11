@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { Plus, Trash2, X, ChevronDown, ChevronRight, AlertCircle, RefreshCw } from 'lucide-react';
 import type { PodNodeData } from '../types';
 import type { SeccompAction } from '../types/seccompProfile';
@@ -53,6 +53,14 @@ const NetworkPolicyEditor: React.FC<NetworkPolicyEditorProps> = ({ isOpen, onClo
   // detected CNI, while an explicit choice wins permanently.
   const [chosenPolicyType, selectPolicyType] = useState<PolicyType | undefined>(initialPolicyType);
   const policyType = chosenPolicyType ?? recommendedPolicyType(cni);
+  // The header's Network tab hands back 'network'; coming from the Seccomp
+  // tab that must restore whichever network format was in use (Cilium is a
+  // policy type internally), not silently drop back to NetworkPolicy.
+  const lastNetworkType = useRef<PolicyType>('network');
+  useEffect(() => {
+    if (policyType !== 'seccomp') lastNetworkType.current = policyType;
+  }, [policyType]);
+  const selectTab = (t: PolicyType) => selectPolicyType(t === 'network' ? lastNetworkType.current : t);
 
   const [yamlView, setYamlView] = useState(true); // Default to YAML view
 
@@ -217,7 +225,7 @@ const NetworkPolicyEditor: React.FC<NetworkPolicyEditorProps> = ({ isOpen, onClo
       {/* Header */}
       <PolicyHeader
             policyType={policyType}
-            onPolicyTypeChange={selectPolicyType}
+            onPolicyTypeChange={selectTab}
             yamlView={yamlView}
             onYamlViewToggle={() => setYamlView(!yamlView)}
             copiedToClipboard={copiedToClipboard}

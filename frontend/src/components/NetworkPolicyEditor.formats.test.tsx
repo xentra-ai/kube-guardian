@@ -84,3 +84,14 @@ test('on a Cilium cluster the Cilium format is selectable and the tab strip is N
   await vi.waitFor(() => expect(cilium.getAttribute('aria-checked')).toBe('true'));
   expect(screen.getByText('Cilium Policy Builder')).toBeTruthy();
 });
+
+test('switching to Seccomp and back to Network restores the Cilium format', async () => {
+  cni = 'cilium';
+  render(<NetworkPolicyEditor isOpen onClose={() => {}} pod={target} />);
+  const cilium = await screen.findByRole('radio', { name: /CiliumNetworkPolicy/ });
+  await vi.waitFor(() => expect(cilium.getAttribute('aria-checked')).toBe('true'));
+  fireEvent.click(screen.getByRole('tab', { name: 'Seccomp Profile' }));
+  expect(screen.getByText('Seccomp Profile Builder')).toBeTruthy();
+  fireEvent.click(screen.getByRole('tab', { name: 'Network Policy' }));
+  expect(screen.getByText('Cilium Policy Builder')).toBeTruthy();
+});

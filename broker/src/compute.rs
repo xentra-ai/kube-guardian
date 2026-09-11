@@ -230,8 +230,6 @@ where
     }
 }
 
-/// `throttled_usec / (nr_periods x period_usec)` over the window. 0 when
-/// there were no periods (no quota, or no data).
 /// Run-queue events per minute on a history row, resolution-aware so a
 /// 5-minute row is judged by the same bar as a minute row.
 fn runq_events_per_min(r: &PodComputeHistoryRow) -> f64 {
@@ -239,6 +237,8 @@ fn runq_events_per_min(r: &PodComputeHistoryRow) -> f64 {
     r.runq_count.unwrap_or(0) as f64 / minutes
 }
 
+/// `throttled_usec / (nr_periods x period_usec)` over the window. 0 when
+/// there were no periods (no quota, or no data).
 fn throttled_ratio(rows: &[&PodComputeHistoryRow]) -> f64 {
     let throttled: i128 = rows.iter().map(|r| r.cpu_throttled_usec as i128).sum();
     let wall: i128 = rows

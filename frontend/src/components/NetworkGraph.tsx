@@ -21,6 +21,7 @@ import {
   keepOnMap,
   layoutIntent,
   layoutSignatureOf,
+  mergeLayoutIntent,
   mergeNodeData,
   placeNodes,
   pruneNodes,
@@ -540,13 +541,18 @@ const NetworkGraphInner: React.FC<NetworkGraphProps> = ({
   // an expand/collapse or a gauge tick, panning only to a card that grew out
   // of view.
   const lastLayoutParts = React.useRef<LayoutParts | null>(null);
-  const pendingIntent = React.useRef<LayoutIntent>({ kind: 'refit' });
+  // `null` once the intent has been acted on; a pending refit is sticky
+  // across signature changes that land before its ELK result does.
+  const pendingIntent = React.useRef<LayoutIntent | null>({ kind: 'refit' });
   const lastLayoutSignature = React.useRef<string | null>(null);
 
   useEffect(() => {
     if (lastLayoutSignature.current === layoutSignature) return;
     lastLayoutSignature.current = layoutSignature;
-    pendingIntent.current = layoutIntent(lastLayoutParts.current, layoutParts);
+    pendingIntent.current = mergeLayoutIntent(
+      pendingIntent.current,
+      layoutIntent(lastLayoutParts.current, layoutParts),
+    );
     lastLayoutParts.current = layoutParts;
 
     if (displayNodes.length === 0) {
@@ -704,8 +710,13 @@ const NetworkGraphInner: React.FC<NetworkGraphProps> = ({
   // only pan to the toggled card if its new size pushed it out of view.
   useEffect(() => {
     if (elkPositions.size === 0) return;
-    const intent = pendingIntent.current;
     const timer = setTimeout(() => {
+      // Read at fire time, not at effect time: a second layout landing
+      // inside the delay cancels this timer and its own effect acts on the
+      // (still pending, still sticky) intent instead.
+      const intent = pendingIntent.current;
+      pendingIntent.current = null;
+      if (!intent) return;
       if (intent.kind === 'refit') {
         fitView({ padding: 0.2, duration: UI_TIMING.FIT_VIEW_DURATION });
         return;
