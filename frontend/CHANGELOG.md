@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.17.0](https://github.com/kguardian-dev/kguardian/compare/frontend/v1.16.0...frontend/v1.17.0) (2026-09-11)
+
+
+### Features
+
+* live compute gauges and noisy-neighbour detection ([#1531](https://github.com/kguardian-dev/kguardian/issues/1531)) ([62959c2](https://github.com/kguardian-dev/kguardian/commit/62959c2be3d1fb71611c0ab77308a5d56af6ac91))
+
 ## [1.16.0](https://github.com/kguardian-dev/kguardian/compare/frontend/v1.15.0...frontend/v1.16.0) (2026-09-08)
 
 
