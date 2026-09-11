@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.10.0](https://github.com/kguardian-dev/kguardian/compare/advisor/v1.9.0...advisor/v1.10.0) (2026-09-11)
+
+
+### Features
+
+* live compute gauges and noisy-neighbour detection ([#1531](https://github.com/kguardian-dev/kguardian/issues/1531)) ([62959c2](https://github.com/kguardian-dev/kguardian/commit/62959c2be3d1fb71611c0ab77308a5d56af6ac91))
+
 ## [1.9.0](https://github.com/kguardian-dev/kguardian/compare/advisor/v1.8.2...advisor/v1.9.0) (2026-09-08)
 
 
