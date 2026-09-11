@@ -1,0 +1,209 @@
+---
+title: "Compute Gauges & Noisy Neighbours"
+description: "Turn the compute layers on or off, opt a pod out, and read the gauges, edges and findings on the network map"
+icon: "gauge-high"
+---
+
+This guide is operational: which switches exist, what they change on the
+cluster, and how to read what shows up. For what the signals mean and when a
+culprit is named, see [Compute Contention](/concepts/compute-contention);
+for every value, env var and the finding schema, the
+[reference](/reference/compute).
+
+## Enable or disable
+
+The gauges and stall findings are on by default. `compute.enabled` is the
+master switch: it mounts `/sys/fs/cgroup` read-only into the controller
+DaemonSet and starts the sampler. Setting it to `false` removes the mount,
+the sampler and every controller-side `COMPUTE_*` setting.
+
+```bash
+# Turn the whole feature off
+helm upgrade kguardian oci://ghcr.io/kguardian-dev/charts/kguardian \
+  -n kguardian --reuse-values --set compute.enabled=false
+```
+
+The broker keeps its retention pass running either way, so a cluster that
+turns the feature off still prunes the history it collected.
+
+### Turn on the scheduler probe
+
+Blame — the `noisy-neighbor` finding and the contention edges — needs the
+eBPF scheduler probe, which is off by default until its overhead has been
+measured (see the [concept page](/concepts/compute-contention#overhead)).
+It requires `compute.enabled`.
+
+```bash
+helm upgrade kguardian oci://ghcr.io/kguardian-dev/charts/kguardian \
+  -n kguardian --reuse-values --set compute.contention.enabled=true
+```
+
+The probe attaches to `sched_wakeup`, `sched_wakeup_new`, `sched_switch` and
+`sched_process_exit` via `tp_btf`, which requires kernel BTF
+(`/sys/kernel/btf/vmlinux`). Without it the probe does not load: the node
+reports `contention_loaded: false` and its gauges and stall findings keep
+working. Check with `GET /compute/nodes` on the broker or the status-dot
+tooltip on a pod in the UI.
+
+`compute.contention.minRunqLatencyUs` (default 100) is the in-kernel filter:
+a run-queue wait shorter than this is dropped before any map write. Raise it
+on nodes with very high context-switch rates if the probe's cost matters
+more than sub-100 µs resolution.
+
+### Opt a pod out
+
+Annotate the pod (or its template):
+
+```yaml
+metadata:
+  annotations:
+    kguardian.dev/compute: "off"
+```
+
+The pod is not sampled, has no gauge, and is not registered with the
+scheduler probe as a victim. It can still be named as a **culprit** for
+another pod, because blame is recorded from the victim's side. There is no
+opt-in mode: a pod that is not sampled cannot be found to be a victim.
+
+## Reading the network map
+
+The compute data is the only thing on the map that is live: the frontend
+polls `GET /compute/latest` for the selected namespace every 5 seconds and
+the findings every 15 seconds, and pauses both while the tab is hidden.
+Traffic and syscalls stay on manual refresh.
+
+<Steps>
+  <Step title="Status dot">
+    Each pod's collapsed header carries a dot driven by the pod's worst
+    active compute finding: the success colour with no finding, the warning
+    colour for a `high` or `medium` finding, the error colour for a
+    `critical` one. Hover it for the finding.
+  </Step>
+  <Step title="Micro bar">
+    Next to the dot, a two-segment bar: CPU on the left, memory on the right,
+    each as a percentage of the container's limit, else its request, else
+    the node. The tooltip names the denominator, because 80 % of a limit and
+    80 % of a node are different situations. A multi-container pod's bar is
+    the sum of its container rows (usage and denominator alike); the worst
+    container drives the dot.
+  </Step>
+  <Step title="Sparklines">
+    Expand the pod and the bar becomes two sparklines — the last 60 samples
+    (five minutes at the default interval), kept in the browser — with the
+    current value and denominator. Two chips can appear below them:
+    `Starved by <pod>` when a finding names a culprit, and `Throttled N %`
+    for `cpu-throttled`.
+  </Step>
+  <Step title="Contention edges">
+    With the scheduler probe on and **Show contention** enabled in the graph
+    controls (default on), a `noisy-neighbor` finding draws a dashed edge in
+    the error colour from the culprit to the victim, labelled with the
+    culprit's share of the victim's wait. A culprit outside the selected
+    namespace is drawn as an external node, as cross-namespace traffic peers
+    already are. A `system` or `kernel` culprit has no node to draw an edge
+    from; it shows in the chip and the Compute section instead.
+  </Step>
+  <Step title="Compute section">
+    Select a pod and the bottom panel gains a collapsible **Compute** section
+    alongside Traffic and Syscalls: one row per container with requests,
+    limits, current usage, throttled ratio, CPU and memory PSI, run-queue
+    p99 (when the probe is loaded), and the blame list — every cgroup that
+    ran while this container waited, with its share.
+  </Step>
+  <Step title="Findings">
+    The Findings view lists the five compute kinds with the same rows as the
+    policy findings, plus a node filter. Where a policy finding offers a
+    **Policy** button, a compute finding offers **View workload**, which
+    takes you to the victim's or the culprit's workload. Nothing is applied.
+  </Step>
+</Steps>
+
+A pod with no gauge shows a muted dot instead, and the dot's tooltip says
+why: **off** (the node's controller reports `compute.enabled` false — a
+disabled controller still posts a heartbeat; when *every* node reports it
+off, the compute layer is hidden and pods look exactly as they did before
+the feature), **pending** (`no compute
+sample yet`: the pod's first sample has not arrived, it is opted out, or
+its controller predates the feature), or **unsupported** (the node is
+cgroup v1 or has no PSI).
+
+## From the CLI
+
+```bash
+# Every finding in a namespace
+kubectl kguardian compute findings -n payments
+
+# Everything on one node, as JSON
+kubectl kguardian compute findings --node worker-3 -o json
+```
+
+See [`compute findings`](/cli/compute-findings). The command reads
+`GET /compute/findings` on the broker, the same endpoint the UI uses.
+
+## From the assistant
+
+The [assistant](/guides/mcp-endpoint) has three tools over the same data:
+`get_pod_compute` (a pod's latest rows plus a summary of the last hour),
+`get_compute_findings` (findings for a namespace or node) and
+`get_node_contention` (victim→culprit pairs on a node). "Why is
+`payments/api` slow?" is answerable from those alone.
+
+## Tuning
+
+The thresholds live under `compute.thresholds` and are evaluated by the
+broker, so changing them takes effect on the next findings poll — no
+controller restart. The defaults are conservative; the two you are most
+likely to touch:
+
+- `blameShare` (default `0.40`): how dominant one neighbour has to be before
+  it is named. Lower it on nodes where the wait is spread over several
+  culprits and you still want a name; expect more `noisy-neighbor` and fewer
+  `cpu-contended`.
+- `throttledRatioMax` (default `0.10`): the hard gate above which a pod is
+  self-throttled and never a victim. Do not raise it to make a throttled pod
+  show a neighbour — the neighbour is not the problem. See
+  [why throttling is never blamed on a neighbour](/concepts/compute-contention#why-throttling-is-never-blamed-on-a-neighbour).
+
+History size is `compute.history.retentionDays` (default 7; `0` keeps only
+the live table **and disables every compute finding**, since findings are
+computed from history) and `compute.history.minuteResolutionHours` (default
+24, after which minute rows are folded into 5-minute rows).
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="No gauges on any pod" icon="gauge">
+    ```bash
+    kubectl -n kguardian get ds kguardian-controller -o yaml | grep -A1 COMPUTE_ENABLED
+    kubectl port-forward -n kguardian svc/kguardian-broker 9090:9090 &
+    curl -s http://localhost:9090/compute/nodes
+    ```
+    `COMPUTE_ENABLED` should be `"true"` and every node should have a row
+    with `compute_supported: true`. No rows at all means the controllers are
+    not sending: check they restarted after the upgrade and that the
+    `/sys/fs/cgroup` mount is present in the DaemonSet.
+  </Accordion>
+  <Accordion title="Gauges on some nodes but not others" icon="server">
+    Those nodes are reporting `compute_supported: false` — cgroup v1, or a
+    kernel without PSI. Confirm with `stat -fc %T /sys/fs/cgroup` on the node
+    (`cgroup2fs` is v2) and `cat /proc/pressure/cpu`. There is no fallback
+    for cgroup v1.
+  </Accordion>
+  <Accordion title="Gauges work, but no `noisy-neighbor` findings and no edges" icon="link-slash">
+    Either `compute.contention.enabled` is false (the default), or the probe
+    did not attach on that node (`contention_loaded: false` in
+    `GET /compute/nodes`, and a warning in the controller log at startup).
+    Without the probe the broker still raises `cpu-throttled`,
+    `cpu-contended`, `memory-pressure` and `memory-limit-thrash`.
+  </Accordion>
+  <Accordion title="A pod is clearly slow but the finding is `cpu-throttled`, not `noisy-neighbor`" icon="hourglass-half">
+    That is the intended answer. The pod's own `limits.cpu` explains its wait,
+    so no neighbour is named. Raise or remove the limit and re-check.
+  </Accordion>
+  <Accordion title="The blame list is mostly `unknown`" icon="question">
+    The controller could not classify those cgroup ids. The per-node
+    `unknown_blame_share` is exported with every sample; if it is high,
+    attribution on that node is unreliable and no `noisy-neighbor` will be
+    named from it. Check the controller log for the cgroup index walk.
+  </Accordion>
+</AccordionGroup>

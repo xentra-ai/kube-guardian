@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, expect, test, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen } from '@testing-library/react';
-import { DAEMONSET_ACTIVE, DAEMONSET_TOGGLE_TOOLTIP, EXTERNAL_ACTIVE, GraphControls, TRAFFIC_ACTIVE } from './GraphControls';
+import { CONTENTION_ACTIVE, CONTENTION_TOGGLE_TOOLTIP, DAEMONSET_ACTIVE, DAEMONSET_TOGGLE_TOOLTIP, EXTERNAL_ACTIVE, GraphControls, TRAFFIC_ACTIVE } from './GraphControls';
 
 afterEach(cleanup);
 
@@ -64,4 +64,40 @@ test('no count suffix when there is nothing to hide', () => {
 test('the toggle is only offered while external nodes are shown', () => {
   render(<GraphControls {...props({ showExternalNodes: false })} />);
   expect(screen.queryByTitle(DAEMONSET_TOGGLE_TOOLTIP)).toBeNull();
+});
+
+// Contention toggle (design D8): on by default, offered only when there is a
+// contention edge to control, its own hue (error red, shared with the edges).
+
+test('Contention toggle is not offered when there are no contention edges', () => {
+  render(<GraphControls {...props({ onToggleContention: vi.fn(), contentionCount: 0 })} />);
+  expect(screen.queryByTitle(CONTENTION_TOGGLE_TOOLTIP)).toBeNull();
+});
+
+test('Contention toggle: on by default, shows the edge count, fires its callback', () => {
+  const onToggleContention = vi.fn();
+  render(<GraphControls {...props({ onToggleContention, contentionCount: 2 })} />);
+  const btn = screen.getByTitle(CONTENTION_TOGGLE_TOOLTIP);
+  expect(btn.textContent).toBe('Contention (2)');
+  expect(btn.getAttribute('aria-pressed')).toBe('true');
+  expect(btn.className).toContain(CONTENTION_ACTIVE);
+  // Ordering: Traffic, External, DaemonSets, Contention, Layout.
+  const labels = screen.getAllByRole('button').map((b) => b.textContent);
+  expect(labels).toEqual(['Traffic', 'External (3)', 'DaemonSets (5 hidden)', 'Contention (2)', 'Layout']);
+  fireEvent.click(btn);
+  expect(onToggleContention).toHaveBeenCalledTimes(1);
+});
+
+test('while off, the Contention hidden-count hint carries the contention hue', () => {
+  render(<GraphControls {...props({ showContention: false, onToggleContention: vi.fn(), contentionCount: 2 })} />);
+  const btn = screen.getByTitle(CONTENTION_TOGGLE_TOOLTIP);
+  expect(btn.textContent).toBe('Contention (2 hidden)');
+  expect(btn.getAttribute('aria-pressed')).toBe('false');
+  expect(btn.className).not.toContain('hubble-error');
+  expect(btn.querySelector('span.text-hubble-error')?.textContent).toBe('(2 hidden)');
+});
+
+test('the Contention hue is distinct from the other three toggles', () => {
+  expect(CONTENTION_ACTIVE).toContain('hubble-error');
+  for (const other of [TRAFFIC_ACTIVE, EXTERNAL_ACTIVE, DAEMONSET_ACTIVE]) expect(other).not.toContain('hubble-error');
 });

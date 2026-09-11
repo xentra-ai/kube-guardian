@@ -5,16 +5,20 @@ import {
   filterByNamespace, compactTrafficSummary, compactPodsSummary, filterAlivePods, compactSvc,
 } from "./compaction.js";
 import { seccompFromBrokerSyscalls } from "./generators/seccomp.js";
+import { computeQuery, selectPodFromLatest, summariseComputeHistory } from "./compute.js";
 import {
   generateNetworkPolicyWithComments, generateCiliumPolicyWithComments, policyToYAML, makePeerResolver,
   type PeerResolver, type PodInfo, type TrafficRow, type BrokerPodListEntry, type BrokerServiceRecord,
 } from "./generators/networkpolicy.js";
 
-// In-process tool execution — this IS the assistant now. Each of the 12
-// tools is a broker fetch + the exact compaction the former mcp-server applied,
-// or in-process policy/seccomp generation. The G1 parity test replays the
-// shared backend fixtures through executeInProcessTool and asserts broker
-// tools match the former Go server's outputs.
+// In-process tool execution — this IS the assistant now. Each of the original
+// 12 tools is a broker fetch + the exact compaction the former mcp-server
+// applied, or in-process policy/seccomp generation. The G1 parity test replays
+// the shared backend fixtures through executeInProcessTool and asserts broker
+// tools match the former Go server's outputs. The three compute tools
+// (get_pod_compute, get_compute_findings, get_node_contention) post-date the
+// mcp-server and have no golden; they are wiring-checked there and
+// unit-tested in compute.test.ts.
 
 const s = (v: unknown): string => (typeof v === "string" ? v : "");
 const enc = encodeURIComponent;
@@ -134,6 +138,41 @@ const handlers: Record<string, Handler> = {
   generate_seccomp_profile: async (a) => {
     const syscalls = await brokerGetJSON(`/pod/syscalls/${enc(s(a.pod_name))}`);
     return JSON.stringify(seccompFromBrokerSyscalls(syscalls), null, 2);
+  },
+  // --- compute gauges & noisy-neighbour detection ---------------------------
+  // The broker computes findings (design D7); these tools only fetch and,
+  // for history, summarise. /compute/latest is namespace-scoped (400
+  // without a namespace), so get_pod_compute needs both args.
+  get_pod_compute: async (a) => {
+    const namespace = s(a.namespace);
+    const podName = s(a.pod_name);
+    if (!namespace || !podName) throw new Error("get_pod_compute requires both namespace and pod_name");
+    const latest = await brokerGetJSON(`/compute/latest${computeQuery({ namespace })}`);
+    const pod = selectPodFromLatest(latest, podName);
+    if (!pod) {
+      return {
+        namespace, pod_name: podName, containers: [], node: null, history_60m: [],
+        note: "no compute samples for this pod — compute sampling may be disabled (compute.enabled=false or the kguardian.dev/compute=off annotation), the pod may not be running, or the name/namespace may be wrong",
+      };
+    }
+    let history: unknown = [];
+    if (pod.pod_uid) {
+      const h = (await brokerGetJSON(`/compute/history/${enc(pod.pod_uid)}${computeQuery({ minutes: 60 })}`)) as { rows?: unknown };
+      history = h?.rows ?? [];
+    }
+    return {
+      namespace, pod_name: podName, pod_uid: pod.pod_uid,
+      node: pod.node,
+      containers: pod.containers,
+      history_60m: summariseComputeHistory(history),
+    };
+  },
+  get_compute_findings: (a) => brokerGetJSON(`/compute/findings${computeQuery({ namespace: s(a.namespace), node: s(a.node) })}`),
+  get_node_contention: (a) => {
+    const node = s(a.node);
+    if (!node) throw new Error("get_node_contention requires node");
+    const minutes = typeof a.minutes === "number" && a.minutes > 0 ? a.minutes : 5;
+    return brokerGetJSON(`/compute/contention${computeQuery({ node, minutes })}`);
   },
 };
 

@@ -20,6 +20,10 @@ use client::*;
 
 pub mod bpf;
 pub mod capture_tiers;
+pub mod compute_config;
+pub mod compute_registry;
+pub mod compute_sampler;
+pub mod contention;
 pub mod log;
 pub mod node_facts;
 /// One task per subsystem, with explicit supervision over what each

@@ -45,7 +45,7 @@ app.use(express.json({ limit: '100kb' }));
 
 // Initialize the in-process assistant. Note: the class is named "McpClient"
 // for historical reasons; it no longer talks to a separate MCP server —
-// all 12 tools execute in-process (src/tools/*), reaching the broker
+// all tools execute in-process (src/tools/*), reaching the broker
 // directly. No constructor arg needed.
 const mcpClient = new McpClient();
 

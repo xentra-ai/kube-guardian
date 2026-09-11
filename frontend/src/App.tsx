@@ -1,4 +1,5 @@
-import { useState, useCallback, useEffect, useMemo, useRef, lazy, Suspense } from 'react';
+import { useState, useCallback, useEffect, useMemo, useRef, Suspense } from 'react';
+import { lazyRetry } from './utils/lazyRetry';
 import { Bot, RefreshCw, Share2, ShieldAlert, LayoutDashboard, FileCode, Boxes, Search, Lock } from 'lucide-react';
 import NetworkGraph from './components/NetworkGraph';
 import { FindingsView } from './components/FindingsView';
@@ -12,19 +13,19 @@ import { AccountMenu } from './components/AccountMenu';
 import { SettingsPanel } from './components/SettingsPanel';
 import { useSettings } from './contexts/SettingsContext';
 import { useClusterEnvironment } from './hooks/useClusterEnvironment';
-import { policyTypeForFinding, type FindingKind } from './utils/findingPolicyType';
+import { findingAction, policyTypeForFinding, type FindingKind } from './utils/findingPolicyType';
 import { recommendedPolicyType } from './utils/cniPolicySupport';
 import type { PolicyType } from './hooks/policyEditor';
 import { useCluster } from './contexts/ClusterContext';
 
 // Heavy surfaces — lazy so they stay out of the initial bundle and only load
 // when first opened (the NetworkPolicyEditor alone is ~2k lines).
-const AIAssistant = lazy(() => import('./components/AIAssistant'));
-const AuditVerdictsPanel = lazy(() => import('./components/AuditVerdictsPanel'));
-const PolicyBuilderModal = lazy(() =>
+const AIAssistant = lazyRetry(() => import('./components/AIAssistant'));
+const AuditVerdictsPanel = lazyRetry(() => import('./components/AuditVerdictsPanel'));
+const PolicyBuilderModal = lazyRetry(() =>
   import('./components/PolicyBuilderModal').then((m) => ({ default: m.PolicyBuilderModal })),
 );
-const SeccompProfilesView = lazy(() => import('./components/SeccompProfilesView'));
+const SeccompProfilesView = lazyRetry(() => import('./components/SeccompProfilesView'));
 import { Button } from './components/ui/Button';
 import { EmptyState } from './components/ui/EmptyState';
 import { GraphSkeleton } from './components/ui/Skeleton';
@@ -39,6 +40,7 @@ const ROUTES = ['map', 'findings', 'seccomp'] as const;
 function App() {
   const { settings, updateSettings, toggleSetting } = useSettings();
   const toggleDaemonSetNodes = useCallback(() => toggleSetting('showDaemonSetNodes'), [toggleSetting]);
+  const toggleContention = useCallback(() => toggleSetting('showContention'), [toggleSetting]);
   const { activeCluster } = useCluster();
 
   // The whole location — view, namespace, selected workload — lives in the URL
@@ -98,7 +100,7 @@ function App() {
   // effect — no extra render, and it can't loop.
   const effectiveNamespace =
     namespaces.length > 0 && !namespaces.includes(namespace) ? namespaces[0] : namespace;
-  const { pods, allPodsLookup, services, loading, error, togglePodExpansion, refreshData } = usePodData(effectiveNamespace);
+  const { pods, compute, allPodsLookup, services, loading, error, togglePodExpansion, refreshData } = usePodData(effectiveNamespace);
 
   // Selected workload is derived from the URL (`?pod=<id>`) and resolved against
   // the loaded pods — so a deep link opens straight to that workload once data
@@ -163,8 +165,11 @@ function App() {
 
   // A finding's "Policy" action opens the tab relevant to that finding —
   // seccomp for sensitive syscalls, network (Cilium on a Cilium cluster) for
-  // the traffic findings — not the default tab.
+  // the traffic findings — not the default tab. Compute findings (D7) are a
+  // `resources` action and never open the builder: policyTypeForFinding is
+  // only called for `policy` kinds.
   const handleBuildPolicyForFinding = useCallback((pod: PodNodeData, kind: FindingKind) => {
+    if (findingAction(kind) !== 'policy') return;
     setPolicyBuilderInitialPod(pod);
     setPolicyBuilderInitialType(policyTypeForFinding(kind, cni));
     setIsPolicyBuilderOpen(true);
@@ -245,6 +250,16 @@ function App() {
   const handleFindingSelect = useCallback((pod: PodNodeData) => {
     navigate('map', { ns: loc.params.ns, pod: pod.id });
   }, [navigate, loc.params.ns]);
+
+  // "View workload" on a compute finding (D7): the pod may live in another
+  // namespace (a noisy neighbour is cross-namespace by nature), so resolve
+  // its identity from the cluster-wide pod list and switch namespace with it.
+  const handleViewWorkload = useCallback((ns: string, podName: string) => {
+    const record = allPodsLookup.find((p) => p.pod_namespace === ns && p.pod_name === podName);
+    const identity = record?.pod_identity || podName;
+    if (ns !== effectiveNamespace) setNsByCluster((prev) => ({ ...prev, [activeCluster.id]: ns }));
+    navigate('map', { ns, pod: `${ns}-${identity}` });
+  }, [allPodsLookup, effectiveNamespace, activeCluster.id, navigate]);
 
   // ⌘K / Ctrl-K opens the command palette from anywhere.
   useEffect(() => {
@@ -392,6 +407,10 @@ function App() {
             onSelectPod={handleFindingSelect}
             onBuildPolicy={handleBuildPolicyForFinding}
             onOpenAudit={() => setIsAuditPanelOpen(true)}
+            computeFindings={compute.findings}
+            computeEnabled={compute.enabled}
+            computeMeta={compute.findingsMeta}
+            onViewWorkload={handleViewWorkload}
           />
         ) : (
         <>
@@ -438,6 +457,9 @@ function App() {
                 onToggleDaemonSetNodes={toggleDaemonSetNodes}
                 showTraffic={settings.showTraffic}
                 onToggleTraffic={() => updateSettings({ showTraffic: !settings.showTraffic })}
+                showContention={settings.showContention}
+                onToggleContention={toggleContention}
+                computeFindings={compute.findings}
                 layoutDirection={settings.layoutDirection}
                 onToggleLayoutDirection={() => updateSettings({ layoutDirection: settings.layoutDirection === 'LR' ? 'TB' : 'LR' })}
               />

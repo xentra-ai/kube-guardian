@@ -228,6 +228,9 @@ subsystems! {
     SyscallRecorder => "syscall-recorder", Disposition::Required;
     PodReconciler => "pod-reconciler", Disposition::Required;
     SeccompDistributor => "seccomp-distributor", Disposition::MayRetire;
+    // Compute gauges (COMPUTE_ENABLED, default on). `run` returns `Ok`
+    // straight away when the feature is off; an `Err` is still fatal.
+    ComputeSampler => "compute-sampler", Disposition::MayRetire;
     EbpfLoader => "ebpf-loader", Disposition::Required;
 }
 
@@ -932,7 +935,7 @@ mod tests {
     /// flipped to `MayRetire` — or a newly added subsystem declared
     /// that way — fails here rather than shipping.
     #[test]
-    fn only_the_seccomp_distributor_may_retire() {
+    fn only_switchable_features_may_retire() {
         let retiring: Vec<&'static str> = Subsystem::ALL
             .iter()
             .copied()
@@ -941,9 +944,9 @@ mod tests {
             .collect();
         assert_eq!(
             retiring,
-            vec!["seccomp-distributor"],
-            "exactly one subsystem is a feature that can be switched off; everything else \
-             is capture and must be Required"
+            vec!["seccomp-distributor", "compute-sampler"],
+            "only subsystems that are features an operator can switch off may retire; \
+             everything else is capture and must be Required"
         );
     }
 

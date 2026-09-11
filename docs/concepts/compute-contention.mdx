@@ -1,0 +1,214 @@
+---
+title: "Compute Contention"
+description: "How kguardian measures a pod's CPU and memory, decides it is starved, and names the neighbour starving it — and why a throttled pod is never a victim"
+icon: "gauge-high"
+---
+
+kguardian draws every pod on the network map as a live CPU and memory gauge,
+raises a finding when a pod is degraded because it cannot get the compute it
+is entitled to, and — when the scheduler probe is on — names the pod, system
+unit or kernel thread that was on the CPU while it waited. Nothing is
+enforced: like a `SeccompProfile`, the output is an observation with
+evidence, and what you do with it is yours.
+
+The feature is on by default (`compute.enabled: true`). The scheduler probe
+that produces blame is a second switch beneath it (`compute.contention.enabled`)
+and is off by default. See the [guide](/guides/compute-gauges) to turn either
+on or off and the [reference](/reference/compute) for every value and the
+finding schema.
+
+## Three layers
+
+Three signals, cheapest first, each one gating the next:
+
+| Layer | Question | Source | Cost |
+|---|---|---|---|
+| **Usage** | How much CPU and memory is this container using, against what? | cgroup v2 `cpu.stat`, `cpu.max`, `memory.current`, `memory.max`, `memory.stat` | one small file read per file, per container, per sample |
+| **Stall** | Is it waiting for CPU it should have? Thrashing under its memory limit? Throttled by its *own* quota? | cgroup v2 `cpu.pressure`, `memory.pressure`, the throttle counters in `cpu.stat`, `memory.events` | same file walk |
+| **Blame** | *Who* was on the CPU while it waited? | eBPF `sched_wakeup`, `sched_wakeup_new`, `sched_switch`; a run-queue latency histogram and a victim→culprit pair matrix, aggregated **in the kernel** and keyed by cgroup id | a few hundred nanoseconds per context switch on the node |
+
+Only the blame layer loads a BPF program. The first two are what the kernel
+already accounts for free, and they are what turns "this pod looks slow"
+into "this pod is *starved*, and not by its own limit". Blame without the
+stall layer produces phantom victims; the stall layer without blame still
+tells you a pod is under-provisioned or that a node is oversubscribed.
+
+The controller samples every container on its node every
+`compute.sampleInterval` seconds (default 5), ships one row per container to
+the broker, and once a minute folds its samples into a history row. The
+broker keeps a bounded `latest` table (one row per live container) that the
+UI polls, and a minute-resolution history that is downsampled to 5-minute
+rows after 24 hours and pruned after `compute.history.retentionDays`
+(default 7).
+
+## What the gauge is measured against
+
+A percentage needs a denominator, and a pod does not always have one. The
+gauge normalises against the first of these that exists, and the tooltip
+says which:
+
+1. the container's **limit** (`cpu.max` / `memory.max`, which the kubelet
+   writes from `resources.limits`),
+2. its **request** (captured from the pod spec when the container is
+   registered — requests are not in the cgroup),
+3. the **node's** capacity.
+
+A pod with neither request nor limit is drawn against the node. That is not
+a kguardian limitation; it is the pod's actual entitlement.
+
+## Finding kinds
+
+Findings are computed in the broker over the last five minutes of history
+(the *window*), so the UI, `kubectl kguardian compute findings` and the
+assistant all see the same verdicts. Each finding carries the numbers that
+fired it, not just the verdict.
+
+| Kind | Fires when | Culprit | Remediation |
+|---|---|---|---|
+| `cpu-throttled` | the container's CFS throttled time over the window is ≥ `throttledRatio` (default 25 %) of its quota time | never | raise or remove `resources.limits.cpu` on the victim |
+| `noisy-neighbor` | the victim is stalled, is *not* self-throttled, and one cgroup on the same node dominates its wait time and is running beyond its own request | a pod, a systemd unit, or the kernel | lower the culprit's usage or give it a request that reflects it; move one of the two |
+| `cpu-contended` | the victim is stalled and not self-throttled, but no single cgroup passes the culprit test | none — the node is oversubscribed | the blame list shows who shares the CPU; add capacity or spread the workload |
+| `memory-pressure` | the container's `memory.pressure some avg10` ≥ `memStallSome` (default 10 %) or its workingset refault rate is ≥ `refaultPerMin` (default 1000 per minute), **while** the node itself is under memory pressure (`/proc/pressure/memory some` ≥ 5 %) | the container on the node with the largest growth beyond its memory request, if it accounts for ≥ 40 % of the node's overage; labelled as a heuristic | set or raise memory requests on the culprit; add memory to the node |
+| `memory-limit-thrash` | the container is refaulting under its **own** `memory.max` (`memory.events` `high` + `max` hits rising) and the node is not under pressure | never | raise `resources.limits.memory` on the victim |
+
+Severity for the CPU kinds: `critical` when `cpu.pressure full avg10` ≥ 10 %
+or run-queue p99 ≥ 200 ms; `high` when both stall signals fired; `medium`
+otherwise.
+
+### When a culprit is named
+
+A `noisy-neighbor` finding for victim V on node N requires **all three** of
+the following over the window. Any one on its own is not enough.
+
+1. **V is stalled.** Its cgroup `cpu.pressure some avg10` is ≥ `stallSome`
+   (default 20 %), **or** its run-queue latency p99 is ≥ `runqP99Ms`
+   (default 20 ms) over at least `minRunqEvents` run-queue events per
+   minute (default 50, so a near-idle sidecar's handful of wakeups cannot
+   fire it; multi-second waits in the overflow bucket always count), for
+   at least two consecutive minutes.
+2. **V is not throttling itself.** Its throttled ratio is below
+   `throttledRatioMax` (default 10 %). See below.
+3. **One neighbour dominates.** A cgroup C ≠ V on the same node accounts for
+   ≥ `blameShare` (default 40 %) of V's total wait time in the pair matrix,
+   **and** C's own CPU usage over the window exceeds its request — or C has
+   no request at all.
+
+The third condition is what separates a noisy neighbour from a busy one. A
+pod running inside its CPU request is entitled to that CPU; it can preempt V
+all day and it is still not the problem. A pod with no request is the
+textbook noisy neighbour, and the finding says so.
+
+If 1 and 2 hold and no C passes 3, the finding is `cpu-contended` instead:
+the node is oversubscribed, and the blame list will typically show system
+units and kernel threads sharing the wait.
+
+### Why throttling is never blamed on a neighbour
+
+The most common misread in this space is CFS throttling inflating a pod's
+run-queue latency and being reported as contention. A pod that is throttled
+by its own `limits.cpu` waits — but it waits because its quota ran out, not
+because anyone else took the CPU. Naming a neighbour for that sends the
+operator to the wrong workload.
+
+So the two are different findings with different remediations, and the
+separation is a hard gate: a container whose throttled ratio is above
+`throttledRatioMax` is never a `noisy-neighbor` victim, whatever the
+scheduler probe recorded. Its finding is `cpu-throttled`, with no culprit,
+and the fix is its own limit. The broker's rule engine has a test case for
+exactly this — a throttled victim with a plausible-looking neighbour must
+not fire.
+
+### Who a culprit can be
+
+The probe records the culprit side raw, so a starved pod can be blamed on
+things that are not pods. The finding's `culprit.kind` is one of:
+
+| `kind` | `ref` | Meaning |
+|---|---|---|
+| `pod` | `namespace/pod/container` | Another tracked container on the node. Carries `pod_uid`, `namespace`, `pod_name` so the UI can draw an edge to it. A container the controller has not registered yet (or one it could not resolve) is shown as `pod:<uid8>`. |
+| `system` | a systemd unit, e.g. `system.slice/kubelet.service` | kubelet, the CNI agent, a log shipper. Still actionable. |
+| `kernel` | `kernel` | Kernel threads — softirq, kswapd, writeback. |
+
+A cgroup id the controller cannot classify is counted as `unknown`. The
+per-node share of unknown blame is exported with every sample; if it climbs,
+attribution on that node is broken and the UI says so rather than blaming
+"unknown".
+
+### Memory blame is a heuristic
+
+CPU blame comes from the scheduler telling us, at every context switch, who
+ran instead of the victim. There is no equivalent for memory: reclaim is
+node-wide and the kernel does not record which cgroup's growth pushed which
+other cgroup's pages out. The `memory-pressure` culprit is therefore a
+heuristic — the container whose usage grew most beyond its request during
+the window — and the finding is labelled as such. Its `blame_share` is
+that container's share of the node's memory overage (usage beyond
+requests), not a share of anyone's wait time. Treat it as a strong lead,
+not a verdict.
+
+A culprit that is opted out (`kguardian.dev/compute: "off"`) is not sampled,
+so its `cpu_usage_millis` is `null` in the finding even though it can still
+be named.
+
+## Cross-namespace visibility
+
+A noisy neighbour is cross-namespace by nature: the victim is in `payments`,
+the culprit is in `batch`. A finding for a namespace can therefore name a pod
+in another namespace, and a contention edge on the map can point at a pod
+outside the namespace you selected (drawn as an external node, the same way
+cross-namespace traffic peers are). kguardian is a cluster-scoped operator
+tool and already lists cluster-wide traffic peers; this is documented
+behaviour, not hidden. `controller.excludedNamespaces` does not
+apply here: it switches off network-flow and syscall capture (the policy
+inputs) for those namespaces, but compute sampling is observation only, so
+their pods, the `kguardian` namespace included, still show gauges and take
+part in attribution as victims and as culprits by name. The only way to keep
+a pod out of compute is the `kguardian.dev/compute: "off"` annotation.
+
+Per-pod opt-out is the annotation `kguardian.dev/compute: "off"`. An
+opted-out pod is not sampled and has no gauge, but it can still be named as a
+**culprit** for a pod that is sampled — blame is recorded from the victim's
+side.
+
+## Requirements and unsupported nodes
+
+The stall layer needs **cgroup v2** and **PSI** (`CONFIG_PSI`, enabled on
+every mainstream distribution kernel since 5.2). The controller reports both
+in its node facts at startup and, with every sample, whether compute is
+enabled and supported on that node and whether the scheduler probe attached.
+
+- **cgroup v1 nodes are not supported.** Per-cgroup pressure files do not
+  exist there. The node reports `compute_supported: false`, its pods render
+  without gauges, and the tooltip says why. Nothing crashes and no empty bars
+  are drawn.
+- **The scheduler probe requires kernel BTF (`/sys/kernel/btf/vmlinux`).**
+  Without it the probe does not load, the node reports
+  `contention_loaded: false` and keeps its gauges and stall findings; it
+  just never produces a `noisy-neighbor`.
+- **A node with no compute row at all** is running a controller older
+  than this feature (a disabled controller still posts a heartbeat that
+  says `compute.enabled` is false). When every node reports the feature
+  disabled, the map hides the compute layer and pods render exactly as
+  they did before.
+
+## Overhead
+
+The usage and stall layers are a file walk: roughly ten small reads per
+container per sample, no BPF, well under the syscall probe's own budget. The
+scheduler probe hooks every context switch on the node; its cost scales with
+the node's context-switch rate, which is shipped with every sample so the
+overhead can be estimated per node. The measured numbers — controller CPU
+with the sampler on and off, and per-hook cost from `bpftop` at several
+context-switch rates — are produced in Phase 4 of the
+[design document](https://github.com/kguardian-dev/kguardian/blob/main/docs/design/compute-contention-monitoring.md)
+and are what decides whether `contention.enabled` defaults to on.
+
+## What kguardian does *not* do
+
+- It never evicts, patches `resources:`, or scales anything. There is no
+  VPA-style actuation.
+- It does not profile (no stack sampling) and does not measure I/O, network
+  softirq or memory-bandwidth contention.
+- It does not generate `resources:` recommendations yet. The history it
+  keeps is the input a recommendation would need; that is a
+  [roadmap](/roadmap/future-resources) item.

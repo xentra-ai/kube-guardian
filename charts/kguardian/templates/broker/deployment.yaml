@@ -170,6 +170,57 @@ spec:
             - name: DB_MIGRATION_MAX_RETRIES
               value: {{ .Values.broker.dbMigrationMaxRetries | quote }}
             {{- end }}
+            {{/*
+              Compute history retention + finding thresholds (values.yaml
+              `compute`). Rendered whether or not compute.enabled: the
+              broker serves whatever the controllers send, and an operator
+              who turns the feature off on the controllers still wants the
+              retention pass to prune what was collected. Explicit
+              `hasKey` so retentionDays: 0 (disable history) propagates.
+            */}}
+            {{- $compute := .Values.compute | default dict }}
+            {{- $history := $compute.history | default dict }}
+            {{- $thresholds := $compute.thresholds | default dict }}
+            {{- if hasKey $history "retentionDays" }}
+            - name: COMPUTE_HISTORY_RETENTION_DAYS
+              value: {{ $history.retentionDays | quote }}
+            {{- end }}
+            {{- if hasKey $history "minuteResolutionHours" }}
+            - name: COMPUTE_HISTORY_MINUTE_HOURS
+              value: {{ $history.minuteResolutionHours | quote }}
+            {{- end }}
+            {{- if hasKey $thresholds "stallSome" }}
+            - name: COMPUTE_THRESHOLD_STALL_SOME
+              value: {{ $thresholds.stallSome | quote }}
+            {{- end }}
+            {{- if hasKey $thresholds "runqP99Ms" }}
+            - name: COMPUTE_THRESHOLD_RUNQ_P99_MS
+              value: {{ $thresholds.runqP99Ms | quote }}
+            {{- end }}
+            {{- if hasKey $thresholds "throttledRatio" }}
+            - name: COMPUTE_THRESHOLD_THROTTLED_RATIO
+              value: {{ $thresholds.throttledRatio | quote }}
+            {{- end }}
+            {{- if hasKey $thresholds "throttledRatioMax" }}
+            - name: COMPUTE_THRESHOLD_THROTTLED_RATIO_MAX
+              value: {{ $thresholds.throttledRatioMax | quote }}
+            {{- end }}
+            {{- if hasKey $thresholds "blameShare" }}
+            - name: COMPUTE_THRESHOLD_BLAME_SHARE
+              value: {{ $thresholds.blameShare | quote }}
+            {{- end }}
+            {{- if hasKey $thresholds "memStallSome" }}
+            - name: COMPUTE_THRESHOLD_MEM_STALL_SOME
+              value: {{ $thresholds.memStallSome | quote }}
+            {{- end }}
+            {{- if hasKey $thresholds "refaultPerMin" }}
+            - name: COMPUTE_THRESHOLD_REFAULT_PER_MIN
+              value: {{ $thresholds.refaultPerMin | quote }}
+            {{- end }}
+{{- if hasKey $thresholds "minRunqEvents" }}
+            - name: COMPUTE_THRESHOLD_MIN_RUNQ_EVENTS
+              value: {{ $thresholds.minRunqEvents | quote }}
+            {{- end }}
             # Anonymous version check-in (see docs/telemetry). CHART_VERSION
             # and KUBE_VERSION are captured at install/upgrade time and ride
             # the daily check-in; disable with telemetry.enabled=false.

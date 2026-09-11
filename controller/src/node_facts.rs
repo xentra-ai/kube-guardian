@@ -14,7 +14,10 @@
 use k8s_openapi::api::core::v1::{Node, Pod};
 use kube::{api::ListParams, Api, Client};
 use serde::Serialize;
+use std::path::Path;
 use tracing::{debug, warn};
+
+use crate::compute_sampler::{parse_meminfo_total_bytes, parse_proc_stat};
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct NodeFacts {
@@ -43,6 +46,76 @@ pub struct NodeFacts {
     /// in force when it is inert is the worst answer available, so
     /// `unknown` is reported wherever it cannot be established.
     pub policy_enforcement: String,
+    /// Static compute facts (design D10), read from the node itself
+    /// rather than the Node object. `None` when the source could not be
+    /// read; an older broker ignores the fields.
+    pub cpu_cores: Option<u32>,
+    pub memory_bytes: Option<u64>,
+    pub kernel_version: Option<String>,
+    /// 1 or 2. Decided by the presence of `cgroup.controllers` at the
+    /// cgroup root, which only the unified (v2) hierarchy has.
+    pub cgroup_version: Option<u8>,
+    /// Whether `/proc/pressure/cpu` exists: PSI compiled in and enabled.
+    pub psi_available: Option<bool>,
+}
+
+/// The node-local half of [`NodeFacts`]: what a compute gauge needs to
+/// know that never changes for the life of the process.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct StaticComputeFacts {
+    pub cpu_cores: Option<u32>,
+    pub memory_bytes: Option<u64>,
+    pub kernel_version: Option<String>,
+    pub cgroup_version: Option<u8>,
+    pub psi_available: Option<bool>,
+}
+
+/// Read the static compute facts from a host `/proc` and a cgroup root.
+/// Pure over the two paths, so it is fixture-tested; every field
+/// degrades to `None` independently.
+pub fn static_compute_facts(host_proc: &Path, cgroup_root: &Path) -> StaticComputeFacts {
+    let cpu_cores = std::fs::read_to_string(host_proc.join("stat"))
+        .ok()
+        .map(|b| parse_proc_stat(&b).cpus)
+        .filter(|n| *n > 0);
+    let memory_bytes = std::fs::read_to_string(host_proc.join("meminfo"))
+        .ok()
+        .and_then(|b| parse_meminfo_total_bytes(&b));
+    let kernel_version = std::fs::read_to_string(host_proc.join("sys/kernel/osrelease"))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let cgroup_version = if cgroup_root.join("cgroup.controllers").is_file() {
+        Some(2)
+    } else if cgroup_root.is_dir() {
+        Some(1)
+    } else {
+        None
+    };
+    let psi_available = if host_proc.is_dir() {
+        Some(host_proc.join("pressure/cpu").exists())
+    } else {
+        None
+    };
+    StaticComputeFacts {
+        cpu_cores,
+        memory_bytes,
+        kernel_version,
+        cgroup_version,
+        psi_available,
+    }
+}
+
+impl NodeFacts {
+    /// Fold the node-local facts in.
+    pub fn with_static(mut self, s: StaticComputeFacts) -> Self {
+        self.cpu_cores = s.cpu_cores;
+        self.memory_bytes = s.memory_bytes;
+        self.kernel_version = s.kernel_version;
+        self.cgroup_version = s.cgroup_version;
+        self.psi_available = s.psi_available;
+        self
+    }
 }
 
 /// What a node-local CNI agent pod reveals about itself.
@@ -344,6 +417,11 @@ pub fn derive_facts(node_name: &str, node: &Node, agent_pods: &[Pod]) -> NodeFac
         ip_family: ip_family(node).to_string(),
         node_os: node_os(node).to_string(),
         policy_enforcement: enforcement.to_string(),
+        cpu_cores: None,
+        memory_bytes: None,
+        kernel_version: None,
+        cgroup_version: None,
+        psi_available: None,
     }
 }
 
@@ -391,7 +469,15 @@ pub async fn report_node_facts(node_name: String, broker_url: String) {
             return;
         }
     };
-    let facts = derive_facts(&node_name, &node, &agent_pods);
+    // Node-local compute facts come from the same host /proc and cgroup
+    // root the sampler reads (COMPUTE_HOST_PROC / COMPUTE_CGROUP_ROOT),
+    // whether or not the sampler is enabled: cgroup version and PSI
+    // availability are what tell the UI *why* a node has no gauges.
+    let compute_cfg = crate::compute_config::ComputeConfig::from_env();
+    let facts = derive_facts(&node_name, &node, &agent_pods).with_static(static_compute_facts(
+        &compute_cfg.host_proc,
+        &compute_cfg.cgroup_root,
+    ));
     debug!(?facts, "derived node environment facts");
     let url = format!("{}/node/facts", broker_url.trim_end_matches('/'));
     match reqwest::Client::new().post(&url).json(&facts).send().await {
@@ -712,6 +798,91 @@ mod tests {
             ),
             ("baremetal", "vanilla", "unknown", "unknown", "unknown")
         );
+    }
+
+    #[test]
+    fn derive_facts_leaves_static_compute_fields_unset() {
+        // The pure Node-object mapping knows nothing about the host;
+        // the fields are filled by `with_static` from the node itself.
+        let f = derive_facts("n1", &Node::default(), &[]);
+        assert_eq!(f.cpu_cores, None);
+        assert_eq!(f.memory_bytes, None);
+        assert_eq!(f.kernel_version, None);
+        assert_eq!(f.cgroup_version, None);
+        assert_eq!(f.psi_available, None);
+        let v = serde_json::to_value(&f).unwrap();
+        for k in [
+            "cpu_cores",
+            "memory_bytes",
+            "kernel_version",
+            "cgroup_version",
+            "psi_available",
+        ] {
+            assert!(v.get(k).is_some(), "{k} must be present (null) on the wire");
+        }
+    }
+
+    fn fixture_root(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("kg-node-facts-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("proc/sys/kernel")).unwrap();
+        std::fs::create_dir_all(d.join("cgroup")).unwrap();
+        std::fs::write(
+            d.join("proc/stat"),
+            "cpu  1 2 3\ncpu0 1 2 3\ncpu1 1 2 3\ncpu2 1 2 3\ncpu3 1 2 3\nctxt 5\n",
+        )
+        .unwrap();
+        std::fs::write(d.join("proc/meminfo"), "MemTotal:       16384000 kB\n").unwrap();
+        std::fs::write(
+            d.join("proc/sys/kernel/osrelease"),
+            "6.6.87.2-microsoft-standard\n",
+        )
+        .unwrap();
+        d
+    }
+
+    #[test]
+    fn cgroup_v2_node_with_psi_reports_supported_facts() {
+        let d = fixture_root("v2");
+        std::fs::write(d.join("cgroup/cgroup.controllers"), "cpu memory io\n").unwrap();
+        std::fs::create_dir_all(d.join("proc/pressure")).unwrap();
+        std::fs::write(d.join("proc/pressure/cpu"), "some avg10=0.00\n").unwrap();
+        let s = static_compute_facts(&d.join("proc"), &d.join("cgroup"));
+        assert_eq!(
+            s,
+            StaticComputeFacts {
+                cpu_cores: Some(4),
+                memory_bytes: Some(16_384_000 * 1024),
+                kernel_version: Some("6.6.87.2-microsoft-standard".into()),
+                cgroup_version: Some(2),
+                psi_available: Some(true),
+            }
+        );
+        let f = derive_facts("n1", &Node::default(), &[]).with_static(s);
+        assert_eq!(f.cgroup_version, Some(2));
+        assert_eq!(f.psi_available, Some(true));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn cgroup_v1_node_without_psi_reports_unsupported_facts() {
+        // v1 root: a directory of controller subtrees, no
+        // cgroup.controllers file; and no /proc/pressure at all.
+        let d = fixture_root("v1");
+        std::fs::create_dir_all(d.join("cgroup/cpu,cpuacct")).unwrap();
+        let s = static_compute_facts(&d.join("proc"), &d.join("cgroup"));
+        assert_eq!(s.cgroup_version, Some(1));
+        assert_eq!(s.psi_available, Some(false));
+        assert_eq!(s.cpu_cores, Some(4));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn missing_sources_degrade_to_none_field_by_field() {
+        let d = std::env::temp_dir().join(format!("kg-node-facts-none-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let s = static_compute_facts(&d.join("proc"), &d.join("cgroup"));
+        assert_eq!(s, StaticComputeFacts::default());
     }
 
     #[test]

@@ -1,4 +1,4 @@
-import { ArrowDown, ArrowRight, Eye, EyeOff, Layers } from 'lucide-react';
+import { ArrowDown, ArrowRight, Eye, EyeOff, Layers, Zap } from 'lucide-react';
 
 // The Network Map toolbar (top-right). Extracted from NetworkGraph so the
 // toggles can be rendered and tested without ReactFlow/ELK.
@@ -14,6 +14,12 @@ export interface GraphControlsProps {
   onToggleDaemonSetNodes: () => void;
   /** DaemonSet / host-network peers: shown when the toggle is on, hidden otherwise. */
   daemonSetCount: number;
+  /** Draw culprit → victim contention edges (design D8). Default on. */
+  showContention?: boolean;
+  onToggleContention?: () => void;
+  /** Contention edges available on the map (drawn when on, held back when off).
+   *  The toggle is only offered when there is at least one. */
+  contentionCount?: number;
   layoutDirection: 'LR' | 'TB';
   onToggleLayoutDirection: () => void;
 }
@@ -27,7 +33,13 @@ export const TRAFFIC_ACTIVE = 'bg-hubble-accent/15 border-hubble-accent/50 text-
 export const EXTERNAL_ACTIVE = 'bg-hubble-warning/15 border-hubble-warning/50 text-hubble-warning hover:bg-hubble-warning/25';
 export const DAEMONSET_ACTIVE = 'bg-hubble-info/15 border-hubble-info/50 text-hubble-info hover:bg-hubble-info/25';
 
+// Contention = error red: the same hue as the dashed culprit → victim edges
+// it controls (they share the token with denied flows on purpose — both are
+// "something is being starved").
+export const CONTENTION_ACTIVE = 'bg-hubble-error/15 border-hubble-error/50 text-hubble-error hover:bg-hubble-error/25';
+
 export const DAEMONSET_TOGGLE_TOOLTIP = 'Show DaemonSet and host-network peers such as node-exporter, CNI and CSI agents';
+export const CONTENTION_TOGGLE_TOOLTIP = 'Show noisy-neighbour edges: a dashed line from the pod hogging the CPU to the pod starved by it, labelled with its share of the wait';
 
 export function GraphControls({
   showTraffic,
@@ -38,6 +50,9 @@ export function GraphControls({
   showDaemonSetNodes,
   onToggleDaemonSetNodes,
   daemonSetCount,
+  showContention = true,
+  onToggleContention,
+  contentionCount = 0,
   layoutDirection,
   onToggleLayoutDirection,
 }: GraphControlsProps) {
@@ -78,6 +93,20 @@ export function GraphControls({
               ({daemonSetCount}{showDaemonSetNodes ? '' : ' hidden'})
             </span>
           )}
+        </button>
+      )}
+      {contentionCount > 0 && onToggleContention && (
+        <button
+          onClick={onToggleContention}
+          aria-pressed={showContention}
+          className={`${base} ${showContention ? CONTENTION_ACTIVE : off}`}
+          title={CONTENTION_TOGGLE_TOOLTIP}
+        >
+          {showContention ? <Zap className="w-3.5 h-3.5" /> : <EyeOff className="w-3.5 h-3.5 text-hubble-error" />}
+          Contention{' '}
+          <span className={showContention ? '' : 'text-hubble-error'}>
+            ({contentionCount}{showContention ? '' : ' hidden'})
+          </span>
         </button>
       )}
       {showTraffic && (

@@ -102,6 +102,46 @@ export const TOOL_DEFS: ToolDef[] = [
       "Generate a least-privilege seccomp profile for a pod from its observed syscalls. Returns ready-to-use seccomp JSON (allow-lists the observed syscalls, denies the rest). Parameter: pod_name (required). Use when the user asks to 'generate/create a seccomp profile' or 'restrict syscalls for X'.",
     parameters: { type: "object", properties: { pod_name: str("The name of the pod to generate a seccomp profile for") }, required: ["pod_name"] },
   },
+  // --- compute gauges & noisy-neighbour detection (design: compute-contention-monitoring.md) ---
+  {
+    name: "get_pod_compute",
+    description:
+      "Get live compute state for a pod: per-container CPU usage (millicores) vs request/limit, CFS throttling, cgroup PSI pressure, memory working set vs limit, OOM/refault counters, scheduler run-queue latency (p50/p95/p99) and the blame list of cgroups that pre-empted it — plus a 60-minute history summary (avg/max/p99 CPU, throttled ratio, peak pressure) per container. THE tool for 'why is pod X slow', 'is X CPU-starved or throttled', 'is X under memory pressure'. Requires namespace AND pod_name. Follow up with get_compute_findings to see if the broker has raised a finding (noisy-neighbor, cpu-throttled, ...) for it.",
+    parameters: {
+      type: "object",
+      properties: {
+        namespace: str("Kubernetes namespace of the pod (required — compute data is namespace-scoped)"),
+        pod_name: str("The name of the pod to inspect"),
+      },
+      required: ["namespace", "pod_name"],
+    },
+  },
+  {
+    name: "get_compute_findings",
+    description:
+      "Get the broker's compute findings: noisy-neighbor (victim starved by a named culprit pod/system unit, with blame share), cpu-contended (starved, no dominant culprit), cpu-throttled (victim hitting its own CPU limit — raise the limit, no culprit), memory-pressure (node memory pressure with a culprit), memory-limit-thrash (victim thrashing under its own memory limit). Each finding carries victim, culprit (or null), evidence and a human-readable message. culprit.blame_share is the culprit's share of the victim's CPU wait for noisy-neighbor, or of the node's memory overage for memory-pressure. Filters optional: namespace (victim's namespace), node; omit both for the whole cluster. The response also carries truncated (true when the broker stopped after its victim budget — narrow by namespace/node), victims_evaluated, and history_disabled (true when compute history retention is off, so an empty findings list means 'not evaluated', not 'all clear'). THE tool for 'who is the noisy neighbour', 'what is starving X', 'which pods are throttled', 'any compute problems in namespace Y'.",
+    parameters: {
+      type: "object",
+      properties: {
+        namespace: str("Optional namespace filter (matches the victim's namespace; culprits may live in another namespace)"),
+        node: str("Optional node name filter"),
+      },
+      required: [],
+    },
+  },
+  {
+    name: "get_node_contention",
+    description:
+      "Get raw scheduler contention pairs on a node: which cgroup (culprit pod container, system unit or kernel) pre-empted which victim container, with pre-emption count and total wait time over the window (default 5 minutes). Lower-level than get_compute_findings — use it to rank every bully on a node, check a suspected culprit that has not crossed the finding threshold, or explain the blame behind a noisy-neighbor finding. Requires node; minutes optional.",
+    parameters: {
+      type: "object",
+      properties: {
+        node: str("The Kubernetes node to inspect"),
+        minutes: { type: "integer", description: "Look-back window in minutes (default 5, max 10080)." },
+      },
+      required: ["node"],
+    },
+  },
 ];
 
 /** Build the system-prompt tool guide from the registry — one source of truth. */

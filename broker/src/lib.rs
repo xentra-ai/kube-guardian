@@ -1,5 +1,8 @@
 mod add;
 mod audit;
+mod compute;
+mod compute_api;
+mod compute_types;
 mod error;
 mod get;
 mod ip;
@@ -15,6 +18,12 @@ pub use add::{
     mark_pod_dead,
 };
 pub use audit::AuditClient;
+pub use compute::{compute_findings, ComputeThresholds};
+pub use compute_api::{
+    add_compute_batch, add_compute_history_batch, compute_ingest_scope, get_compute_contention,
+    get_compute_findings, get_compute_history, get_compute_latest, get_compute_nodes,
+};
+pub use compute_types::*;
 pub use error::*;
 pub use peer::spawn as spawn_peer_late_resolve;
 pub use read_budget::*;

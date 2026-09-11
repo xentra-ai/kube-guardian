@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { policyTypeForFinding } from './findingPolicyType';
+import { ALL_FINDING_KINDS, findingAction, policyTypeForFinding } from './findingPolicyType';
 import {
   recommendedPolicyType,
   enforcementAdvisory,
@@ -102,6 +102,22 @@ describe('one rule, one place', () => {
   it('still routes a syscall finding to seccomp regardless of CNI', () => {
     for (const cni of ['cilium', 'aws-vpc-cni', 'unknown']) {
       expect(policyTypeForFinding('sensitive-syscalls', cni)).toBe('seccomp');
+    }
+  });
+
+  it('every policy-kind × CNI maps to a policy type the CNI can enforce', () => {
+    // The compute kinds (noisy-neighbor, cpu-throttled, cpu-contended,
+    // memory-pressure, memory-limit-thrash) are EXCLUDED on purpose: they are
+    // `resources` findings (design D7) with no policy to build, and the App
+    // never calls policyTypeForFinding for them. Iterating them here would
+    // assert a mapping that must not exist.
+    const policyKinds = ALL_FINDING_KINDS.filter((k) => findingAction(k) === 'policy');
+    expect(policyKinds).toEqual(['denied-traffic', 'sensitive-syscalls', 'egress-fanout', 'would-deny']);
+    for (const kind of policyKinds) {
+      for (const cni of ['cilium', 'aws-vpc-cni', 'calico', 'flannel', 'antrea', 'weave', 'unknown']) {
+        const expected = kind === 'sensitive-syscalls' ? 'seccomp' : recommendedPolicyType(cni);
+        expect(policyTypeForFinding(kind, cni)).toBe(expected);
+      }
     }
   });
 });

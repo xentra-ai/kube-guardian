@@ -2,6 +2,31 @@ import axios from 'axios';
 import type { AxiosInstance } from 'axios';
 import type { PodInfo, NetworkTraffic, SyscallInfo, ServiceInfo, AuditVerdict, ClusterEnvironment } from '../types';
 import { UNKNOWN_CLUSTER_ENVIRONMENT } from '../types';
+import type {
+  ComputeFindingsResponse,
+  ComputeHistoryRow,
+  ComputeLatestResponse,
+  ComputeNode,
+  ContentionPair,
+} from '../types/compute';
+
+/**
+ * The broker has no compute endpoints (404 / 501): a broker predating the
+ * feature. Consumers stop polling for the session instead of retrying.
+ */
+export class ComputeUnsupportedError extends Error {
+  constructor(path: string) {
+    super(`compute endpoints unsupported by this broker (${path})`);
+    this.name = 'ComputeUnsupportedError';
+  }
+}
+
+function rethrowCompute(error: unknown, path: string): never {
+  if (axios.isAxiosError(error) && (error.response?.status === 404 || error.response?.status === 501)) {
+    throw new ComputeUnsupportedError(path);
+  }
+  throw error;
+}
 
 class BrokerAPIClient {
   private client: AxiosInstance;
@@ -243,6 +268,82 @@ class BrokerAPIClient {
     } catch (error) {
       console.error('Error fetching namespaces:', error);
       return ['default'];
+    }
+  }
+
+  // ── Compute gauges / contention (docs/design/compute-contention-monitoring.md) ──
+  // Unlike the traffic getters these do NOT swallow failures: a 404/501
+  // becomes ComputeUnsupportedError (the hook stops polling for the
+  // session, so an older broker is not hammered every 5 s) and anything else
+  // propagates so the hook can surface a real error and retry next tick.
+
+  /** Live per-container rows + node rows for the namespace (`GET /compute/latest`). */
+  async getComputeLatest(namespace: string): Promise<ComputeLatestResponse> {
+    try {
+      const response = await this.client.get<ComputeLatestResponse>('/compute/latest', { params: { namespace } });
+      const data = response.data;
+      return {
+        containers: Array.isArray(data?.containers) ? data.containers : [],
+        nodes: Array.isArray(data?.nodes) ? data.nodes : [],
+      };
+    } catch (error) {
+      return rethrowCompute(error, '/compute/latest');
+    }
+  }
+
+  /** Minute / 5-minute history rows for a pod, oldest first (`GET /compute/history/{pod_uid}`). */
+  async getComputeHistory(podUid: string, minutes = 60): Promise<ComputeHistoryRow[]> {
+    try {
+      const response = await this.client.get<{ rows: ComputeHistoryRow[] }>(
+        `/compute/history/${encodeURIComponent(podUid)}`,
+        { params: { minutes } },
+      );
+      return Array.isArray(response.data?.rows) ? response.data.rows : [];
+    } catch (error) {
+      return rethrowCompute(error, '/compute/history');
+    }
+  }
+
+  /** Victim ↔ culprit pairs for a namespace or node (`GET /compute/contention`). */
+  async getComputeContention(opts: { namespace?: string; node?: string; minutes?: number }): Promise<ContentionPair[]> {
+    try {
+      const params: Record<string, string | number> = {};
+      if (opts.namespace) params.namespace = opts.namespace;
+      if (opts.node) params.node = opts.node;
+      if (opts.minutes) params.minutes = opts.minutes;
+      const response = await this.client.get<{ pairs: ContentionPair[] }>('/compute/contention', { params });
+      return Array.isArray(response.data?.pairs) ? response.data.pairs : [];
+    } catch (error) {
+      return rethrowCompute(error, '/compute/contention');
+    }
+  }
+
+  /** Broker-computed compute findings + metadata (`GET /compute/findings`); no filter = cluster. */
+  async getComputeFindings(opts: { namespace?: string; node?: string } = {}): Promise<ComputeFindingsResponse> {
+    try {
+      const params: Record<string, string> = {};
+      if (opts.namespace) params.namespace = opts.namespace;
+      if (opts.node) params.node = opts.node;
+      const response = await this.client.get<ComputeFindingsResponse>('/compute/findings', { params });
+      const data = response.data;
+      return {
+        findings: Array.isArray(data?.findings) ? data.findings : [],
+        truncated: data?.truncated === true,
+        victims_evaluated: typeof data?.victims_evaluated === 'number' ? data.victims_evaluated : undefined,
+        history_disabled: data?.history_disabled === true,
+      };
+    } catch (error) {
+      return rethrowCompute(error, '/compute/findings');
+    }
+  }
+
+  /** Every node's compute / contention support row (`GET /compute/nodes`). */
+  async getComputeNodes(): Promise<ComputeNode[]> {
+    try {
+      const response = await this.client.get<{ nodes: ComputeNode[] }>('/compute/nodes');
+      return Array.isArray(response.data?.nodes) ? response.data.nodes : [];
+    } catch (error) {
+      return rethrowCompute(error, '/compute/nodes');
     }
   }
 

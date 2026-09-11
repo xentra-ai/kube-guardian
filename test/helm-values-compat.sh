@@ -198,6 +198,63 @@ render "mcp-token-not-optional" \
 assert_render_fails "mcp-no-auth" "requires ai.mcp.auth.existingSecret" \
   --set ai.enabled=true --set ai.mcp.enabled=true
 
+# ---------------------------------------------------------------------------
+# Compute gauges (values.yaml `compute`). The master switch owns BOTH the
+# read-only /sys/fs/cgroup hostPath and the controller's COMPUTE_* env; the
+# broker's retention/threshold env renders regardless so a disabled cluster
+# still prunes what it collected. Pinned here so a refactor cannot start
+# mounting cgroupfs on an operator who turned the feature off.
+# ---------------------------------------------------------------------------
+
+# 9. Defaults: gauges on, scheduler probe off, cgroupfs mounted read-only.
+render "compute-defaults" && {
+  assert_has "compute-defaults" "name: COMPUTE_ENABLED"
+  assert_has "compute-defaults" "name: COMPUTE_CONTENTION_ENABLED"
+  assert_has "compute-defaults" "name: cgroupfs"
+  assert_has "compute-defaults" "path: /sys/fs/cgroup"
+  assert_has "compute-defaults" "name: COMPUTE_HISTORY_RETENTION_DAYS"
+  assert_has "compute-defaults" "name: COMPUTE_THRESHOLD_BLAME_SHARE"
+  grep -A1 'name: COMPUTE_THRESHOLD_REFAULT_PER_MIN' <<<"$OUT" | grep -q 'value: "1000"' || \
+    { echo "FAIL [compute-defaults]: COMPUTE_THRESHOLD_REFAULT_PER_MIN must default to 1000"; fail=1; }
+  grep -A1 'name: COMPUTE_THRESHOLD_MIN_RUNQ_EVENTS' <<<"$OUT" | grep -q 'value: "50"' || \
+    { echo "FAIL [compute-defaults]: COMPUTE_THRESHOLD_MIN_RUNQ_EVENTS must default to 50"; fail=1; }
+  grep -q 'name: COMPUTE_CONTENTION_ENABLED' <<<"$OUT" && \
+    grep -A1 'name: COMPUTE_CONTENTION_ENABLED' <<<"$OUT" | grep -q 'value: "false"' || \
+    { echo "FAIL [compute-defaults]: COMPUTE_CONTENTION_ENABLED must default to false"; fail=1; }
+  assert_deploys "compute-defaults" 4
+}
+
+# 9b. compute.enabled=false: COMPUTE_ENABLED=false is still rendered (the
+# controller must not fall back to its own default), and NO cgroup mount,
+# no sampler env, no probe env.
+render "compute-off" --set compute.enabled=false && {
+  assert_has    "compute-off" "name: COMPUTE_ENABLED"
+  assert_absent "compute-off" "name: cgroupfs"
+  assert_absent "compute-off" "path: /sys/fs/cgroup"
+  assert_absent "compute-off" "COMPUTE_SAMPLE_INTERVAL_SECS"
+  assert_absent "compute-off" "COMPUTE_CONTENTION_ENABLED"
+  assert_absent "compute-off" "COMPUTE_MIN_RUNQ_LATENCY_US"
+  # Broker-side retention still renders: prune what was collected.
+  assert_has    "compute-off" "name: COMPUTE_HISTORY_RETENTION_DAYS"
+}
+
+# 9c. Scheduler probe on: same mount, probe env flips, filter propagates.
+render "compute-contention" --set compute.contention.enabled=true \
+  --set compute.contention.minRunqLatencyUs=250 && {
+  assert_has "compute-contention" "name: cgroupfs"
+  grep -A1 'name: COMPUTE_CONTENTION_ENABLED' <<<"$OUT" | grep -q 'value: "true"' || \
+    { echo "FAIL [compute-contention]: COMPUTE_CONTENTION_ENABLED must render true"; fail=1; }
+  grep -A1 'name: COMPUTE_MIN_RUNQ_LATENCY_US' <<<"$OUT" | grep -q 'value: "250"' || \
+    { echo "FAIL [compute-contention]: COMPUTE_MIN_RUNQ_LATENCY_US must carry the configured value"; fail=1; }
+}
+
+# 9d. retentionDays: 0 (disable history) must propagate — a `with` guard would
+# swallow the zero, the same trap the audit retention block documents.
+render "compute-history-off" --set compute.history.retentionDays=0 && {
+  grep -A1 'name: COMPUTE_HISTORY_RETENTION_DAYS' <<<"$OUT" | grep -q 'value: "0"' || \
+    { echo "FAIL [compute-history-off]: COMPUTE_HISTORY_RETENTION_DAYS=0 must propagate"; fail=1; }
+}
+
 # 8d. ...but the operator can still say "yes, unauthenticated, I mean it".
 # That opt-out is deliberately a value they have to write down, so it shows up
 # in a values diff and in review the way a missing token never would.

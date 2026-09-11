@@ -34,7 +34,27 @@
 //!
 //! Errors are logged and the task continues; a transient DB outage
 //! never crashes the broker.
+//!
+//! # Compute history (design D5)
+//!
+//! A second loop, on its own cadence (`COMPUTE_RETENTION_INTERVAL_SECS`,
+//! default 600), keeps the compute tables bounded:
+//!
+//! 1. **Downsample**: minute rows (`resolution_secs = 60`) older than
+//!    `COMPUTE_HISTORY_MINUTE_HOURS` (default 24) are folded per
+//!    `(container_uid, 5-minute bucket)` into one `resolution_secs = 300`
+//!    row — avg of avgs, max of maxes, last-by-ts of lasts, summed
+//!    counters, element-wise summed `runq_hist` — and the minute rows
+//!    deleted in the SAME transaction, one bounded range of whole
+//!    buckets per batch (see `downsample_range`).
+//! 2. **Prune**: `pod_compute_history` and `pod_contention_history` rows
+//!    older than `COMPUTE_HISTORY_RETENTION_DAYS` (default 7; 0 disables
+//!    history entirely, ingest included) — same batched CTE DELETE.
+//! 3. **Dead containers**: `pod_compute_latest` rows not refreshed for
+//!    10 minutes (the container is gone, or its node's controller is).
+//!    Runs regardless of the history setting.
 
+use chrono::NaiveDateTime;
 use diesel::pg::PgConnection;
 use diesel::prelude::*;
 use diesel::r2d2::{self, ConnectionManager};
@@ -108,6 +128,7 @@ pub fn spawn(pool: DbPool) {
         "retention loop scheduled (audit_days=0 means audit pruning off; dead-pod pruning still runs)"
     );
 
+    let compute_pool = pool.clone();
     actix_web::rt::spawn(async move {
         // First pass after a short warmup so the broker doesn't hammer
         // a cold pool the second it starts.
@@ -118,6 +139,30 @@ pub fn spawn(pool: DbPool) {
                 run_pass(&pool, audit_days).await;
             }
             run_dead_pod_pass(&pool, dead_pod_days).await;
+            tokio::time::sleep(interval).await;
+        }
+    });
+    spawn_compute(compute_pool);
+}
+
+/// The compute-history loop (module docs, "Compute history"). Separate
+/// task and cadence from the audit loop: the downsample is a heavier,
+/// more frequent pass, and one loop's failure mode must not delay the
+/// other's.
+fn spawn_compute(pool: DbPool) {
+    let days = compute_history_retention_days();
+    let minute_hours = compute_minute_hours();
+    let interval = compute_retention_interval();
+    info!(
+        days,
+        minute_hours,
+        interval_secs = interval.as_secs(),
+        "compute retention loop scheduled (days=0 means history off; stale-latest pruning still runs)"
+    );
+    actix_web::rt::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(90)).await;
+        loop {
+            run_compute_pass(&pool, days, minute_hours).await;
             tokio::time::sleep(interval).await;
         }
     });
@@ -301,6 +346,377 @@ fn run_batch(pool: &DbPool, days: u32, batch_size: i64) -> Result<usize, Retenti
     .execute(&mut conn)
     .map_err(RetentionError::Diesel)?;
     Ok(deleted)
+}
+
+// ---------------------------------------------------------------------
+// Compute history (design D5)
+// ---------------------------------------------------------------------
+
+const DEFAULT_COMPUTE_RETENTION_DAYS: u32 = 7;
+const DEFAULT_COMPUTE_MINUTE_HOURS: u32 = 24;
+const DEFAULT_COMPUTE_INTERVAL_SECS: u64 = 600;
+/// A `pod_compute_latest` row not refreshed for this long is a dead
+/// container (the controller upserts every 5 s; 10 minutes is two
+/// orders of magnitude of slack for a slow node).
+const COMPUTE_LATEST_STALE_SECS: i64 = 600;
+/// Width of a downsampled row.
+pub(crate) const DOWNSAMPLE_BUCKET_SECS: i64 = 300;
+/// Whole buckets folded per transaction. Two buckets = 10 minutes of
+/// minute rows = 10 x (containers on the cluster) rows read, 2 x that
+/// written: ~30 000 rows deleted per batch on a 3 000-container
+/// cluster, the same order as `MAX_BATCH_SIZE` for the audit prune.
+pub(crate) const DOWNSAMPLE_BUCKETS_PER_BATCH: i64 = 2;
+/// Batches per pass: 60 x 10 minutes = 10 hours of backlog per pass,
+/// so a broker that was down for a day catches up in three passes
+/// without monopolising the blocking pool for one.
+const MAX_DOWNSAMPLE_BATCHES_PER_PASS: u32 = 60;
+
+/// `COMPUTE_HISTORY_RETENTION_DAYS` (default 7). 0 disables history:
+/// the ingest handler drops minute batches and this loop skips the
+/// downsample and prune. Shared with `compute_api.rs`.
+pub(crate) fn compute_history_retention_days() -> u32 {
+    std::env::var("COMPUTE_HISTORY_RETENTION_DAYS")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(DEFAULT_COMPUTE_RETENTION_DAYS)
+}
+
+/// `COMPUTE_HISTORY_MINUTE_HOURS` (default 24): how long minute rows
+/// are kept before being folded into 5-minute rows. Floored at 1 so the
+/// engine's 5-minute window always sees minute rows.
+fn compute_minute_hours() -> u32 {
+    std::env::var("COMPUTE_HISTORY_MINUTE_HOURS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .map(|h| h.max(1))
+        .unwrap_or(DEFAULT_COMPUTE_MINUTE_HOURS)
+}
+
+fn compute_retention_interval() -> Duration {
+    let secs = std::env::var("COMPUTE_RETENTION_INTERVAL_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(DEFAULT_COMPUTE_INTERVAL_SECS);
+    Duration::from_secs(secs.max(60))
+}
+
+/// Floor a timestamp to the start of its 5-minute bucket (UTC-naive,
+/// same epoch arithmetic the SQL uses).
+pub(crate) fn floor_to_bucket(ts: NaiveDateTime) -> NaiveDateTime {
+    let epoch = ts.and_utc().timestamp();
+    let floored = epoch.div_euclid(DOWNSAMPLE_BUCKET_SECS) * DOWNSAMPLE_BUCKET_SECS;
+    chrono::DateTime::from_timestamp(floored, 0)
+        .map(|d| d.naive_utc())
+        .unwrap_or(ts)
+}
+
+/// The `[start, end)` range of WHOLE buckets one downsample batch folds,
+/// given the oldest remaining minute row and the cutoff below which
+/// minute rows are eligible. `None` when nothing can be folded yet.
+///
+/// Two invariants keep the fold idempotent and duplicate-free:
+/// - it starts at the oldest row's bucket, so buckets are folded oldest
+///   first and a batch never skips one;
+/// - it never reaches into the bucket that contains the cutoff. That
+///   bucket may still be receiving minute rows on its far side; folding
+///   half of it now and the other half later would produce two 300 s
+///   rows for the same (container, bucket).
+pub(crate) fn downsample_range(
+    oldest_minute_row: NaiveDateTime,
+    cutoff: NaiveDateTime,
+    buckets: i64,
+) -> Option<(NaiveDateTime, NaiveDateTime)> {
+    let start = floor_to_bucket(oldest_minute_row);
+    let end_limit = floor_to_bucket(cutoff);
+    if start >= end_limit {
+        return None;
+    }
+    let span = chrono::Duration::seconds(DOWNSAMPLE_BUCKET_SECS * buckets.max(1));
+    let end = (start + span).min(end_limit);
+    Some((start, end))
+}
+
+/// One compute retention pass: downsample, prune, drop stale latest
+/// rows. Each step is independent — a failure in one is logged and the
+/// next still runs — and each batch is its own `spawn_blocking`.
+async fn run_compute_pass(pool: &DbPool, days: u32, minute_hours: u32) {
+    if days > 0 {
+        run_downsample(pool, minute_hours).await;
+        run_compute_prune(pool, "pod_compute_history", days).await;
+        run_compute_prune(pool, "pod_contention_history", days).await;
+    }
+    run_stale_latest(pool).await;
+}
+
+async fn run_downsample(pool: &DbPool, minute_hours: u32) {
+    let mut folded_total = 0usize;
+    let mut written_total = 0usize;
+    for batch_idx in 0..MAX_DOWNSAMPLE_BATCHES_PER_PASS {
+        let pool = pool.clone();
+        let result =
+            tokio::task::spawn_blocking(move || run_downsample_batch(&pool, minute_hours)).await;
+        match result {
+            Ok(Ok(None)) => {
+                if folded_total == 0 {
+                    debug!("compute downsample: nothing to fold");
+                } else {
+                    info!(
+                        minute_rows_folded = folded_total,
+                        five_minute_rows = written_total,
+                        batches = batch_idx,
+                        "compute downsample folded minute rows",
+                    );
+                }
+                return;
+            }
+            Ok(Ok(Some((written, folded)))) => {
+                written_total += written;
+                folded_total += folded;
+            }
+            Ok(Err(e)) => {
+                warn!(error = %e, folded_before_failure = folded_total, "compute downsample failed");
+                return;
+            }
+            Err(e) => {
+                warn!(error = %e, folded_before_failure = folded_total, "compute downsample task panicked");
+                return;
+            }
+        }
+    }
+    info!(
+        minute_rows_folded = folded_total,
+        cap = MAX_DOWNSAMPLE_BATCHES_PER_PASS,
+        "compute downsample hit per-pass batch cap; remaining buckets fold on next interval",
+    );
+}
+
+#[derive(diesel::QueryableByName)]
+struct OldestRow {
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamp>)]
+    ts: Option<chrono::NaiveDateTime>,
+}
+
+/// Fold one bucket range. Returns `(five_minute_rows_written,
+/// minute_rows_deleted)`, or `None` when no eligible bucket remains.
+///
+/// The INSERT ... SELECT and the DELETE share one transaction and one
+/// predicate (`resolution_secs = 60 AND ts >= $1 AND ts < $2`), so a
+/// crash between them cannot leave a bucket both folded and unfolded.
+/// The histogram is summed element-wise through `unnest ... WITH
+/// ORDINALITY` in a LATERAL subquery because Postgres has no array
+/// aggregate that adds arrays. Quantile columns take the max over the
+/// bucket (a p99 of five p99s is not a p99, but the max is a safe upper
+/// bound, and the summed `runq_hist` is there to re-derive an exact
+/// one). Written with epoch arithmetic rather than `date_bin` so it runs
+/// on any Postgres an operator may bring.
+fn run_downsample_batch(
+    pool: &DbPool,
+    minute_hours: u32,
+) -> Result<Option<(usize, usize)>, RetentionError> {
+    use diesel::sql_types::Timestamp;
+    let mut conn = pool.get().map_err(RetentionError::Pool)?;
+    let now = chrono::Utc::now().naive_utc();
+    let cutoff = now - chrono::Duration::hours(i64::from(minute_hours));
+    let oldest = sql_query(
+        "SELECT min(ts) AS ts FROM pod_compute_history WHERE resolution_secs = 60 AND ts < $1",
+    )
+    .bind::<Timestamp, _>(cutoff)
+    .get_result::<OldestRow>(&mut conn)
+    .map_err(RetentionError::Diesel)?
+    .ts;
+    let Some(oldest) = oldest else {
+        return Ok(None);
+    };
+    let Some((start, end)) = downsample_range(oldest, cutoff, DOWNSAMPLE_BUCKETS_PER_BATCH) else {
+        return Ok(None);
+    };
+    conn.transaction::<_, RetentionError, _>(|conn| {
+        let written = sql_query(DOWNSAMPLE_INSERT_SQL)
+            .bind::<Timestamp, _>(start)
+            .bind::<Timestamp, _>(end)
+            .execute(conn)
+            .map_err(RetentionError::Diesel)?;
+        let deleted = sql_query(
+            "DELETE FROM pod_compute_history \
+             WHERE resolution_secs = 60 AND ts >= $1 AND ts < $2",
+        )
+        .bind::<Timestamp, _>(start)
+        .bind::<Timestamp, _>(end)
+        .execute(conn)
+        .map_err(RetentionError::Diesel)?;
+        debug!(
+            %start,
+            %end,
+            written,
+            deleted,
+            "compute downsample batch"
+        );
+        Ok(Some((written, deleted)))
+    })
+}
+
+const DOWNSAMPLE_INSERT_SQL: &str = "\
+INSERT INTO pod_compute_history (\
+    container_uid, pod_uid, namespace, pod_name, container, node, ts, resolution_secs, \
+    cpu_usage_millis_avg, cpu_usage_millis_max, cpu_usage_millis_last, \
+    cpu_quota_usec, cpu_period_usec, cpu_request_millis, cpu_limit_millis, \
+    cpu_nr_periods, cpu_nr_throttled, cpu_throttled_usec, \
+    cpu_psi_some10_avg, cpu_psi_some10_max, cpu_psi_full10_avg, cpu_psi_full10_max, \
+    mem_current_avg, mem_current_max, mem_current_last, \
+    mem_working_set_avg, mem_working_set_max, mem_working_set_last, \
+    mem_limit, mem_request, \
+    mem_psi_some10_avg, mem_psi_some10_max, mem_psi_full10_avg, mem_psi_full10_max, \
+    mem_events_high, mem_events_max, mem_oom_kill, mem_refault, mem_pgmajfault, \
+    runq_count, runq_p50_us, runq_p95_us, runq_p99_us, runq_max_us, runq_overflow, runq_hist) \
+SELECT g.container_uid, g.pod_uid, g.namespace, g.pod_name, g.container, g.node, g.bucket, 300, \
+    g.cpu_usage_millis_avg, g.cpu_usage_millis_max, g.cpu_usage_millis_last, \
+    g.cpu_quota_usec, g.cpu_period_usec, g.cpu_request_millis, g.cpu_limit_millis, \
+    g.cpu_nr_periods, g.cpu_nr_throttled, g.cpu_throttled_usec, \
+    g.cpu_psi_some10_avg, g.cpu_psi_some10_max, g.cpu_psi_full10_avg, g.cpu_psi_full10_max, \
+    g.mem_current_avg, g.mem_current_max, g.mem_current_last, \
+    g.mem_working_set_avg, g.mem_working_set_max, g.mem_working_set_last, \
+    g.mem_limit, g.mem_request, \
+    g.mem_psi_some10_avg, g.mem_psi_some10_max, g.mem_psi_full10_avg, g.mem_psi_full10_max, \
+    g.mem_events_high, g.mem_events_max, g.mem_oom_kill, g.mem_refault, g.mem_pgmajfault, \
+    g.runq_count, g.runq_p50_us, g.runq_p95_us, g.runq_p99_us, g.runq_max_us, g.runq_overflow, h.hist \
+FROM ( \
+    SELECT container_uid, \
+        min(pod_uid) AS pod_uid, min(namespace) AS namespace, min(pod_name) AS pod_name, \
+        min(container) AS container, min(node) AS node, \
+        (to_timestamp(floor(extract(epoch FROM ts) / 300) * 300) AT TIME ZONE 'UTC') AS bucket, \
+        avg(cpu_usage_millis_avg) AS cpu_usage_millis_avg, \
+        max(cpu_usage_millis_max) AS cpu_usage_millis_max, \
+        (array_agg(cpu_usage_millis_last ORDER BY ts DESC))[1] AS cpu_usage_millis_last, \
+        (array_agg(cpu_quota_usec ORDER BY ts DESC))[1] AS cpu_quota_usec, \
+        (array_agg(cpu_period_usec ORDER BY ts DESC))[1] AS cpu_period_usec, \
+        (array_agg(cpu_request_millis ORDER BY ts DESC))[1] AS cpu_request_millis, \
+        (array_agg(cpu_limit_millis ORDER BY ts DESC))[1] AS cpu_limit_millis, \
+        sum(cpu_nr_periods)::bigint AS cpu_nr_periods, \
+        sum(cpu_nr_throttled)::bigint AS cpu_nr_throttled, \
+        sum(cpu_throttled_usec)::bigint AS cpu_throttled_usec, \
+        avg(cpu_psi_some10_avg) AS cpu_psi_some10_avg, max(cpu_psi_some10_max) AS cpu_psi_some10_max, \
+        avg(cpu_psi_full10_avg) AS cpu_psi_full10_avg, max(cpu_psi_full10_max) AS cpu_psi_full10_max, \
+        avg(mem_current_avg)::bigint AS mem_current_avg, max(mem_current_max) AS mem_current_max, \
+        (array_agg(mem_current_last ORDER BY ts DESC))[1] AS mem_current_last, \
+        avg(mem_working_set_avg)::bigint AS mem_working_set_avg, \
+        max(mem_working_set_max) AS mem_working_set_max, \
+        (array_agg(mem_working_set_last ORDER BY ts DESC))[1] AS mem_working_set_last, \
+        (array_agg(mem_limit ORDER BY ts DESC))[1] AS mem_limit, \
+        (array_agg(mem_request ORDER BY ts DESC))[1] AS mem_request, \
+        avg(mem_psi_some10_avg) AS mem_psi_some10_avg, max(mem_psi_some10_max) AS mem_psi_some10_max, \
+        avg(mem_psi_full10_avg) AS mem_psi_full10_avg, max(mem_psi_full10_max) AS mem_psi_full10_max, \
+        sum(mem_events_high)::bigint AS mem_events_high, sum(mem_events_max)::bigint AS mem_events_max, \
+        sum(mem_oom_kill)::bigint AS mem_oom_kill, sum(mem_refault)::bigint AS mem_refault, \
+        sum(mem_pgmajfault)::bigint AS mem_pgmajfault, \
+        sum(runq_count)::bigint AS runq_count, max(runq_p50_us) AS runq_p50_us, \
+        max(runq_p95_us) AS runq_p95_us, max(runq_p99_us) AS runq_p99_us, \
+        max(runq_max_us) AS runq_max_us, sum(runq_overflow)::bigint AS runq_overflow \
+    FROM pod_compute_history \
+    WHERE resolution_secs = 60 AND ts >= $1 AND ts < $2 \
+    GROUP BY container_uid, bucket \
+) g \
+LEFT JOIN LATERAL ( \
+    SELECT array_agg(x.s ORDER BY x.i) AS hist \
+    FROM ( \
+        SELECT u.i, sum(u.v)::bigint AS s \
+        FROM pod_compute_history p, unnest(p.runq_hist) WITH ORDINALITY AS u(v, i) \
+        WHERE p.container_uid = g.container_uid AND p.resolution_secs = 60 \
+          AND p.ts >= g.bucket AND p.ts < g.bucket + interval '5 minutes' \
+        GROUP BY u.i \
+    ) x \
+) h ON true";
+
+/// Batched prune of one compute history table by `ts`. The table name
+/// is a `&'static str` chosen by the caller from two literals, never
+/// user input; the interval is bound.
+async fn run_compute_prune(pool: &DbPool, table: &'static str, days: u32) {
+    let batch_size = retention_batch_size();
+    let mut total_deleted = 0usize;
+    for batch_idx in 0..MAX_BATCHES_PER_PASS {
+        let pool = pool.clone();
+        let result = tokio::task::spawn_blocking(move || -> Result<usize, RetentionError> {
+            let mut conn = pool.get().map_err(RetentionError::Pool)?;
+            let interval = format!("{} days", days);
+            let sql = format!(
+                "WITH expired AS (\
+                     SELECT id FROM {table} \
+                     WHERE ts < timezone('UTC', NOW()) - $1::interval \
+                     ORDER BY ts \
+                     LIMIT $2 \
+                 ) \
+                 DELETE FROM {table} WHERE id IN (SELECT id FROM expired)"
+            );
+            sql_query(sql)
+                .bind::<diesel::sql_types::Text, _>(interval)
+                .bind::<diesel::sql_types::BigInt, _>(batch_size)
+                .execute(&mut conn)
+                .map_err(RetentionError::Diesel)
+        })
+        .await;
+        match result {
+            Ok(Ok(0)) => {
+                if total_deleted == 0 {
+                    debug!(table, "compute retention: 0 rows pruned");
+                } else {
+                    info!(
+                        table,
+                        rows = total_deleted,
+                        batches = batch_idx,
+                        "compute retention pruned old rows"
+                    );
+                }
+                return;
+            }
+            Ok(Ok(n)) => total_deleted += n,
+            Ok(Err(e)) => {
+                warn!(table, error = %e, pruned_before_failure = total_deleted, "compute retention: DELETE failed");
+                return;
+            }
+            Err(e) => {
+                warn!(table, error = %e, pruned_before_failure = total_deleted, "compute retention task panicked");
+                return;
+            }
+        }
+    }
+    info!(
+        table,
+        rows = total_deleted,
+        cap = MAX_BATCHES_PER_PASS,
+        "compute retention hit per-pass batch cap; remaining rows will be pruned on next interval"
+    );
+}
+
+/// Drop `pod_compute_latest` rows the controller stopped refreshing.
+/// The table is bounded by live-container count, so one bounded DELETE
+/// (still LIMITed through the CTE, for the pathological case of a whole
+/// cluster's controllers going away at once) is enough.
+async fn run_stale_latest(pool: &DbPool) {
+    let pool = pool.clone();
+    let batch_size = retention_batch_size();
+    let result = tokio::task::spawn_blocking(move || -> Result<usize, RetentionError> {
+        let mut conn = pool.get().map_err(RetentionError::Pool)?;
+        sql_query(
+            "WITH stale AS (\
+                 SELECT container_uid FROM pod_compute_latest \
+                 WHERE updated_at < timezone('UTC', NOW()) - $1::interval \
+                 ORDER BY updated_at \
+                 LIMIT $2 \
+             ) \
+             DELETE FROM pod_compute_latest \
+             WHERE container_uid IN (SELECT container_uid FROM stale)",
+        )
+        .bind::<diesel::sql_types::Text, _>(format!("{} seconds", COMPUTE_LATEST_STALE_SECS))
+        .bind::<diesel::sql_types::BigInt, _>(batch_size)
+        .execute(&mut conn)
+        .map_err(RetentionError::Diesel)
+    })
+    .await;
+    match result {
+        Ok(Ok(0)) => debug!("pod_compute_latest: no stale containers"),
+        Ok(Ok(n)) => info!(rows = n, "pod_compute_latest: pruned stale containers"),
+        Ok(Err(e)) => warn!(error = %e, "pod_compute_latest stale prune failed"),
+        Err(e) => warn!(error = %e, "pod_compute_latest stale prune task panicked"),
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -546,6 +962,134 @@ mod tests {
                 assert_eq!(retention_batch_size(), 10_000);
             },
         );
+    }
+
+    fn ts(s: &str) -> chrono::NaiveDateTime {
+        chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S").unwrap()
+    }
+
+    #[test]
+    fn bucket_floor_is_five_minute_aligned() {
+        assert_eq!(
+            floor_to_bucket(ts("2026-09-10T02:43:59")),
+            ts("2026-09-10T02:40:00")
+        );
+        assert_eq!(
+            floor_to_bucket(ts("2026-09-10T02:40:00")),
+            ts("2026-09-10T02:40:00")
+        );
+        assert_eq!(
+            floor_to_bucket(ts("2026-09-10T02:44:59")),
+            ts("2026-09-10T02:40:00")
+        );
+        assert_eq!(
+            floor_to_bucket(ts("2026-09-10T02:45:00")),
+            ts("2026-09-10T02:45:00")
+        );
+    }
+
+    #[test]
+    fn downsample_range_folds_whole_buckets_oldest_first() {
+        // Oldest minute row at 02:41, cutoff 03:17 → first batch is the
+        // two buckets [02:40, 02:50).
+        let r = downsample_range(ts("2026-09-10T02:41:00"), ts("2026-09-10T03:17:00"), 2);
+        assert_eq!(
+            r,
+            Some((ts("2026-09-10T02:40:00"), ts("2026-09-10T02:50:00")))
+        );
+    }
+
+    #[test]
+    fn downsample_range_never_touches_the_cutoff_bucket() {
+        // Oldest 03:11, cutoff 03:17: both in bucket [03:10, 03:15) and
+        // [03:15, 03:20) resp. Only [03:10, 03:15) is whole and below the
+        // cutoff bucket; the range must stop at 03:15 even with a batch
+        // size of 10 buckets.
+        let r = downsample_range(ts("2026-09-10T03:11:00"), ts("2026-09-10T03:17:00"), 10);
+        assert_eq!(
+            r,
+            Some((ts("2026-09-10T03:10:00"), ts("2026-09-10T03:15:00")))
+        );
+        // Oldest row inside the cutoff's own bucket → nothing yet.
+        assert_eq!(
+            downsample_range(ts("2026-09-10T03:16:00"), ts("2026-09-10T03:17:00"), 2),
+            None
+        );
+        // Oldest row exactly on the cutoff bucket boundary → nothing.
+        assert_eq!(
+            downsample_range(ts("2026-09-10T03:15:00"), ts("2026-09-10T03:17:00"), 2),
+            None
+        );
+    }
+
+    #[test]
+    fn downsample_range_batch_size_floors_at_one() {
+        let r = downsample_range(ts("2026-09-10T02:41:00"), ts("2026-09-10T03:17:00"), 0);
+        assert_eq!(
+            r,
+            Some((ts("2026-09-10T02:40:00"), ts("2026-09-10T02:45:00")))
+        );
+    }
+
+    #[test]
+    fn compute_retention_env_defaults_and_overrides() {
+        with_env("COMPUTE_HISTORY_RETENTION_DAYS", None, || {
+            assert_eq!(
+                compute_history_retention_days(),
+                DEFAULT_COMPUTE_RETENTION_DAYS
+            );
+        });
+        with_env("COMPUTE_HISTORY_RETENTION_DAYS", Some("0"), || {
+            assert_eq!(compute_history_retention_days(), 0, "0 disables history");
+        });
+        with_env("COMPUTE_HISTORY_RETENTION_DAYS", Some(" 3\n"), || {
+            assert_eq!(compute_history_retention_days(), 3);
+        });
+        with_env("COMPUTE_HISTORY_MINUTE_HOURS", None, || {
+            assert_eq!(compute_minute_hours(), DEFAULT_COMPUTE_MINUTE_HOURS);
+        });
+        with_env("COMPUTE_HISTORY_MINUTE_HOURS", Some("0"), || {
+            assert_eq!(
+                compute_minute_hours(),
+                1,
+                "floored so the engine window keeps minute rows"
+            );
+        });
+        with_env("COMPUTE_RETENTION_INTERVAL_SECS", None, || {
+            assert_eq!(
+                compute_retention_interval(),
+                Duration::from_secs(DEFAULT_COMPUTE_INTERVAL_SECS)
+            );
+        });
+        with_env("COMPUTE_RETENTION_INTERVAL_SECS", Some("5"), || {
+            assert_eq!(compute_retention_interval(), Duration::from_secs(60));
+        });
+    }
+
+    #[test]
+    fn downsample_sql_names_every_history_column_once() {
+        // The INSERT column list must match the SELECT list one-to-one;
+        // a column added to the table and to only one side would fail at
+        // runtime in the retention loop, which has no test database. Pin
+        // the count here so a mismatch fails locally.
+        let sql = DOWNSAMPLE_INSERT_SQL;
+        let cols = sql
+            .split("INSERT INTO pod_compute_history (")
+            .nth(1)
+            .unwrap()
+            .split(')')
+            .next()
+            .unwrap();
+        let insert_cols: Vec<&str> = cols.split(',').map(str::trim).collect();
+        assert_eq!(insert_cols.len(), 46, "46 = every column but id");
+        let select = sql.split("SELECT g.container_uid").nth(1).unwrap();
+        let select = select.split("FROM (").next().unwrap();
+        let select_cols = select.matches("g.").count() + select.matches("h.hist").count();
+        // + `g.container_uid` (consumed by the split above) + the literal
+        // `300` standing in for resolution_secs.
+        assert_eq!(select_cols + 2, insert_cols.len());
+        assert!(sql.contains("resolution_secs = 60 AND ts >= $1 AND ts < $2"));
+        assert!(sql.contains("GROUP BY container_uid, bucket"));
     }
 
     #[test]

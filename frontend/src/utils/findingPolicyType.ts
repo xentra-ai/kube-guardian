@@ -1,8 +1,44 @@
 import type { PolicyType } from '../hooks/policyEditor/usePolicyExport';
 import { recommendedPolicyType } from './cniPolicySupport';
+import type { ComputeFindingKind } from '../types/compute';
 
 /** The kinds of finding the Findings view surfaces per workload. */
-export type FindingKind = 'denied-traffic' | 'sensitive-syscalls' | 'egress-fanout' | 'would-deny';
+export type FindingKind =
+  | 'denied-traffic'
+  | 'sensitive-syscalls'
+  | 'egress-fanout'
+  | 'would-deny'
+  | ComputeFindingKind;
+
+/** The compute kinds (design D7): broker-computed, remediated by resources, not a policy. */
+export const COMPUTE_FINDING_KINDS: readonly ComputeFindingKind[] = [
+  'noisy-neighbor',
+  'cpu-throttled',
+  'cpu-contended',
+  'memory-pressure',
+  'memory-limit-thrash',
+];
+
+/** Every finding kind, for exhaustive tests. */
+export const ALL_FINDING_KINDS: readonly FindingKind[] = [
+  'denied-traffic',
+  'sensitive-syscalls',
+  'egress-fanout',
+  'would-deny',
+  ...COMPUTE_FINDING_KINDS,
+];
+
+export type FindingAction = 'policy' | 'resources';
+
+/**
+ * Which action a finding row offers. Network and syscall findings open the
+ * Policy Builder; compute findings (D7) have no policy to build — the fix is
+ * the workload's `resources:` — so the row links to the workload instead.
+ * `policyTypeForFinding` is only ever called for `'policy'` kinds.
+ */
+export function findingAction(kind: FindingKind): FindingAction {
+  return (COMPUTE_FINDING_KINDS as readonly string[]).includes(kind) ? 'resources' : 'policy';
+}
 
 /**
  * Which Policy Builder tab a finding's "Policy" action should open. A

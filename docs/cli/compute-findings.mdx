@@ -1,0 +1,70 @@
+---
+title: "compute findings"
+description: "List compute findings — throttled, contended and noisy-neighbour pods — for a namespace, a node, or the cluster"
+icon: "gauge-high"
+---
+
+## Synopsis
+
+List the broker's current compute findings. Read-only: the command calls
+`GET /compute/findings` and prints the result; it generates nothing and
+applies nothing.
+
+```bash
+kubectl kguardian compute findings [flags]
+```
+
+## Flags
+
+| Flag | Type | Description | Default |
+|------|------|-------------|---------|
+| `-n, --namespace` | string | Only findings whose victim is in this namespace | all namespaces |
+| `--node` | string | Only findings whose victim runs on this node | all nodes |
+| `-o, --output` | string | `table` or `json` | `table` |
+
+Global flags (`--kubeconfig`, `--context`, `--broker-namespace`,
+`--broker-service`, `--debug`) are listed in the [CLI overview](/cli/overview).
+
+## Output
+
+The table has one row per finding:
+
+```
+SEVERITY  KIND            VICTIM                       CULPRIT                 SHARE  MESSAGE
+high      noisy-neighbor  payments/api-7c9d8f6b5-x2k4q  batch/etl-1-x           71%    payments/api is starved for CPU by batch/etl-1-x (71% of its wait); etl-1-x is using 1.9 cores against a 0.5-core request.
+high      noisy-neighbor  logging/fluentd-4m2pq         system:kubelet.service  55%    logging/fluentd is starved for CPU by kubelet.service (55% of its wait).
+medium    cpu-throttled   payments/worker-5f7c9-b8n3d   -                       -      payments/worker is throttled 34% of the time by its own 500m limit.
+```
+
+`VICTIM` and `CULPRIT` are printed as `namespace/pod`; the container is in
+the JSON output. A `system` culprit prints as `system:<unit>` (for example
+`system:kubelet.service`), a `kernel` culprit as `kernel`. `CULPRIT` and
+`SHARE` are `-` for the kinds that never name one (`cpu-throttled`,
+`cpu-contended`, `memory-limit-thrash`). `SHARE` is the culprit's share of
+the victim's scheduler wait for `noisy-neighbor`, and its share of the
+node's memory overage for `memory-pressure`.
+
+`-o json` prints the broker's response unchanged (`findings`, `truncated`,
+`victims_evaluated`, `history_disabled`); the schema is in the
+[compute reference](/reference/compute#findings-response). In table mode the
+CLI prints a notice when `truncated` is set (narrow the scope with `-n` or
+`--node`), when `history_disabled` is set (`retentionDays: 0` — no findings
+are possible), and how many victims were evaluated.
+
+## Examples
+
+```bash
+# Everything in one namespace
+kubectl kguardian compute findings -n payments
+
+# One node, cluster-wide, as JSON for scripting
+kubectl kguardian compute findings --node worker-3 -o json
+
+# Only noisy neighbours
+kubectl kguardian compute findings -o json | jq '.findings[] | select(.kind == "noisy-neighbor")'
+```
+
+---
+
+See [Compute Contention](/concepts/compute-contention) for what each kind
+means and why a throttled pod is never blamed on a neighbour.

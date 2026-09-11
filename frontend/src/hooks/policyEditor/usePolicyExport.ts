@@ -4,12 +4,33 @@ import type { CiliumNetworkPolicy } from '../../types/ciliumPolicy';
 import type { SeccompProfile } from '../../types/seccompProfile';
 import { policyToYAML } from '../../utils/networkPolicyGenerator';
 import { ciliumPolicyToYAML } from '../../utils/ciliumPolicyGenerator';
+import { toAuditNetworkPolicy } from '../../utils/auditNetworkPolicy';
 import { profileToYAML, profileToJSON } from '../../utils/seccompProfileGenerator';
 import { podProfileToKguardianCR, suggestedCrName } from '../../utils/seccompCr';
 import type { PodNodeData } from '../../types';
 import type { CaptureInfo } from '../../types/seccompWorkload';
 
 export type PolicyType = 'network' | 'cilium' | 'seccomp';
+
+/**
+ * Network export formats, the counterpart of the seccomp formats below.
+ * `audit` is the kguardian.dev/v1alpha1 AuditNetworkPolicy (same spec, the
+ * evaluator reports would-deny verdicts instead of dropping); `network` is
+ * the upstream NetworkPolicy; `cilium` is a CiliumNetworkPolicy and only
+ * makes sense where Cilium is the CNI.
+ */
+export type NetworkExportFormat = 'audit' | 'network' | 'cilium';
+
+export const NETWORK_EXPORT_FORMATS: { id: NetworkExportFormat; label: string; hint: string; requiresCilium?: boolean }[] = [
+  { id: 'audit', label: 'Audit (kguardian CR)', hint: 'kguardian.dev/v1alpha1 AuditNetworkPolicy — same spec, nothing is dropped; the evaluator reports what it would deny' },
+  { id: 'network', label: 'NetworkPolicy', hint: 'networking.k8s.io/v1 NetworkPolicy — enforced by the CNI once applied' },
+  { id: 'cilium', label: 'CiliumNetworkPolicy', hint: 'cilium.io/v2 CiliumNetworkPolicy — only Cilium reads it', requiresCilium: true },
+];
+
+/** The top-level tab a policy type belongs to; `cilium` is a format of the network tab. */
+export function policyTypeForNetworkFormat(format: NetworkExportFormat): PolicyType {
+  return format === 'cilium' ? 'cilium' : 'network';
+}
 
 /**
  * Seccomp export formats. `kguardian` (default) is the kguardian.dev/v1alpha1
@@ -37,6 +58,8 @@ interface UsePolicyExportProps {
   yamlView?: boolean;
   /** Seccomp only; defaults to the kguardian CR. */
   seccompFormat?: SeccompExportFormat;
+  /** Network tab only; `audit` swaps the header for AuditNetworkPolicy. Defaults to the plain NetworkPolicy. */
+  networkFormat?: NetworkExportFormat;
   /** Seccomp only; needed for the kguardian CR (workloadRef + capture header). */
   pod?: PodNodeData | null;
   capture?: CaptureInfo;
@@ -54,6 +77,7 @@ export const usePolicyExport = ({
   podIdentity,
   podNamespace,
   seccompFormat = 'kguardian',
+  networkFormat = 'network',
   pod = null,
   capture = { level: 'unknown', complete: false, pods: [] },
   crDefaultAction,
@@ -62,7 +86,7 @@ export const usePolicyExport = ({
 
   const getExportContent = (): string | null => {
     if (policyType === 'network' && policy) {
-      return policyToYAML(policy);
+      return policyToYAML(networkFormat === 'audit' ? toAuditNetworkPolicy(policy) : policy);
     } else if (policyType === 'cilium' && ciliumPolicy) {
       return ciliumPolicyToYAML(ciliumPolicy);
     } else if (policyType === 'seccomp' && seccompProfile) {
@@ -111,7 +135,7 @@ export const usePolicyExport = ({
     let mimeType: string;
 
     if (policyType === 'network' && policy) {
-      filename = `${policy.metadata.name}.yaml`;
+      filename = networkFormat === 'audit' ? `${policy.metadata.name}-audit.yaml` : `${policy.metadata.name}.yaml`;
       mimeType = 'text/yaml';
     } else if (policyType === 'cilium' && ciliumPolicy) {
       filename = `${ciliumPolicy.metadata.name}.yaml`;
