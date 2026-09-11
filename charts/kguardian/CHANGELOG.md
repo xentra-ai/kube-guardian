@@ -1,5 +1,29 @@
 # Changelog
 
+## [1.23.0](https://github.com/kguardian-dev/kguardian/compare/chart/v1.22.0...chart/v1.23.0) (2026-09-11)
+
+
+### ⚠ BREAKING CHANGES
+
+* **chart:** autoscaling.enabled=true is now refused at template time for broker, frontend and llm-bridge, where it previously rendered. Any values file setting it must remove it and use the component's replicaCount instead. Such an install is already broken - it is running a single replica, and if its PDB is enabled it cannot be drained - so this converts a silent misconfiguration into a loud one at upgrade time.
+
+### Features
+
+* live compute gauges and noisy-neighbour detection ([#1531](https://github.com/kguardian-dev/kguardian/issues/1531)) ([62959c2](https://github.com/kguardian-dev/kguardian/commit/62959c2be3d1fb71611c0ab77308a5d56af6ac91))
+
+
+### Bug Fixes
+
+* **broker:** stop the seccomp profile list allocating per syscall name ([1cae69b](https://github.com/kguardian-dev/kguardian/commit/1cae69bba1d5170c6d06f7249861c874955a6a94))
+* **chart:** refuse to render autoscaling.enabled instead of silently scaling to one replica ([9bfc0ef](https://github.com/kguardian-dev/kguardian/commit/9bfc0efce8fe682a97b32e9ba9ebb162eb26c518))
+* **deps:** update busybox docker tag to v1.38.0 ([#1509](https://github.com/kguardian-dev/kguardian/issues/1509)) ([5d35718](https://github.com/kguardian-dev/kguardian/commit/5d3571835c2943f1e06066ee0529bdba19afd72a))
+* **deps:** update ghcr.io/kguardian-dev/kguardian/broker docker tag to v1.16.1 ([#1520](https://github.com/kguardian-dev/kguardian/issues/1520)) ([7c6823d](https://github.com/kguardian-dev/kguardian/commit/7c6823d08951b4923d964cf40d166ca06771a456))
+
+
+### Miscellaneous Chores
+
+* **chart:** re-release the pending chart changes as 1.23.0, not 2.0.0 ([#1552](https://github.com/kguardian-dev/kguardian/issues/1552)) ([f102c08](https://github.com/kguardian-dev/kguardian/commit/f102c08bfabe14092a1e8bfcd0914f633099415a))
+
 ## [1.22.0](https://github.com/kguardian-dev/kguardian/compare/chart/v1.21.2...chart/v1.22.0) (2026-09-08)
 
 
