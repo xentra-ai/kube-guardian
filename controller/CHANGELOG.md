@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.14.0](https://github.com/kguardian-dev/kguardian/compare/controller/v1.13.0...controller/v1.14.0) (2026-09-11)
+
+
+### Features
+
+* live compute gauges and noisy-neighbour detection ([#1531](https://github.com/kguardian-dev/kguardian/issues/1531)) ([62959c2](https://github.com/kguardian-dev/kguardian/commit/62959c2be3d1fb71611c0ab77308a5d56af6ac91))
+
+
+### Bug Fixes
+
+* **broker:** stop the seccomp profile list allocating per syscall name ([1cae69b](https://github.com/kguardian-dev/kguardian/commit/1cae69bba1d5170c6d06f7249861c874955a6a94))
+* **controller:** map k3s:// providerID to baremetal in telemetry facts ([#1528](https://github.com/kguardian-dev/kguardian/issues/1528)) ([ebac67a](https://github.com/kguardian-dev/kguardian/commit/ebac67a040c0a14224c1a921fd44935b61ba6d4d))
+* stop the seccomp profile list allocating per-name, and admit it to the read budget ([f03903f](https://github.com/kguardian-dev/kguardian/commit/f03903f3a106fe3faafecbbac37f2b7fae7f68fe))
+
 ## [1.13.0](https://github.com/kguardian-dev/kguardian/compare/controller/v1.12.1...controller/v1.13.0) (2026-09-08)
 
 
