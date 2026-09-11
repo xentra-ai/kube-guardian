@@ -90,6 +90,11 @@ pub struct ComputeThresholds {
     /// pages a minute; `> 0` would flag every such container on a node
     /// under pressure.
     pub refault_per_min: f64,
+    /// Run-queue events per minute a row must carry before its p99 counts
+    /// as a stall. A p99 over a handful of wakeups (a CSI sidecar that
+    /// woke 12 times in a minute) is noise, not starvation; the overflow
+    /// bucket is exempt because any multi-second wait is real.
+    pub min_runq_events: f64,
 }
 
 impl Default for ComputeThresholds {
@@ -102,6 +107,7 @@ impl Default for ComputeThresholds {
             blame_share: 0.40,
             mem_stall_some: 10.0,
             refault_per_min: 1000.0,
+            min_runq_events: 50.0,
         }
     }
 }
@@ -124,6 +130,7 @@ impl ComputeThresholds {
             blame_share: env_f64("COMPUTE_THRESHOLD_BLAME_SHARE", d.blame_share),
             mem_stall_some: env_f64("COMPUTE_THRESHOLD_MEM_STALL_SOME", d.mem_stall_some),
             refault_per_min: env_f64("COMPUTE_THRESHOLD_REFAULT_PER_MIN", d.refault_per_min),
+            min_runq_events: env_f64("COMPUTE_THRESHOLD_MIN_RUNQ_EVENTS", d.min_runq_events),
         }
     }
 }
@@ -225,6 +232,13 @@ where
 
 /// `throttled_usec / (nr_periods x period_usec)` over the window. 0 when
 /// there were no periods (no quota, or no data).
+/// Run-queue events per minute on a history row, resolution-aware so a
+/// 5-minute row is judged by the same bar as a minute row.
+fn runq_events_per_min(r: &PodComputeHistoryRow) -> f64 {
+    let minutes = (r.resolution_secs.max(60) as f64) / 60.0;
+    r.runq_count.unwrap_or(0) as f64 / minutes
+}
+
 fn throttled_ratio(rows: &[&PodComputeHistoryRow]) -> f64 {
     let throttled: i128 = rows.iter().map(|r| r.cpu_throttled_usec as i128).sum();
     let wall: i128 = rows
@@ -338,8 +352,10 @@ fn cpu_finding(
     // ALL that long would show p99 = max = 0. Any overflow is a stall,
     // and a critical one.
     let runq_span = sustained(rows, |r| {
-        r.runq_p99_us
-            .is_some_and(|p| p as f64 >= t.runq_p99_ms * 1000.0)
+        let enough_events = runq_events_per_min(r) >= t.min_runq_events;
+        (enough_events
+            && r.runq_p99_us
+                .is_some_and(|p| p as f64 >= t.runq_p99_ms * 1000.0))
             || r.runq_overflow.is_some_and(|o| o > 0)
     });
     let overflowed = rows.iter().any(|r| r.runq_overflow.is_some_and(|o| o > 0));
@@ -1226,6 +1242,45 @@ mod tests {
     }
 
     #[test]
+    fn p99_over_a_handful_of_events_is_not_a_stall() {
+        // PSI quiet, p99 48 ms from the fixture, but only 12 run-queue events
+        // in the minute: a near-idle sidecar's wakeups, not starvation.
+        let (mut history, pairs) = bully_victim();
+        fn set(h: &mut [PodComputeHistoryRow], f: impl Fn(&mut PodComputeHistoryRow)) {
+            h.iter_mut()
+                .filter(|r| r.container_uid == VICTIM)
+                .for_each(f);
+        }
+        set(&mut history, |r| {
+            r.cpu_psi_some10_avg = 1.0;
+            r.cpu_psi_full10_max = 0.0;
+            r.runq_count = Some(12);
+            r.runq_overflow = Some(0);
+        });
+        let t = ComputeThresholds::default();
+        let for_victim = |f: &[Finding]| f.iter().any(|x| x.victim.container_uid == VICTIM);
+        assert!(
+            !for_victim(&compute_findings(&history, &pairs, &[], &t)),
+            "12 events/min must not fire the p99 rule"
+        );
+
+        // The same p99 over enough events is a stall.
+        set(&mut history, |r| r.runq_count = Some(120));
+        assert!(
+            for_victim(&compute_findings(&history, &pairs, &[], &t)),
+            "120 events/min fires"
+        );
+
+        // A 5-minute row is judged per minute: 120 events over 300 s is 24/min.
+        set(&mut history, |r| r.resolution_secs = 300);
+        assert!(!for_victim(&compute_findings(&history, &pairs, &[], &t)));
+
+        // Overflow is exempt from the event floor: any 8 s wait is real.
+        set(&mut history, |r| r.runq_overflow = Some(1));
+        assert!(for_victim(&compute_findings(&history, &pairs, &[], &t)));
+    }
+
+    #[test]
     fn probe_off_uses_psi_only() {
         let (mut history, pairs) = bully_victim();
         for r in history.iter_mut() {
@@ -1457,6 +1512,7 @@ mod tests {
             "COMPUTE_THRESHOLD_BLAME_SHARE",
             "COMPUTE_THRESHOLD_MEM_STALL_SOME",
             "COMPUTE_THRESHOLD_REFAULT_PER_MIN",
+            "COMPUTE_THRESHOLD_MIN_RUNQ_EVENTS",
         ];
         let prev: Vec<Option<String>> = keys.iter().map(|k| std::env::var(k).ok()).collect();
         for k in keys {
@@ -1471,14 +1527,17 @@ mod tests {
         assert_eq!(d.blame_share, 0.40);
         assert_eq!(d.mem_stall_some, 10.0);
         assert_eq!(d.refault_per_min, 1000.0);
+        assert_eq!(d.min_runq_events, 50.0);
 
         std::env::set_var("COMPUTE_THRESHOLD_STALL_SOME", " 35 \n");
         std::env::set_var("COMPUTE_THRESHOLD_BLAME_SHARE", "0.6");
         std::env::set_var("COMPUTE_THRESHOLD_RUNQ_P99_MS", "garbage");
         std::env::set_var("COMPUTE_THRESHOLD_MEM_STALL_SOME", "-1");
         std::env::set_var("COMPUTE_THRESHOLD_REFAULT_PER_MIN", "250");
+        std::env::set_var("COMPUTE_THRESHOLD_MIN_RUNQ_EVENTS", "10");
         let t = ComputeThresholds::from_env();
         assert_eq!(t.refault_per_min, 250.0);
+        assert_eq!(t.min_runq_events, 10.0);
         assert_eq!(t.stall_some, 35.0, "trimmed");
         assert_eq!(t.blame_share, 0.6);
         assert_eq!(t.runq_p99_ms, 20.0, "unparseable keeps the default");

@@ -217,6 +217,10 @@ spec:
             - name: COMPUTE_THRESHOLD_REFAULT_PER_MIN
               value: {{ $thresholds.refaultPerMin | quote }}
             {{- end }}
+{{- if hasKey $thresholds "minRunqEvents" }}
+            - name: COMPUTE_THRESHOLD_MIN_RUNQ_EVENTS
+              value: {{ $thresholds.minRunqEvents | quote }}
+            {{- end }}
             # Anonymous version check-in (see docs/telemetry). CHART_VERSION
             # and KUBE_VERSION are captured at install/upgrade time and ride
             # the daily check-in; disable with telemetry.enabled=false.

@@ -82,7 +82,10 @@ the following over the window. Any one on its own is not enough.
 
 1. **V is stalled.** Its cgroup `cpu.pressure some avg10` is ≥ `stallSome`
    (default 20 %), **or** its run-queue latency p99 is ≥ `runqP99Ms`
-   (default 20 ms), for at least two consecutive minutes.
+   (default 20 ms) over at least `minRunqEvents` run-queue events per
+   minute (default 50, so a near-idle sidecar's handful of wakeups cannot
+   fire it; multi-second waits in the overflow bucket always count), for
+   at least two consecutive minutes.
 2. **V is not throttling itself.** Its throttled ratio is below
    `throttledRatioMax` (default 10 %). See below.
 3. **One neighbour dominates.** A cgroup C ≠ V on the same node accounts for

@@ -348,6 +348,11 @@ compute:
     # `memory-pressure`: the second way (besides `memStallSome`) a container
     # qualifies as a memory victim while the node is under pressure.
     refaultPerMin: 1000
+    # -- Run-queue events per minute a history row must carry before its p99
+    # counts as a CPU stall. Filters p99-only findings on near-idle sidecars
+    # (a dozen wakeups a minute); the overflow bucket (multi-second waits)
+    # is never filtered.
+    minRunqEvents: 50
   history:
     # -- Days of per-pod compute and contention history the broker keeps.
     # Minute rows are downsampled to 5-minute rows after

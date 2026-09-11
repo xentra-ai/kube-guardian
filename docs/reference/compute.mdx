@@ -22,6 +22,7 @@ feature. Operational steps are in the [guide](/guides/compute-gauges).
 | `compute.thresholds.blameShare` | float | `0.40` | Share of the victim's wait time one cgroup must hold to be named the culprit. |
 | `compute.thresholds.memStallSome` | int | `10` | `memory.pressure some avg10` (percent) at or above which `memory-pressure` can fire (while the node is also under pressure). |
 | `compute.thresholds.refaultPerMin` | int | `1000` | Workingset refaults per minute at or above which a container counts as thrashing for `memory-pressure` (the alternative to `memStallSome`; the node must also be under pressure). |
+| `compute.thresholds.minRunqEvents` | int | `50` | Run-queue events per minute a history row must carry before its p99 counts as a CPU stall. Filters p99-only findings on near-idle sidecars; the histogram overflow bucket (multi-second waits) is never filtered. |
 | `compute.history.retentionDays` | int | `7` | Days of history kept. `0` disables history inserts and pruning **and every compute finding** (they are computed from history); only the live gauges remain. |
 | `compute.history.minuteResolutionHours` | int | `24` | Hours kept at one-minute resolution before rows are folded into 5-minute rows. |
 
@@ -63,6 +64,7 @@ it collected.
 | `COMPUTE_THRESHOLD_BLAME_SHARE` | `compute.thresholds.blameShare` | `0.40` |
 | `COMPUTE_THRESHOLD_MEM_STALL_SOME` | `compute.thresholds.memStallSome` | `10` |
 | `COMPUTE_THRESHOLD_REFAULT_PER_MIN` | `compute.thresholds.refaultPerMin` | `1000` |
+| `COMPUTE_THRESHOLD_MIN_RUNQ_EVENTS` | `compute.thresholds.minRunqEvents` | `50` |
 
 ## Pod annotation
 
