@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.11.0](https://github.com/kguardian-dev/kguardian/compare/llm-bridge/v1.10.0...llm-bridge/v1.11.0) (2026-09-11)
+
+
+### Features
+
+* live compute gauges and noisy-neighbour detection ([#1531](https://github.com/kguardian-dev/kguardian/issues/1531)) ([62959c2](https://github.com/kguardian-dev/kguardian/commit/62959c2be3d1fb71611c0ab77308a5d56af6ac91))
+
+
+### Bug Fixes
+
+* **deps:** update dependency @anthropic-ai/sdk to ^0.125.0 ([#1537](https://github.com/kguardian-dev/kguardian/issues/1537)) ([bdda1fe](https://github.com/kguardian-dev/kguardian/commit/bdda1fece0782a38207470f6bf681b18f88e3630))
+
 ## [1.10.0](https://github.com/kguardian-dev/kguardian/compare/llm-bridge/v1.9.1...llm-bridge/v1.10.0) (2026-09-08)
 
 
