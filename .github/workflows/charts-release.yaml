@@ -43,7 +43,7 @@ jobs:
       - name: Install Helm
         uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5
         with:
-          version: v4.3.0 # keep in step with charts-lint.yaml
+          version: v4.3.1 # keep in step with charts-lint.yaml
 
       # Never publish a chart that points at an image that is not in GHCR:
       # every install of it would sit in ImagePullBackOff. Renders with every
