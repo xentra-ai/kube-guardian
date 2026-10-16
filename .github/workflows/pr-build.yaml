@@ -946,7 +946,7 @@ jobs:
       - name: golangci-lint
         uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9
         with:
-          version: v2.14.0 # pinned; bump deliberately (a new release can add failing linters)
+          version: v2.15.0 # pinned; bump deliberately (a new release can add failing linters)
           working-directory: evaluator
           args: --timeout=5m
 
@@ -1121,7 +1121,7 @@ jobs:
       - name: golangci-lint
         uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9
         with:
-          version: v2.14.0 # pinned; bump deliberately (a new release can add failing linters)
+          version: v2.15.0 # pinned; bump deliberately (a new release can add failing linters)
           working-directory: supplychain
           args: --timeout=5m
 
@@ -1208,7 +1208,7 @@ jobs:
       - name: golangci-lint
         uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9
         with:
-          version: v2.14.0 # pinned; bump deliberately (a new release can add failing linters)
+          version: v2.15.0 # pinned; bump deliberately (a new release can add failing linters)
           working-directory: supplychain-matcher
           args: --timeout=15m
 
@@ -1299,7 +1299,7 @@ jobs:
       - name: golangci-lint
         uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9
         with:
-          version: v2.14.0 # pinned; bump deliberately (a new release can add failing linters)
+          version: v2.15.0 # pinned; bump deliberately (a new release can add failing linters)
           working-directory: cataloger
           args: --timeout=15m
 
